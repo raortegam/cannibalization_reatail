@@ -1,0 +1,19 @@
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Archivos de entorno
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Datos
+data/raw/
+data/processed/
+
+# Reportes
+reports/figures/
+
+# Archivos temporales
+*.log
+.DS_Store
