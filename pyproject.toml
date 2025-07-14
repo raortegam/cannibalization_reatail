@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "ml-canibalizacion-retail"
+version = "0.1.0"
+description = "Trabajo de grado: Comparación de Control Sintético y Meta-learners en Series Temporales para estimar canibalización de productos"
+authors = ["Richard Andrés Ortega Mutis <correo@example.com>"]
+readme = "README.md"
+packages = [{ include = "src" }]
+
+[tool.poetry.dependencies]
+python = "3.9.18"
+numpy = "<2.2"
+pandas = "<2.2"
+scikit-learn = "<1.2"
+dowhy = "<0.9"
+econml = "<0.15"
+causalml = "<0.15"
+statsmodels = "<0.14"
+matplotlib = "<3.9"
+seaborn = "<0.13"
+plotly = "<5.21"
+graphviz = "<0.20"
+networkx = "<2.8"
+causalgraphicalmodels = "<0.0.4"
+
+[tool.poetry.group.dev.dependencies]
+jupyterlab = "^4.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
