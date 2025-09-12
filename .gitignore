@@ -8,7 +8,7 @@ __pycache__/
 *.pyc
 
 # Datos
-data/raw/
+.data
 data/processed/
 
 # Reportes

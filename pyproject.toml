@@ -1,17 +1,16 @@
 [tool.poetry]
-name = "ml-canibalizacion-retail"
+name = "causal-inference-project"
 version = "0.1.0"
-description = "Trabajo de grado: Comparación de Control Sintético y Meta-learners en Series Temporales para estimar canibalización de productos"
-authors = ["Richard Andrés Ortega Mutis <correo@example.com>"]
-readme = "README.md"
-packages = [{ include = "src" }]
+description = "Proyecto de modelado causal y análisis"
+authors = ["Richard Andrés Ortega Mutis <tu-email@ejemplo.com>"]
+package-mode = false
 
 [tool.poetry.dependencies]
-python = ">=3.9,<3.11"
+python = ">=3.11,<3.12"
 
-# Versiones compatibles con dowhy 0.9.1
+# Librerías principales
 numpy = "^1.23"
-pandas = "^1.5"
+pandas = "^2.0"
 scikit-learn = "<1.2"
 statsmodels = "^0.13.5"
 matplotlib = ">=3.6,<3.8"
@@ -21,14 +20,22 @@ graphviz = "^0.20"
 networkx = "^2.8"
 
 # Inferencia causal
-dowhy = "0.9.1"
-econml = "^0.15.0"  # Compatible con scikit-learn <1.2
+dowhy = ">=0.10.1,<0.13"
+econml = "^0.15.0"
 causalgraphicalmodels = "^0.0.4"
 
-[tool.poetry.group.dev.dependencies]
-jupyterlab = "^3.6"
+# Computación paralela / distribuida
+dask = { version = "2024.5.0", extras = ["dataframe"] }
+fsspec = "^2024.2.0"
+cloudpickle = "^3.0.0"
+partd = "^1.4.0"
+
+# Dependencias opcionales (GPU)
+cupy = {version = "*", optional = true}
+
+[tool.poetry.extras]
+gpu = ["cupy"]
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
-
