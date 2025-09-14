@@ -20,3 +20,44 @@ HOLIDAYS_PARSE_DATES = ["date"]
 TRANSACTIONS_PARSE_DATES = ["date"]
 OIL_PARSE_DATES = ["date"]
 OUTPUT_DIR = r"D:\repos\cannibalization_reatail\.data\processed_data"
+
+from datetime import datetime
+
+# --------- Expectativas de validación (puedes ajustarlas) ---------
+EXPECTED_DATE_MIN = datetime(2013, 1, 1)
+EXPECTED_DATE_MAX = datetime(2017, 8, 15)
+
+# Claves / columnas esperadas por dataset
+SCHEMA_EXPECTED = {
+    "ventas": {
+        "required_cols": ["date", "store_nbr", "item_nbr", "unit_sales", "onpromotion"],
+        "key": ["date", "store_nbr", "item_nbr"],
+    },
+    "items": {
+        "required_cols": ["item_nbr", "family", "class", "perishable"],
+        "key": ["item_nbr"],
+    },
+    "stores": {
+        "required_cols": ["store_nbr", "city", "state", "type", "cluster"],
+        "key": ["store_nbr"],
+    },
+    "hol": {
+        "required_cols": ["date", "type", "locale", "locale_name", "description", "transferred"],
+        "key": ["date", "locale", "locale_name", "description"],
+    },
+    "trans": {
+        "required_cols": ["date", "store_nbr", "transactions"],
+        "key": ["date", "store_nbr"],
+    },
+    "oil": {
+        "required_cols": ["date", "dcoilwtico"],
+        "key": ["date"],
+    },
+}
+
+# Expectativas agregadas
+EXPECTED_MIN_FAMILIES = 33
+EXPECTED_MIN_STORES = 54
+
+# Directorio de salida para reportes de calidad
+REPORT_DIR = DATA_DIR  # o usa otro path si prefieres

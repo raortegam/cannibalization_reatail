@@ -24,7 +24,7 @@ def aggregate_weekly_sales(
     ventas = ventas.copy()
     ventas["store_nbr"] = ventas["store_nbr"].astype("int32")
     ventas["item_nbr"]  = ventas["item_nbr"].astype("int32")
-    ventas["unit_sales"] = pd.to_numeric(ventas["unit_sales"], errors="coerce").astype("float32")
+    ventas["unit_sales"] = pd.to_numeric(ventas["unit_sales"], errors="coerce").astype("float32").clip(lower=0)
 
     # onpromotion → {0,1}
     ventas["onpromotion"] = safe_bool_to_int(ventas["onpromotion"])
