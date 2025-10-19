@@ -1,0 +1,96 @@
+# pipeline_config.yaml
+# Configuración para 00_run_pipeline.py
+# Ajusta rutas y parámetros a tu entorno/proyecto.
+
+project_name: "cannibalization_retail"
+seed: 2025
+log_level: "INFO"           # DEBUG | INFO | WARNING | ERROR
+log_to_file: true
+fail_fast: false            # Si true, el pipeline se detiene en la primera falla.
+use_filtered_from_step1: true
+
+toggles:
+  step1: true
+  step2: true
+  step3: true
+  step4: true
+  eda1: true
+  eda2: true
+  eda3: true
+  eda4: true
+
+paths:
+  # Directorios base
+  raw_dir: ".data/raw_data"
+  processed_dir: ".data/processed_data"
+  preprocessed_dir: ".data/preprocessed_data"
+  figures_dir: "figures/favorita_analysis"
+
+  # Entradas (ajusta a tus nombres reales de archivos)
+  train_csv: ".data/raw_data/train.csv"
+  transactions_csv: ".data/raw_data/transactions.csv"    # opcional
+  items_csv: ".data/raw_data/items.csv"                  # opcional
+  stores_csv: ".data/raw_data/stores.csv"                # opcional
+
+  # Salidas intermedias
+  exposure_csv: ".data/processed_data/competitive_exposure.csv"
+  step1_out_dir: ".data/processed_data"  # donde se guardarán train_filtered.csv, etc.
+
+params:
+  # ---------------- Paso 1: Data Quality ----------------
+  min_date: "2016-01-01"
+  date_col: "date"
+  store_col: "store_nbr"
+  item_col: "item_nbr"
+  promo_col: "onpromotion"
+  sales_col: "unit_sales"
+  tx_col: "transactions"
+  # save_report_json: ".data/processed_data/data_quality_report.json"  # opcional
+
+  # ---------------- Paso 2: Competitive Exposure --------
+  neighborhood_col: "neighborhood"   # si no existe, la función puede ignorarlo
+  save_format: null                  # infiere por extensión; usa CSV por compatibilidad
+
+  # ---------------- Paso 3: Select Pairs & Donors -------
+  outdir_pairs_donors: ".data/preprocessed_data"
+
+  # ---------------- Paso 4: Pre-Algorithm Prep ----------
+  top_k_donors: 10
+  donor_kind: "same_item"        # "same_item" | "same_family" | etc. (según implementación)
+  lags_days: [7, 14, 28, 56]
+  fourier_k: 3
+  max_donor_promo_share: 0.02
+  min_availability_share: 0.90
+  save_intermediate: true
+  use_stl: true
+  drop_city: true
+  dry_run: false
+  max_episodes: null
+  prep_log_level: "INFO"
+  fail_fast: false
+
+  # ---------------- EDA 2: exposición -------------------
+  eda2_orientation: "portrait"
+  eda2_dpi: 300
+  eda2_bins: 50
+  eda2_top_stores: 30
+  eda2_min_store_obs: 5
+  eda2_heatmap_stores: null
+  eda2_chunksize: 1000000
+  eda2_log_level: "INFO"
+
+  # ---------------- EDA 3: episodios --------------------
+  eda3_n: 5
+  eda3_strategy: "stratified"     # "stratified" | "top_delta" | "recent" | "random"
+  eda3_seed: 2025
+  eda3_orientation: "portrait"
+  eda3_dpi: 300
+
+  # ---------------- EDA 4: final ------------------------
+  eda4_promo_thresh: 0.02
+  eda4_avail_thresh: 0.90
+  eda4_limit_episodes: 1
+  eda4_example_episode_id: null
+  eda4_orientation: "portrait"
+  eda4_dpi: 300
+  eda4_log_level: "INFO"
