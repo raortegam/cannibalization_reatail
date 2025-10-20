@@ -118,7 +118,7 @@ SPD_SHARD_H = bool(_env_int("SPD_SHARD_H", 1))  # 1=on
 _SHARD_DIR: Optional[str] = None
 
 # Modos rápidos / permisividad
-SPD_FAST_SCORING          = _env_int("SPD_FAST_SCORING", 1)  # 0=off, 1=exacto vectorizado, 2=ultra-rápido (S/C)
+SPD_FAST_SCORING          = _env_int("SPD_FAST_SCORING", 2)  # 0=off, 1=exacto vectorizado, 2=ultra-rápido (S/C)
 SPD_ALLOW_J_PROMO_OVERLAP = bool(_env_int("SPD_ALLOW_J_PROMO_OVERLAP", 0))
 SPD_SAVE_DEBUG_TABLES     = bool(_env_int("SPD_SAVE_DEBUG_TABLES", 0))
 

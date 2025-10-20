@@ -1,0 +1,91 @@
+{
+  "project_name": "cannibalization_retail",
+  "start_time": "2025-10-19T20:22:24.576323",
+  "log_file": "D:\\repos\\cannibalization_reatail\\diagnostics\\pipeline_20251019_202224.log",
+  "steps": {
+    "step1": {
+      "status": "ok",
+      "outputs": {
+        "train_summary": {
+          "rows": 59038132,
+          "date_range": [
+            "2016-01-01",
+            "2017-08-15"
+          ],
+          "n_stores": 54,
+          "n_items": 4036,
+          "promo_rate": 0.10610486456448182,
+          "sales_nonnull_rate": 1.0,
+          "sales_negative_rate": 6.570329833606523e-05,
+          "stores_rows_min_max": [
+            290581,
+            1599702
+          ]
+        },
+        "transactions_summary": {
+          "rows": 31096,
+          "date_range": [
+            "2016-01-02",
+            "2017-08-15"
+          ],
+          "n_stores": 54,
+          "transactions_nonneg_rate": 1.0
+        },
+        "paths": {
+          "train_filtered": ".data\\processed_data\\train_filtered.csv",
+          "transactions_filtered": ".data\\processed_data\\transactions_filtered.csv"
+        },
+        "min_date": "2016-01-01",
+        "keys_train": [
+          "date",
+          "store_nbr",
+          "item_nbr"
+        ],
+        "keys_transactions": [
+          "date",
+          "store_nbr"
+        ]
+      }
+    },
+    "step2": {
+      "status": "ok",
+      "outputs": {
+        "exposure_csv": ".data\\processed_data\\competitive_exposure.csv"
+      }
+    },
+    "eda1": {
+      "status": "ok",
+      "figures_dir": "figures\\favorita_analysis"
+    },
+    "eda2": {
+      "status": "ok",
+      "figures_dir": "figures\\favorita_analysis"
+    },
+    "step3": {
+      "status": "ok",
+      "outputs": {
+        "pairs_path": ".data\\processed_data\\pairs_windows.csv",
+        "donors_path": ".data\\processed_data\\donors_per_victim.csv"
+      }
+    },
+    "eda3": {
+      "status": "ok",
+      "figures_dir": "figures\\favorita_analysis"
+    },
+    "step4": {
+      "status": "ok",
+      "outputs": {
+        "episodes_index": ".data\\processed_data\\episodes_index.parquet",
+        "gsc_dir": ".data\\processed_data\\gsc",
+        "meta_all": ".data\\processed_data\\meta\\all_units.parquet",
+        "panel_features": ".data\\processed_data\\intermediate\\panel_features.parquet",
+        "donor_quality": ".data\\processed_data\\gsc\\donor_quality.parquet"
+      }
+    },
+    "eda4": {
+      "status": "ok",
+      "figures_dir": "figures\\favorita_analysis"
+    }
+  },
+  "end_time": "2025-10-19T20:37:32.748342"
+}

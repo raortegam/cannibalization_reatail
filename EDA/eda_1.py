@@ -246,19 +246,22 @@ def _compute_run_lengths(train: pd.DataFrame,
                          promo_col: str) -> pd.Series:
     """
     Calcula longitudes de rachas (consecutivos de True en onpromotion)
-    por grupo (p.ej., tienda-ítem).
-    Devuelve una Serie con las longitudes de rachas (sólo para onpromotion=True).
+    por grupo (p.ej., tienda-ítem). Devuelve una Serie con las longitudes
+    de rachas (sólo para onpromotion=True).
     """
     df = train.sort_values(group_cols + [date_col]).copy()
-    # ID de racha por grupo: cumsum cuando cambia el flag
-    run_id = df.groupby(group_cols, observed=True)[promo_col].apply(
-        lambda s: s.ne(s.shift()).cumsum()  # numera bloques de 0s y 1s alternados
-    )
-    df = df.join(run_id.rename("run_id"))
-    # Longitud de cada bloque (dentro de grupo)
-    df["run_len"] = df.groupby(group_cols + ["run_id"], observed=True)[promo_col].transform("size")
-    # Nos quedamos con bloques donde promo=True, una fila por bloque
+
+    # ID incremental de bloque cada vez que cambia el flag, preservando el índice del df
+    df["run_id"] = df.groupby(group_cols, observed=True)[promo_col] \
+                     .transform(lambda s: s.ne(s.shift()).cumsum())
+
+    # Longitud de cada bloque dentro de cada grupo
+    df["run_len"] = df.groupby(group_cols + ["run_id"], observed=True)[promo_col] \
+                      .transform("size")
+
+    # Mantener una fila por bloque donde promo=True
     on_blocks = df[df[promo_col]].drop_duplicates(subset=group_cols + ["run_id"])
+
     return on_blocks["run_len"]
 
 

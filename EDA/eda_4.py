@@ -41,7 +41,7 @@ import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Union
 
 import numpy as np
 import pandas as pd
@@ -78,6 +78,26 @@ class EDAConfig:
     # Logging
     log_level: str = "INFO"
 
+# --- Helpers de rutas robustos a str | Path ---
+
+PathLike = Union[str, Path]
+
+def _to_path(p: Optional[PathLike]) -> Optional[Path]:
+    if p is None:
+        return None
+    return p if isinstance(p, Path) else Path(p)
+
+def _coerce_all_paths(cfg: "EDAConfig") -> "EDAConfig":
+    # Entradas
+    cfg.processed_dir  = _to_path(cfg.processed_dir)
+    cfg.episodes_index = _to_path(cfg.episodes_index)
+    cfg.donor_quality  = _to_path(cfg.donor_quality)
+    cfg.meta_all       = _to_path(cfg.meta_all)
+    cfg.panel_features = _to_path(cfg.panel_features)
+    cfg.gsc_dir        = _to_path(cfg.gsc_dir)
+    # Salida
+    cfg.out_dir        = _to_path(cfg.out_dir) or Path("./reports/eda")
+    return cfg
 
 def _setup_logging(level: str = "INFO"):
     numeric_level = getattr(logging, level.upper(), logging.INFO)
@@ -91,15 +111,32 @@ def _setup_logging(level: str = "INFO"):
 def _resolve_paths(cfg: EDAConfig) -> EDAConfig:
     """
     Completa rutas a partir de processed_dir si no se proveen explícitamente.
+    Acepta str | Path en los atributos de cfg.
     """
+    # Asegura que todo en cfg sean Path (o None)
+    cfg = _coerce_all_paths(cfg)
+
     if cfg.processed_dir is not None:
-        p = cfg.processed_dir
-        cfg.episodes_index = cfg.episodes_index or (p / "episodes_index.parquet")
-        cfg.donor_quality = cfg.donor_quality or (p / "gsc" / "donor_quality.parquet")
-        cfg.meta_all = cfg.meta_all or (p / "meta" / "all_units.parquet")
-        cfg.panel_features = cfg.panel_features or (p / "intermediate" / "panel_features.parquet")
-        cfg.gsc_dir = cfg.gsc_dir or (p / "gsc")
+        p = cfg.processed_dir  # Path garantizado
+        cfg.episodes_index  = cfg.episodes_index  or (p / "episodes_index.parquet")
+        cfg.donor_quality   = cfg.donor_quality   or (p / "gsc" / "donor_quality.parquet")
+        cfg.meta_all        = cfg.meta_all        or (p / "meta" / "all_units.parquet")
+        cfg.panel_features  = cfg.panel_features  or (p / "intermediate" / "panel_features.parquet")
+        cfg.gsc_dir         = cfg.gsc_dir         or (p / "gsc")
+
+    # Asegurar directorio de salida
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Log informativo: rutas resueltas
+    logging.info("Rutas resueltas EDA4:")
+    logging.info("  processed_dir  : %s", cfg.processed_dir)
+    logging.info("  episodes_index : %s", cfg.episodes_index)
+    logging.info("  donor_quality  : %s", cfg.donor_quality)
+    logging.info("  meta_all       : %s", cfg.meta_all)
+    logging.info("  panel_features : %s", cfg.panel_features)
+    logging.info("  gsc_dir        : %s", cfg.gsc_dir)
+    logging.info("  out_dir        : %s", cfg.out_dir)
+
     return cfg
 
 
@@ -146,8 +183,8 @@ def _ensure_datetime(df: pd.DataFrame, col: str = "date") -> pd.DataFrame:
     return df
 
 
-def _exists(p: Optional[Path]) -> bool:
-    return (p is not None) and p.exists()
+def _exists(p: Optional[PathLike]) -> bool:
+    return (p is not None) and Path(p).exists()
 
 
 # ---------------------------------------------------------------------

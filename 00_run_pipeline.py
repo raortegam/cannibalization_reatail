@@ -50,7 +50,8 @@ SRC_DIR = REPO_ROOT / "src"
 EDA_DIR = REPO_ROOT / "EDA"
 DIAG_DIR = REPO_ROOT / "diagnostics"
 
-def ensure_dir(p: Path) -> Path:
+def ensure_dir(p: str | Path) -> Path:
+    p = Path(p)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -90,6 +91,27 @@ def seed_everything(seed: int = 2025) -> None:
     except Exception:
         pass
 
+def import_module_spawn_safe(module_name: str, real_path: Path):
+    """
+    Garantiza que el módulo sea importable por nombre en procesos hijos (Windows spawn).
+    Crea una copia con nombre válido en .data/_temp_modules/<module_name>.py y la importa.
+    """
+    tmp_dir = REPO_ROOT / ".data" / "_temp_modules"
+    ensure_dir(tmp_dir)
+    dest = tmp_dir / f"{module_name}.py"
+    try:
+        # Copia si no existe o si el source es más nuevo
+        if (not dest.exists()) or (real_path.stat().st_mtime > dest.stat().st_mtime):
+            shutil.copy2(str(real_path), str(dest))
+    except Exception as e:
+        raise ImportError(f"No pude preparar alias spawn-safe para {module_name}: {e}")
+
+    # Asegura que el tmp_dir esté al frente del sys.path
+    if str(tmp_dir) not in sys.path:
+        sys.path.insert(0, str(tmp_dir))
+
+    # Importación normal: esto asegura presencia en sys.modules
+    return importlib.import_module(module_name)
 
 def _dynamic_import(module_name: str, py_path: Path):
     """
@@ -184,6 +206,7 @@ class ParamsConfig:
     sales_col: Optional[str] = "unit_sales"
     tx_col: str = "transactions"
     save_report_json: Optional[Path] = None
+    h_bin_threshold: float = 0.02
 
     # Step 2: Competitive Exposure
     neighborhood_col: Optional[str] = None  # si aplica
@@ -401,20 +424,21 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         if compute_competitive_exposure is not None:
             ensure_dir(cfg.paths.processed_dir)
             _ = _safe_call(
-                compute_competitive_exposure,
-                logger,
-                cfg.fail_fast,
-                "2. Competitive Exposure",
-                train_path=str(train_for_next),
-                items_path=str(cfg.paths.items_csv) if cfg.paths.items_csv else None,
-                date_col=cfg.params.date_col,
-                store_col=cfg.params.store_col,
-                item_col=cfg.params.item_col,
-                promo_col=cfg.params.promo_col,
-                neighborhood_col=cfg.params.neighborhood_col if cfg.params.neighborhood_col else "neighborhood",
-                save_path=str(exposure_path),
-                save_format=cfg.params.save_format,
-            )
+            compute_competitive_exposure,
+            logger,
+            cfg.fail_fast,
+            "2. Competitive Exposure",
+            train_path=str(train_for_next),
+            items_path=str(cfg.paths.items_csv) if cfg.paths.items_csv else None,
+            date_col=cfg.params.date_col,
+            store_col=cfg.params.store_col,
+            item_col=cfg.params.item_col,
+            promo_col=cfg.params.promo_col,
+            neighborhood_col=cfg.params.neighborhood_col if cfg.params.neighborhood_col else "neighborhood",
+            bin_threshold=cfg.params.h_bin_threshold,  # <--- NUEVO
+            save_path=str(exposure_path),
+            save_format=cfg.params.save_format,
+        )
         else:
             logger.warning("Paso 2 omitido (función no disponible).")
 
@@ -513,10 +537,10 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         try:
             sp_path = SRC_DIR / "preprocess_data" / "3. select_pairs_and_donors.py"
             if sp_path.exists():
-                sp_mod = _dynamic_import("select_pairs_and_donors", sp_path)
+                sp_mod = import_module_spawn_safe("select_pairs_and_donors", sp_path)  # <-- usar helper spawn-safe
                 select_pairs_and_donors = getattr(sp_mod, "select_pairs_and_donors")
             else:
-                from preprocess_data.select_pairs_and_donors import select_pairs_and_donors  # type: ignore
+                from preprocess_data.select_pairs_and_donors import select_pairs_and_donors  # fallback
         except Exception:
             logger.exception("No se pudo localizar 'select_pairs_and_donors'.")
             if cfg.fail_fast:
@@ -597,7 +621,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         try:
             pa_path = SRC_DIR / "preprocess_data" / "4. pre_algorithm.py"
             if pa_path.exists():
-                pa_mod = _dynamic_import("pre_algorithm", pa_path)
+                pa_mod = import_module_spawn_safe("pre_algorithm", pa_path)
                 PrepConfig = getattr(pa_mod, "PrepConfig")
                 prepare_datasets = getattr(pa_mod, "prepare_datasets")
             else:

@@ -23,7 +23,7 @@ paths:
   # Directorios base
   raw_dir: ".data/raw_data"
   processed_dir: ".data/processed_data"
-  preprocessed_dir: ".data/preprocessed_data"
+  preprocessed_dir: ".data/processed_data"
   figures_dir: "figures/favorita_analysis"
 
   # Entradas (ajusta a tus nombres reales de archivos)
@@ -45,14 +45,15 @@ params:
   promo_col: "onpromotion"
   sales_col: "unit_sales"
   tx_col: "transactions"
+  h_bin_threshold: 0.02
   # save_report_json: ".data/processed_data/data_quality_report.json"  # opcional
 
   # ---------------- Paso 2: Competitive Exposure --------
-  neighborhood_col: "neighborhood"   # si no existe, la función puede ignorarlo
+  neighborhood_col: "class"   # si no existe, la función puede ignorarlo
   save_format: null                  # infiere por extensión; usa CSV por compatibilidad
 
   # ---------------- Paso 3: Select Pairs & Donors -------
-  outdir_pairs_donors: ".data/preprocessed_data"
+  outdir_pairs_donors: ".data/processed_data"
 
   # ---------------- Paso 4: Pre-Algorithm Prep ----------
   top_k_donors: 10

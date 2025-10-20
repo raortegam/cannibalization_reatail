@@ -17,3 +17,4 @@ reports/figures/
 # Archivos temporales
 *.log
 .DS_Store
+figures

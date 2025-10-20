@@ -42,11 +42,15 @@ def compute_competitive_exposure(
     item_col: str = "item_nbr",
     promo_col: str = "onpromotion",
     neighborhood_col: str = "neighborhood",
+    # parámetros nuevos
+    bin_threshold: float = 0.02,      # UMBRAL para H_bin
+    include_self: bool = False,       # si True, no excluye al propio ítem (no recomendado)
     # salida
     save_path: Optional[str] = None,
-    save_format: Optional[str] = None,  # "csv" | "parquet"; si None, infiere por extensión de save_path
+    save_format: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Calcula competitive exposure excluyendo el ítem propio."""
+    """Calcula exposición competitiva excluyendo el ítem propio y exporta H_prop, H_bin, H_disc."""
+
     train = pd.read_csv(train_path, parse_dates=[date_col])
 
     # neighborhood: merge opcional si no existe en train
@@ -58,30 +62,33 @@ def compute_competitive_exposure(
         items = pd.read_csv(items_path, usecols=[item_col, neighborhood_col])
         train = train.merge(items, on=item_col, how="left", validate="many_to_one")
 
-    # Definición de grupo (tienda-fecha-vecindario)
-    grp_cols: List[str] = [date_col, store_col, neighborhood_col]
+    grp_cols = [date_col, store_col, neighborhood_col]
 
-    # Conteos por grupo (vectorizado)
-    # n_total: número de filas (cada fila debe ser única por item)
-    n_total = train.groupby(grp_cols, observed=True)[item_col].transform("size")
-    # n_promos: número de items en promo
-    # onpromotion se asume booleano; sum cuenta True
+    # Tamaños y conteos por grupo
+    n_total  = train.groupby(grp_cols, observed=True)[item_col].transform("size")
     n_promos = train.groupby(grp_cols, observed=True)[promo_col].transform("sum")
 
-    # Excluir el propio ítem (self-exclusion)
-    self_in_promo = train[promo_col].astype("int8")
-    numer = n_promos - self_in_promo
-    denom = n_total - 1
+    self_promo = train[promo_col].astype("int8")
+    if include_self:
+        numer = n_promos
+        denom = n_total
+    else:
+        numer = n_promos - self_promo  # descuenta al propio ítem
+        denom = n_total - 1
 
-    exposure = np.where(denom > 0, numer / denom, np.nan)
-    # Boundaries por estabilidad numérica
-    exposure = np.clip(exposure, 0.0, 1.0)
+    # Proporción y conteo (otros ítems en promo)
+    H_prop = np.where(denom > 0, numer / denom, np.nan)  # NaN si no hay "otros"
+    H_prop = np.clip(H_prop, 0.0, 1.0).astype("float32")
+    H_disc = np.clip(numer, 0, None).astype("int32")
+    H_bin  = (H_prop >= float(bin_threshold)).astype("int8")
 
-    out_cols = [date_col, store_col, item_col, "competitive_exposure"]
     out = train[[date_col, store_col, item_col]].copy()
-    out["competitive_exposure"] = exposure
+    out["H_prop"] = H_prop
+    out["H_bin"]  = H_bin
+    out["H_disc"] = H_disc
+    # Compatibilidad con EDA 2 existente
+    out["competitive_exposure"] = out["H_prop"]
 
-    # Guardado opcional
     if save_path:
         save_path = str(Path(save_path))
         ext = save_format or Path(save_path).suffix.lower().replace(".", "")
