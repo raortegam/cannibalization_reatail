@@ -1,525 +1,859 @@
+# -*- coding: utf-8 -*-
+"""
+synthetic_control.py
+====================
+
+Implementación de Control Sintético Generalizado (GSC) para el estudio de
+canibalización en retail sobre paneles episodios (víctima + donantes).
+
+Características clave
+---------------------
+- Estimación por *interactive fixed effects* (factores latentes) vía SoftImpute
+  (Mazumder et al., 2010): descomposición de bajo rango con *shrinkage* nuclear.
+- Opción de covariables X_it (proxies semanales, Fourier, rezagos, feriados,
+  tendencia/disponibilidad STL, dummies tienda, etc.) con actualización alternada:
+      Y_it ≈ L_it + X_it'β    con M_ij como máscara de observación
+- Selección de hiperparámetros (rango, τ, α) con validación cruzada en el tiempo
+  sobre la unidad tratada usando únicamente datos *pre*.
+- Contrafactual para la víctima en *post*, efectos diarios y agregados (ATT).
+- Validación causal: placebos en el espacio (treat cada donante) e in-time
+  (ventana pre desplazada), *p-values* por ranking.
+- Robustez: *leave-one-out* retirando controles; sensibilidad global (muestreo
+  sobre hiperparámetros/especificaciones).
+- Salidas listas para comparar con Meta-learners.
+
+Entradas esperadas
+------------------
+- Carpeta con parquets por episodio (panel largo) generados por `pre_algorithm.py`:
+    ./.data/processed_data/gsc/<episode_id>.parquet
+  con columnas al menos:
+    ['date','store_nbr','item_nbr','sales','treated_unit','treated_time','D','unit_id', ... features ...]
+
+- (Opcional) Índice de episodios:
+    ./.data/processed_data/episodes_index.parquet
+
+- Donantes por víctima:
+    ./.data/processed_data/donors_per_victim.csv
+
+Salidas
+-------
+- cf_series/<episode_id>_cf.parquet         : serie diaria y_hat_cf, efecto, etc.
+- placebos/<episode_id>_space.parquet       : ATTs placebo en espacio (por donante)
+- placebos/<episode_id>_time.parquet        : ATT placebo in-time
+- loo/<episode_id>_loo.parquet              : ATTs al excluir 1 control
+- reports/<episode_id>.json                 : reporte por episodio (hiperparámetros, métricas)
+- gsc_metrics.parquet                       : resumen por episodio (para comparar con Meta)
+
+CLI (ejemplo)
+-------------
+python -m src.models.synthetic_control \
+  --gsc_dir ./.data/processed_data/gsc \
+  --episodes_index ./.data/processed_data/episodes_index.parquet \
+  --donors_csv ./.data/processed_data/donors_per_victim.csv \
+  --out_dir ./.data/processed_data/gsc_outputs \
+  --max_episodes 50 --cv_folds 3 --cv_holdout 21 \
+  --grid_ranks "1,2,3" --grid_tau "0.5,1.0,2.0" --grid_alpha "0.0,0.01,0.1" \
+  --include_covariates
+
+Limitaciones
+------------
+- SoftImpute implementado con SVD denso (NumPy). Para paneles muy grandes,
+  considerar un solver esparso/convexo dedicado o *warm starts*.
+- La inferencia (p-values) se basa en placebos (randomización en espacio)
+  y no en errores estándar asintóticos.
+
+Autor: generado por GPT-5 Pro.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import argparse
+import json
+import logging
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import numpy as _np
+import numpy as np
 import pandas as pd
 
-# Intento opcional de usar CuPy (GPU). Si no está disponible, cae a NumPy.
-try:  # pragma: no cover
-    import cupy as _cp  # type: ignore
-    _CUPY_OK = True
-except Exception:  # pragma: no cover
-    _cp = None  # type: ignore
-    _CUPY_OK = False
+
+# ---------------------------------------------------------------------
+# Utilidades generales
+# ---------------------------------------------------------------------
+
+def _to_path(p: str | Path) -> Path:
+    return p if isinstance(p, Path) else Path(p)
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def _sorted_unique(a: Iterable) -> List:
+    return sorted(list(dict.fromkeys(a)))
+
+def _as_datetime(s: pd.Series) -> pd.Series:
+    if np.issubdtype(s.dtype, np.datetime64):
+        return s
+    return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
+
+def _nanrmspe(y, yhat) -> float:
+    m = np.isfinite(y) & np.isfinite(yhat)
+    if not np.any(m):
+        return np.nan
+    e = y[m] - yhat[m]
+    denom = np.maximum(1.0, np.nanmean(np.square(y[m])) ** 0.5)
+    return float(np.sqrt(np.nanmean(e**2)) / denom)
+
+def _rmspe(y, yhat) -> float:
+    e = y - yhat
+    denom = max(1.0, float(np.sqrt(np.mean(y**2))))
+    return float(np.sqrt(np.mean(e**2)) / denom)
+
+def _mae(y, yhat) -> float:
+    return float(np.mean(np.abs(y - yhat)))
+
+def _safe_pct(a: float, b: float) -> float:
+    if abs(b) < 1e-8:
+        return np.nan
+    return float(a / b)
+
+def _augment_ridge(X: np.ndarray, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Construye el sistema aumentado para resolver ridge con lstsq."""
+    n, p = X.shape
+    if alpha <= 0:
+        return X, np.eye(0)  # sin regularización
+    A = np.sqrt(alpha) * np.eye(p)
+    return np.vstack([X, A]), A  # A devuelto sólo por compatibilidad
 
 
-# ==============================
-# Resultados y helpers públicos
-# ==============================
+# ---------------------------------------------------------------------
+# Selección de covariables y armado de matrices wide
+# ---------------------------------------------------------------------
+
+EXCLUDE_BASE_COLS = {
+    # identificadores / etiquetas
+    "id", "date", "year_week", "store_nbr", "item_nbr", "unit_id",
+    "family_name",
+    # objetivo y tratamiento
+    "sales", "treated_unit", "treated_time", "D",
+    # calidad donante / auxiliares
+    "episode_id", "is_victim", "promo_share", "avail_share", "keep", "reason",
+    # potencialmente post-tratamiento o no exógena
+    "onpromotion",
+}
+
+def select_feature_cols(df: pd.DataFrame) -> List[str]:
+    """Elige columnas numéricas 'seguras' como X_it."""
+    num = df.select_dtypes(include=[np.number]).columns.tolist()
+    feats = []
+    for c in num:
+        if c in EXCLUDE_BASE_COLS:
+            continue
+        # Heurística: mantener Fourier/rezagos/proxies/feriados/dummies tienda/mes/tendencias
+        if (
+            c.startswith("fourier_") or c.startswith("lag_") or
+            c in {"Fsw_log1p", "Ow", "HNat", "HReg", "HLoc",
+                  "is_bridge", "is_additional", "is_work_day",
+                  "trend_T", "available_A", "Q_store_trend",
+                  "month"} or
+            c.startswith("type_") or c.startswith("cluster_") or c.startswith("state_")
+        ):
+            feats.append(c)
+    # Asegurar orden estable
+    feats = sorted(list(dict.fromkeys(feats)))
+    return feats
+
 
 @dataclass
-class GSCResult:
-    """Resultados de Generalized Synthetic Control (matrix completion baja-rango).
-
-    Atributos
-    ---------
-    att: float
-        Efecto promedio del tratamiento (ATT) en el periodo post (promedio sobre celdas tratadas post).
-    att_t: pd.Series
-        ATT por tiempo (index = valores de `time` en post). Promedia sobre unidades tratadas con D_it=1.
-    att_i: pd.Series
-        ATT por unidad tratada (index = ids tratados). Promedia sobre periodos post donde D_it=1.
-    y0_hat: pd.DataFrame
-        Contrafactual imputado Y(0) solo para celdas tratadas en post (NaN en otras celdas).
-    tau_it: pd.DataFrame
-        Efecto por celda tratada en post (= Y - y0_hat). NaN fuera de celdas tratadas post.
-    full_y_hat: pd.DataFrame
-        Reconstrucción baja-rango completa (todas las celdas). Útil para diagnóstico.
-    r: int
-        Rango/factores efectivos utilizados.
-    factors: pd.DataFrame
-        Factores en el tiempo (t x r), indexado por time.
-    loadings: pd.DataFrame
-        Cargas por unidad (i x r), indexado por id.
-    metrics: Dict[str, Any]
-        Métricas y diagnósticos (p.ej., pre_rmse, n_iter, converged, backend, device).
-    """
-
-    att: float
-    att_t: pd.Series
-    att_i: pd.Series
-    y0_hat: pd.DataFrame
-    tau_it: pd.DataFrame
-    full_y_hat: pd.DataFrame
-    r: int
-    factors: pd.DataFrame
-    loadings: pd.DataFrame
-    metrics: Dict[str, Any]
+class EpisodeWide:
+    Y: np.ndarray                # (U,T) ventas
+    M: np.ndarray                # (U,T) máscara de observación (True si observado)
+    X: Optional[np.ndarray]      # (U,T,P) covariables (o None)
+    units: List[str]             # unit_id ordenadas (víctima va primero)
+    dates: List[pd.Timestamp]    # fechas ordenadas
+    treated_row: int             # índice de fila de la víctima (0)
+    treated_post_mask: np.ndarray# (T,) bool, columnas post para víctima
+    pre_mask: np.ndarray         # (T,) bool, columnas pre para víctima
+    feats: List[str]             # nombres de features
+    meta: Dict                   # metadatos varios
 
 
-# ------------------------------
-# Helpers de preparación de datos
-# ------------------------------
-
-def derive_treat_from_adoption(
-    df: pd.DataFrame,
-    id_col: str,
-    time_col: str,
-    adoption_time_col: str,
-    out_treat_col: str = "D",
-) -> pd.DataFrame:
-    """Deriva D_it = 1[t >= t0_i] a partir de fecha de adopción por unidad.
-
-    No sobrescribe columnas existentes; retorna un nuevo DataFrame con `out_treat_col`.
-    """
+def long_to_wide_for_episode(df: pd.DataFrame, include_covariates: bool = True) -> EpisodeWide:
+    """Convierte panel largo del episodio a matrices wide (unidades x fecha)."""
     d = df.copy()
-    adop = d[[id_col, adoption_time_col]].drop_duplicates(subset=[id_col]).set_index(id_col)[adoption_time_col]
-    d = d.merge(adop.rename("__adopt__"), how="left", left_on=id_col, right_index=True)
-    d[out_treat_col] = (d[time_col] >= d["__adopt__"]) & d["__adopt__"].notna()
-    d.drop(columns=["__adopt__"], inplace=True)
-    return d
+    d["date"] = _as_datetime(d["date"])
+    d = d.sort_values(["date", "store_nbr", "item_nbr"])
 
+    # Asegurar victim primero
+    d["__is_victim__"] = (d["treated_unit"] == 1).astype(int)
+    units = _sorted_unique(d.sort_values(["__is_victim__", "unit_id"], ascending=[False, True])["unit_id"])
+    dates = _sorted_unique(d["date"])
 
-def prepare_panel(
-    df: pd.DataFrame,
-    id_col: str,
-    time_col: str,
-    y_col: str,
-    treat_col: Optional[str],
-) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
-    """Construye matrices anchas Y (id x tiempo) y D (si existe)."""
-    Y = df.pivot(index=id_col, columns=time_col, values=y_col).sort_index(axis=0).sort_index(axis=1)
-    D = None
-    if treat_col is not None and treat_col in df.columns:
-        D = df.pivot(index=id_col, columns=time_col, values=treat_col).sort_index(axis=0).sort_index(axis=1)
-    return Y, D
+    U, T = len(units), len(dates)
 
+    # Pivot ventas
+    Y = np.full((U, T), np.nan, dtype=float)
+    treated_time_vec = np.zeros(T, dtype=bool)
 
-def _sorted_unique(values: Iterable[Any]) -> List[Any]:
-    return sorted(pd.unique(pd.Series(list(values))).tolist())
+    # Features
+    feats = select_feature_cols(d) if include_covariates else []
+    P = len(feats)
+    X = np.zeros((U, T, P), dtype=float) if include_covariates and P > 0 else None
 
+    # Mapa índice
+    unit2idx = {u: i for i, u in enumerate(units)}
+    date2idx = {dt: j for j, dt in enumerate(dates)}
 
-# ------------------------------
-# Selección de donantes (opcional, CPU)
-# ------------------------------
+    for _, r in d.iterrows():
+        i = unit2idx[r["unit_id"]]
+        j = date2idx[r["date"]]
+        Y[i, j] = float(r["sales"])
+        if int(r["treated_unit"]) == 1 and int(r["treated_time"]) == 1:
+            treated_time_vec[j] = True
+        if include_covariates and P > 0:
+            for k, c in enumerate(feats):
+                val = r.get(c, np.nan)
+                X[i, j, k] = 0.0 if pd.isna(val) else float(val)
 
-def find_donors(
-    df: pd.DataFrame,
-    id_col: str,
-    time_col: str,
-    y_col: str,
-    treat_col: str,
-    pre_start: Any,
-    pre_end: Any,
-    K: int = 10,
-    min_pre_periods: int = 8,
-    extra_filters: Optional[Dict[str, Any]] = None,
-    method: str = "cosine",  # "cosine" | "corr" | "euclidean"
-) -> Dict[Any, List[Any]]:
-    """Selecciona K donantes por unidad tratada usando similitud en pre (CPU/NumPy)."""
-    d = df.copy()
-    if extra_filters:
-        for k, v in extra_filters.items():
-            d = d[d[k] == v]
-
-    d_pre = d[(d[time_col] >= pre_start) & (d[time_col] <= pre_end)].copy()
-    Y = d_pre.pivot(index=id_col, columns=time_col, values=y_col)
-    counts = (~Y.isna()).sum(axis=1)
-    ok_ids = counts[counts >= min_pre_periods].index
-    Y = Y.loc[ok_ids]
-
-    treated_flag = d.groupby(id_col)[treat_col].max().reindex(Y.index).fillna(0).astype(int)
-    treated_ids = treated_flag[treated_flag > 0].index.tolist()
-    control_ids = treated_flag[treated_flag == 0].index.tolist()
-    if not treated_ids or not control_ids:
-        return {}
-
-    col_means = Y.mean(axis=0, skipna=True)
-    Y_dm = (Y - col_means).fillna(0.0)
-    row_mean = Y_dm.mean(axis=1)
-    row_std = Y_dm.std(axis=1).replace(0, 1.0)
-    Y_std = ((Y_dm.sub(row_mean, axis=0)).div(row_std, axis=0)).astype(float)
-
-    T = Y_std.loc[treated_ids].to_numpy(dtype=float)
-    C = Y_std.loc[control_ids].to_numpy(dtype=float)
-
-    donors: Dict[Any, List[Any]] = {}
-    if method in ("cosine", "corr"):
-        def _normalize_rows(A: _np.ndarray) -> _np.ndarray:
-            nrm = _np.linalg.norm(A, axis=1, keepdims=True)
-            nrm[nrm == 0] = 1.0
-            return A / nrm
-        Tn = _normalize_rows(T)
-        Cn = _normalize_rows(C)
-        sim = Tn @ Cn.T
-        rank = _np.argsort(-sim, axis=1)
-    else:
-        T2 = (T ** 2).sum(axis=1, keepdims=True)
-        C2 = (C ** 2).sum(axis=1, keepdims=True).T
-        cross = T @ C.T
-        dist = _np.sqrt(_np.maximum(T2 + C2 - 2.0 * cross, 0.0))
-        rank = _np.argsort(dist, axis=1)
-
-    ctrl_list = control_ids
-    for i, tid in enumerate(treated_ids):
-        idx = rank[i, : min(K, len(ctrl_list))]
-        donors[tid] = [ctrl_list[j] for j in idx]
-    return donors
-
-
-# ==============================
-# Núcleo GSC (GPU con CuPy, fallback CPU)
-# ==============================
-
-class _XP:
-    """Pequeño wrapper para escoger backend NumPy/CuPy y mover datos."""
-
-    def __init__(self, prefer_gpu: bool = True, force_gpu: bool = False):
-        self.using_gpu = False
-        if prefer_gpu and _CUPY_OK:
-            try:  # pragma: no cover
-                _cp.cuda.runtime.getDeviceCount()  # valida acceso a GPU
-                self.xp = _cp
-                self.using_gpu = True
-            except Exception:
-                if force_gpu:
-                    raise RuntimeError("No se pudo inicializar GPU/CuPy.")
-                self.xp = _np
-        else:
-            if force_gpu:
-                raise RuntimeError("'cupy' no está instalado para ejecución en GPU.")
-            self.xp = _np
-
-    def to_xp(self, a, dtype=_np.float64):
-        if self.using_gpu:
-            return self.xp.asarray(a, dtype=dtype)
-        return _np.asarray(a, dtype=dtype)
-
-    def to_np(self, a):
-        if self.using_gpu:
-            return _cp.asnumpy(a)
-        return a
-
-
-def _initial_fill_xp(xp, Y, obs_mask):
-    # Basado en medias de fila/columna sobre observados
-    filled = Y.copy()
-    gmean = xp.nanmean(Y[obs_mask]) if bool(obs_mask.any()) else xp.array(0.0, dtype=Y.dtype)
-    row_means = xp.where(
-        obs_mask.sum(axis=1, keepdims=True) > 0,
-        xp.nansum(xp.where(obs_mask, Y, 0.0), axis=1, keepdims=True)
-        / xp.clip(obs_mask.sum(axis=1, keepdims=True), 1, None),
-        gmean,
+    # Máscara: observado todo excepto víctima en post
+    treated_row = 0 if d.loc[d["treated_unit"] == 1, "unit_id"].head(1).tolist() and units[0] == d.loc[d["treated_unit"] == 1, "unit_id"].iloc[0] else units.index(
+        d.loc[d["treated_unit"] == 1, "unit_id"].iloc[0]
     )
-    col_means = xp.where(
-        obs_mask.sum(axis=0, keepdims=True) > 0,
-        xp.nansum(xp.where(obs_mask, Y, 0.0), axis=0, keepdims=True)
-        / xp.clip(obs_mask.sum(axis=0, keepdims=True), 1, None),
-        gmean,
-    )
-    base = row_means + col_means - gmean
-    filled = filled.copy()
-    filled[~obs_mask] = base[~obs_mask]
-    filled = xp.where(xp.isfinite(filled), filled, gmean)
-    return filled
+    M = np.isfinite(Y)
+    # Celdas no observadas: víctima en post
+    M[treated_row, treated_time_vec] = False
 
+    pre_mask = ~treated_time_vec
 
-def _choose_rank_via_ic_xp(xp, U, S, Vt, Y_true, pre_mask, r_grid: Sequence[int]) -> int:
-    n, t = Y_true.shape
-    n_obs = int(pre_mask.sum())
-    n_obs = max(n_obs, 1)
-    best_r, best_obj = 1, float("inf")
-    for r in r_grid:
-        r = max(1, int(r))
-        Ur, Sr, Vtr = U[:, :r], S[:r], Vt[:r, :]
-        Yhat = Ur @ xp.diag(Sr) @ Vtr
-        err = Y_true - Yhat
-        mse_pre = float((err[pre_mask] ** 2).mean()) if n_obs > 0 else float("inf")
-        pen = _np.log(max(n * t, 2)) * r * (n + t) / max(n * t, 2)
-        obj = mse_pre + float(pen)
-        if obj < best_obj:
-            best_obj, best_r = obj, r
-    return best_r
-
-
-def _em_svd_xp(
-    xp,
-    Y,
-    obs_mask,
-    pre_mask,
-    r: Optional[int],
-    r_grid: Tuple[int, int] = (1, 6),
-    max_iter: int = 200,
-    tol: float = 1e-4,
-) -> Tuple[Any, int, Dict[str, Any]]:
-    """EM con SVD truncado sobre backend xp (CuPy/NumPy)."""
-    n, t = Y.shape
-    filled = _initial_fill_xp(xp, Y, obs_mask)
-
-    chosen_r: Optional[int] = r
-    converged = False
-    it = 0
-    prev_missing = filled.copy()
-
-    r_candidates = list(range(r_grid[0], r_grid[1] + 1)) if r is None else [r]
-
-    while it < max_iter:
-        it += 1
-        U, S, Vt = xp.linalg.svd(filled, full_matrices=False)
-        if chosen_r is None:
-            chosen_r = _choose_rank_via_ic_xp(xp, U, S, Vt, Y_true=Y, pre_mask=pre_mask, r_grid=r_candidates)
-        r_eff = max(1, int(chosen_r))
-
-        Ur, Sr, Vtr = U[:, :r_eff], S[:r_eff], Vt[:r_eff, :]
-        Yhat = Ur @ xp.diag(Sr) @ Vtr
-
-        filled[~obs_mask] = Yhat[~obs_mask]
-
-        diff = Yhat[~obs_mask] - prev_missing[~obs_mask]
-        denom = float(xp.linalg.norm(prev_missing[~obs_mask])) + 1e-12
-        rel_change = float(xp.linalg.norm(diff)) / denom if denom > 0 else 0.0
-        prev_missing[~obs_mask] = Yhat[~obs_mask]
-
-        if rel_change < tol:
-            converged = True
-            break
-
-    metrics = {
-        "n_iter": it,
-        "converged": converged,
-        "rank": int(chosen_r if chosen_r is not None else r_eff),
+    meta = {
+        "n_units": U,
+        "n_time": T,
+        "victim_unit": units[treated_row],
+        "n_controls": U - 1,
+        "n_pre": int(pre_mask.sum()),
+        "n_post": int(treated_time_vec.sum()),
     }
-    return filled, int(chosen_r if chosen_r is not None else r_eff), metrics
+    return EpisodeWide(Y=Y, M=M, X=X, units=units, dates=dates,
+                       treated_row=treated_row,
+                       treated_post_mask=treated_time_vec,
+                       pre_mask=pre_mask,
+                       feats=feats,
+                       meta=meta)
 
 
-# ==============================
-# API pública: generalized_synth_gpu
-# ==============================
+# ---------------------------------------------------------------------
+# Núcleo GSC: SoftImpute + Ridge alternado
+# ---------------------------------------------------------------------
 
-def generalized_synth_gpu(
-    df: pd.DataFrame,
-    id_col: str,
-    time_col: str,
-    outcome_col: str,
-    treat_col: Optional[str] = None,
-    adoption_time_col: Optional[str] = None,
-    treated_units: Optional[Sequence[Any]] = None,
-    control_units: Optional[Sequence[Any]] = None,
-    pre_period: Optional[Tuple[Any, Any]] = None,
-    post_period: Optional[Tuple[Any, Any]] = None,
-    r: Optional[int] = None,
-    r_grid: Tuple[int, int] = (1, 6),
-    max_iter: int = 200,
-    tol: float = 1e-4,
-    prefer_gpu: bool = True,
-    force_gpu: bool = False,
-) -> GSCResult:
-    """GSC vía matrix completion (EM+SVD) ejecutado en GPU con CuPy cuando está disponible.
+@dataclass
+class GSCConfig:
+    rank: int = 2
+    tau: float = 1.0
+    alpha: float = 0.01        # ridge para β
+    max_inner: int = 100       # iteraciones SoftImpute
+    max_outer: int = 10        # alternancias (L <-> β)
+    tol: float = 1e-4
+    include_covariates: bool = True
+    random_state: int = 42
 
-    - Si `prefer_gpu=True` y hay GPU/CuPy, todo el núcleo iterativo corre en GPU.
-    - Si no hay GPU, cae a NumPy (CPU) salvo que `force_gpu=True` (entonces lanza error).
-    """
-    if treat_col is None and adoption_time_col is None:
-        raise ValueError("Debe especificar `treat_col` o `adoption_time_col`.")
 
-    d = df.copy()
-    if adoption_time_col is not None and (treat_col is None or treat_col not in d.columns):
-        d = derive_treat_from_adoption(d, id_col, time_col, adoption_time_col, out_treat_col="__D__")
-        treat_col_eff = "__D__"
-    else:
-        treat_col_eff = treat_col  # type: ignore
+class SoftImpute:
+    """SoftImpute con SVD denso y máscara M (True si observado)."""
 
-    needed = {id_col, time_col, outcome_col, treat_col_eff}
-    missing_cols = [c for c in needed if c not in d.columns]
-    if missing_cols:
-        raise ValueError(f"Faltan columnas requeridas: {missing_cols}")
+    def __init__(self, tau: float, rank: int, max_iters: int = 100, tol: float = 1e-4):
+        self.tau = float(tau)
+        self.rank = int(rank)
+        self.max_iters = int(max_iters)
+        self.tol = float(tol)
 
-    all_times = _sorted_unique(d[time_col])
-    if pre_period is None or post_period is None:
-        if adoption_time_col is not None and adoption_time_col in d.columns:
-            adop_map = d[[id_col, adoption_time_col]].dropna().drop_duplicates(subset=[id_col])
-            if adop_map.empty:
-                raise ValueError("`adoption_time_col` no tiene adopciones válidas para definir post.")
-            t0_min = adop_map[adoption_time_col].min()
-            pre_period = (all_times[0], min([t for t in all_times if t < t0_min])) if any(t < t0_min for t in all_times) else None
-            post_period = (min([t for t in all_times if t >= t0_min]), all_times[-1]) if any(t >= t0_min for t in all_times) else None
+    def fit(self, W: np.ndarray, M: np.ndarray) -> np.ndarray:
+        """
+        Resuelve: min_L 0.5||M*(W - L)||_F^2 + tau * ||L||_*
+        Iterando: L = S_tau( SVD( W_tilde ) ), con W_tilde = M*W + (1-M)*L_{t-1}
+        """
+        # Inicialización: cero para missing
+        L = np.nan_to_num(W, nan=0.0).copy()
+        prev_missing = L.copy()
+
+        for it in range(self.max_iters):
+            # SVD de la matriz "completa" actual
+            try:
+                U, s, Vt = np.linalg.svd(L, full_matrices=False)
+            except np.linalg.LinAlgError:
+                # fallback: pequeña perturbación
+                L = L + 1e-6 * np.random.randn(*L.shape)
+                U, s, Vt = np.linalg.svd(L, full_matrices=False)
+            # Soft-threshold a los singulares
+            s_shrunk = np.maximum(s - self.tau, 0.0)
+            r = int(min(self.rank, np.sum(s_shrunk > 0)))
+            if r <= 0:
+                r = 1  # asegurar al menos rango 1
+            L_new = (U[:, :r] * s_shrunk[:r]) @ Vt[:r, :]
+
+            # Mantener observados como W, missing como L_new
+            L = np.where(M, W, L_new)
+
+            # Convergencia en missing
+            miss_mask = ~M
+            num = np.linalg.norm((L - prev_missing)[miss_mask])
+            den = np.linalg.norm(prev_missing[miss_mask]) + 1e-8
+            rel = num / den
+            if rel < self.tol:
+                break
+            prev_missing = L.copy()
+        # Reconstrucción de L* (sin "pegar" observados)
+        # Rehacer SVD y devolver L_shrunk de la última iteración:
+        U, s, Vt = np.linalg.svd(L, full_matrices=False)
+        s_shrunk = np.maximum(s - self.tau, 0.0)
+        r = int(min(self.rank, np.sum(s_shrunk > 0)))
+        if r <= 0:
+            r = 1
+        L_star = (U[:, :r] * s_shrunk[:r]) @ Vt[:r, :]
+        return L_star
+
+
+class GSCModel:
+    """GSC con alternancia entre L (factores) y β (covariables) sobre máscara M."""
+
+    def __init__(self, cfg: GSCConfig):
+        self.cfg = cfg
+        self.beta_: Optional[np.ndarray] = None
+        self.L_: Optional[np.ndarray] = None
+        self.history_: Dict = {}
+
+    def fit(self, Y: np.ndarray, M: np.ndarray, X: Optional[np.ndarray] = None) -> "GSCModel":
+        rng = np.random.default_rng(self.cfg.random_state)
+        include_X = self.cfg.include_covariates and X is not None and X.ndim == 3 and X.shape[2] > 0
+        P = 0 if not include_X else X.shape[2]
+
+        # Inicialización
+        beta = np.zeros(P, dtype=float) if include_X else None
+        residual = Y.copy()
+
+        if include_X:
+            # Estándar: centramos X por columna (p) para estabilidad
+            X_flat = X.reshape(-1, P)
+            X_means = X_flat.mean(axis=0)
+            X_std = X_flat.std(axis=0) + 1e-8
+            self._x_means, self._x_std = X_means, X_std
         else:
-            raise ValueError("Si no pasa `pre_period`/`post_period`, necesita `adoption_time_col`.")
-    if pre_period is None or post_period is None:
-        raise ValueError("No se pudieron determinar `pre_period` y `post_period`.")
+            self._x_means, self._x_std = None, None
 
-    pre_start, pre_end = pre_period
-    post_start, post_end = post_period
+        def xbeta_all(beta_vec: Optional[np.ndarray]) -> np.ndarray:
+            if not include_X or beta_vec is None:
+                return np.zeros_like(Y)
+            # normalizar X y multiplicar
+            Xn = (X - self._x_means.reshape(1, 1, -1)) / self._x_std.reshape(1, 1, -1)
+            return np.tensordot(Xn, beta_vec, axes=(2, 0))  # (U,T,P)·(P,) -> (U,T)
 
-    # Paneles anchos
-    Y_w, D_w = prepare_panel(d, id_col, time_col, outcome_col, treat_col_eff)
-    units = Y_w.index.tolist()
-    times = Y_w.columns.tolist()
+        # Alternancia
+        hist = {"outer_obj": [], "rmspe_obs": []}
+        L = np.zeros_like(Y)
+        for outer in range(self.cfg.max_outer):
+            # Paso 1: SoftImpute sobre residuales observados
+            R = Y - (xbeta_all(beta) if include_X else 0.0)
+            W = np.where(M, R, np.nan)
+            L_est = SoftImpute(self.cfg.tau, self.cfg.rank, self.cfg.max_inner, self.cfg.tol).fit(W, M)
+            L = L_est
 
-    # Define conjuntos
-    if treated_units is None:
-        treated_units = (
-            D_w.max(axis=1) if D_w is not None else d.groupby(id_col)[treat_col_eff].max()
-        )
-        treated_units = treated_units[treated_units > 0].index.tolist()
-    if control_units is None:
-        control_units = [u for u in units if u not in set(treated_units)]
+            # Paso 2: Ridge para β con observados
+            if include_X:
+                R_obs = (Y - L)[M]
+                Xn = (X - self._x_means.reshape(1, 1, -1)) / self._x_std.reshape(1, 1, -1)
+                X_obs = Xn[M, :]  # filas (i,t) observadas
+                # Resolver ridge con sistema aumentado
+                if X_obs.size == 0:
+                    beta = np.zeros(P, dtype=float)
+                else:
+                    A, _ = _augment_ridge(X_obs, self.cfg.alpha)
+                    y_aug = np.concatenate([R_obs, np.zeros(X_obs.shape[1])]) if self.cfg.alpha > 0 else R_obs
+                    beta, *_ = np.linalg.lstsq(A, y_aug, rcond=None)
 
-    keep_units = [u for u in units if u in set(treated_units) or u in set(control_units)]
-    Y_np = Y_w.loc[keep_units, :].to_numpy(dtype=float)
-    if D_w is None:
-        D_w2 = d.pivot(index=id_col, columns=time_col, values=treat_col_eff).reindex(index=keep_units, columns=times)
-        D_np = D_w2.to_numpy(dtype=float)
+            # Métrica de seguimiento (RMSPE sobre observados)
+            yhat_obs = (L + (xbeta_all(beta) if include_X else 0.0))[M]
+            hist["rmspe_obs"].append(_rmspe(Y[M], yhat_obs))
+            # Criterio simple
+            if outer > 0 and abs(hist["rmspe_obs"][-1] - hist["rmspe_obs"][-2]) < 1e-5:
+                break
+
+        self.beta_ = beta
+        self.L_ = L
+        self.history_ = hist
+        return self
+
+    def predict(self, X: Optional[np.ndarray] = None) -> np.ndarray:
+        assert self.L_ is not None, "Modelo no ajustado."
+        if self.cfg.include_covariates and self.beta_ is not None and X is not None and X.ndim == 3:
+            Xn = (X - self._x_means.reshape(1, 1, -1)) / self._x_std.reshape(1, 1, -1)
+            Xb = np.tensordot(Xn, self.beta_, axes=(2, 0))
+            return self.L_ + Xb
+        return self.L_
+
+
+# ---------------------------------------------------------------------
+# Validación en el tiempo (selección de hiperparámetros)
+# ---------------------------------------------------------------------
+
+@dataclass
+class CVCfg:
+    folds: int = 3
+    holdout_days: int = 21
+    grid_ranks: Tuple[int, ...] = (1, 2, 3)
+    grid_tau: Tuple[float, ...] = (0.5, 1.0, 2.0)
+    grid_alpha: Tuple[float, ...] = (0.0, 0.01, 0.1)
+
+def time_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig) -> Tuple[GSCConfig, Dict]:
+    """Realiza validación cruzada sobre el periodo pre de la víctima."""
+    T = len(ep.dates)
+    pre_idx = np.where(ep.pre_mask)[0]
+    if len(pre_idx) < max(14, cv.holdout_days + 7):
+        # pre muy corto: usar configuración base
+        return base_cfg, {"cv_used": False, "score": np.nan, "best": asdict(base_cfg)}
+
+    # Construir folds por ventanas deslizantes al final del pre
+    H = int(cv.holdout_days)
+    fold_ends = list(range(pre_idx[-1] - H + 1, pre_idx[-1] - H * cv.folds + 1, -H))
+    fold_ends = [e for e in fold_ends if e >= pre_idx[0] + H - 1][:cv.folds]
+    if not fold_ends:
+        return base_cfg, {"cv_used": False, "score": np.nan, "best": asdict(base_cfg)}
+
+    results = []
+    for rnk in cv.grid_ranks:
+        for tau in cv.grid_tau:
+            for alpha in cv.grid_alpha:
+                cfg_try = GSCConfig(rank=rnk, tau=float(tau), alpha=float(alpha),
+                                    max_inner=base_cfg.max_inner, max_outer=base_cfg.max_outer,
+                                    tol=base_cfg.tol, include_covariates=base_cfg.include_covariates,
+                                    random_state=base_cfg.random_state)
+                fold_scores = []
+                for e in fold_ends:
+                    # Holdout última ventana H del pre para la víctima
+                    M_train = ep.M.copy()
+                    hold_j = np.arange(e - H + 1, e + 1, dtype=int)
+                    M_train[ep.treated_row, hold_j] = False  # ocultar como missing (validación)
+                    model = GSCModel(cfg_try).fit(ep.Y, M_train, ep.X)
+                    Yhat = model.predict(ep.X)
+                    y_true = ep.Y[ep.treated_row, hold_j]
+                    y_hat = Yhat[ep.treated_row, hold_j]
+                    fold_scores.append(_rmspe(y_true, y_hat))
+                results.append({
+                    "rank": rnk, "tau": float(tau), "alpha": float(alpha),
+                    "score": float(np.nanmedian(fold_scores)),
+                    "scores": fold_scores
+                })
+    # Selección por score mínimo (mediana)
+    best = min(results, key=lambda z: z["score"])
+    best_cfg = GSCConfig(rank=int(best["rank"]), tau=float(best["tau"]), alpha=float(best["alpha"]),
+                         max_inner=base_cfg.max_inner, max_outer=base_cfg.max_outer,
+                         tol=base_cfg.tol, include_covariates=base_cfg.include_covariates,
+                         random_state=base_cfg.random_state)
+    return best_cfg, {"cv_used": True, "score": best["score"], "best": best, "all": results}
+
+
+# ---------------------------------------------------------------------
+# Placebos, LOO y sensibilidad
+# ---------------------------------------------------------------------
+
+def placebo_space(ep: EpisodeWide, cfg: GSCConfig, max_units: int = 20) -> pd.DataFrame:
+    """Trata cada control como 'víctima' (misma ventana temporal) y estima ATT placebo."""
+    rows = []
+    control_rows = [i for i in range(len(ep.units)) if i != ep.treated_row]
+    control_rows = control_rows[:max_units]  # limitar costo
+    for r in control_rows:
+        M_alt = ep.M.copy()
+        # "finge" tratamiento en mismas columnas post pero para unidad r
+        M_alt[r, ep.treated_post_mask] = False
+        model = GSCModel(cfg).fit(ep.Y, M_alt, ep.X)
+        Yhat = model.predict(ep.X)
+        eff = ep.Y[r, ep.treated_post_mask] - Yhat[r, ep.treated_post_mask]
+        rows.append({
+            "unit_id": ep.units[r],
+            "att_placebo_mean": float(np.nanmean(eff)),
+            "att_placebo_sum": float(np.nansum(eff)),
+            "rmspe_pre": float(_rmspe(ep.Y[r, ep.pre_mask], Yhat[r, ep.pre_mask]))
+        })
+    out = pd.DataFrame(rows)
+    return out
+
+
+def placebo_time(ep: EpisodeWide, cfg: GSCConfig) -> pd.DataFrame:
+    """In-time placebo: desplaza ventana (mismo largo) dentro del pre de la víctima."""
+    pre_idx = np.where(ep.pre_mask)[0]
+    Lpre = len(pre_idx)
+    Lpost = int(ep.treated_post_mask.sum())
+    H = min(Lpost, max(7, Lpre // 2))
+    if Lpre <= H + 7:
+        return pd.DataFrame([{"att_placebo_mean": np.nan, "att_placebo_sum": np.nan, "used": False}])
+
+    # Tomar la última ventana pre de longitud H como pseudo-post
+    hold = pre_idx[-H:]
+    M_alt = ep.M.copy()
+    M_alt[ep.treated_row, hold] = False
+    model = GSCModel(cfg).fit(ep.Y, M_alt, ep.X)
+    Yhat = model.predict(ep.X)
+    eff = ep.Y[ep.treated_row, hold] - Yhat[ep.treated_row, hold]
+    return pd.DataFrame([{
+        "att_placebo_mean": float(np.nanmean(eff)),
+        "att_placebo_sum": float(np.nansum(eff)),
+        "used": True,
+        "H": int(H)
+    }])
+
+
+def leave_one_out(ep: EpisodeWide, cfg: GSCConfig, max_units: int = 20) -> pd.DataFrame:
+    """Robustez: excluir un control a la vez."""
+    rows = []
+    control_rows = [i for i in range(len(ep.units)) if i != ep.treated_row][:max_units]
+    for r in control_rows:
+        # Eliminar fila r
+        keep = [i for i in range(len(ep.units)) if i != r]
+        Y = ep.Y[keep, :]
+        M = ep.M[keep, :]
+        X = ep.X[keep, :, :] if ep.X is not None else None
+        treated_row = next(i for i, k in enumerate(keep) if k == ep.treated_row)
+        model = GSCModel(cfg).fit(Y, M, X)
+        Yhat = model.predict(X)
+
+        eff = Y[treated_row, ep.treated_post_mask] - Yhat[treated_row, ep.treated_post_mask]
+        rows.append({
+            "excluded_unit": ep.units[r],
+            "att_mean": float(np.nanmean(eff)),
+            "att_sum": float(np.nansum(eff))
+        })
+    return pd.DataFrame(rows)
+
+
+def global_sensitivity(ep: EpisodeWide,
+                       base_cfg: GSCConfig,
+                       n_samples: int = 24) -> pd.DataFrame:
+    """Barrido global simple sobre hiperparámetros/especificaciones."""
+    rng = np.random.default_rng(base_cfg.random_state)
+    rows = []
+    for _ in range(n_samples):
+        rank = int(rng.integers(1, max(2, base_cfg.rank + 2)))
+        tau = float(10 ** rng.uniform(-0.3, 0.7))  # ~ [0.5, 5]
+        alpha = float(10 ** rng.uniform(-6, -1))   # ~ [1e-6, 1e-1]
+        incX = bool(rng.integers(0, 2)) if base_cfg.include_covariates else False
+        cfg = GSCConfig(rank=rank, tau=tau, alpha=alpha,
+                        max_inner=base_cfg.max_inner, max_outer=base_cfg.max_outer,
+                        tol=base_cfg.tol, include_covariates=incX,
+                        random_state=base_cfg.random_state)
+        model = GSCModel(cfg).fit(ep.Y, ep.M, ep.X if incX else None)
+        Yhat = model.predict(ep.X if incX else None)
+        eff = ep.Y[ep.treated_row, ep.treated_post_mask] - Yhat[ep.treated_row, ep.treated_post_mask]
+        rows.append({
+            "rank": rank, "tau": tau, "alpha": alpha, "include_covariates": incX,
+            "att_mean": float(np.nanmean(eff)),
+            "att_sum": float(np.nansum(eff))
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------
+# Pipeline por episodio y batch
+# ---------------------------------------------------------------------
+
+@dataclass
+class RunConfig:
+    gsc_dir: Path
+    donors_csv: Path
+    episodes_index: Optional[Path]
+    out_dir: Path
+    include_covariates: bool = True
+    max_episodes: Optional[int] = None
+    log_level: str = "INFO"
+    # CV
+    cv_folds: int = 3
+    cv_holdout: int = 21
+    grid_ranks: Tuple[int, ...] = (1, 2, 3)
+    grid_tau: Tuple[float, ...] = (0.5, 1.0, 2.0)
+    grid_alpha: Tuple[float, ...] = (0.0, 0.01, 0.1)
+    # Placebos / Robustez / Sensibilidad
+    max_placebos: int = 20
+    max_loo: int = 20
+    do_placebo_space: bool = True
+    do_placebo_time: bool = True
+    do_loo: bool = True
+    do_sensitivity: bool = True
+    sens_samples: int = 24
+    # Solver
+    rank: int = 2
+    tau: float = 1.0
+    alpha: float = 0.01
+    max_inner: int = 100
+    max_outer: int = 10
+    tol: float = 1e-4
+    random_state: int = 42
+
+
+def _discover_episode_files(gsc_dir: Path) -> List[Path]:
+    files = [p for p in gsc_dir.glob("*.parquet") if p.name != "donor_quality.parquet"]
+    return sorted(files)
+
+def _episode_id_from_path(p: Path) -> str:
+    return p.stem  # coincide con convención: i-i_j-j_yyyymmdd
+
+def _load_episode_df(p: Path) -> pd.DataFrame:
+    df = pd.read_parquet(p)
+    # Normalizar tipos
+    if "date" in df.columns:
+        df["date"] = _as_datetime(df["date"])
+    return df
+
+
+def run_episode(p: Path, cfg: RunConfig) -> Dict:
+    ep_id = _episode_id_from_path(p)
+    df = _load_episode_df(p)
+
+    # Armar wide
+    epw = long_to_wide_for_episode(df, include_covariates=cfg.include_covariates)
+
+    # Config base + CV
+    base = GSCConfig(rank=cfg.rank, tau=cfg.tau, alpha=cfg.alpha,
+                     max_inner=cfg.max_inner, max_outer=cfg.max_outer,
+                     tol=cfg.tol, include_covariates=cfg.include_covariates,
+                     random_state=cfg.random_state)
+    cv_cfg = CVCfg(folds=cfg.cv_folds, holdout_days=cfg.cv_holdout,
+                   grid_ranks=cfg.grid_ranks, grid_tau=cfg.grid_tau, grid_alpha=cfg.grid_alpha)
+    best_cfg, cv_info = time_cv_select(epw, cv_cfg, base)
+
+    # Ajuste final
+    model = GSCModel(best_cfg).fit(epw.Y, epw.M, epw.X)
+    Yhat = model.predict(epw.X)
+
+    # Efectos y métricas clave
+    y_obs_post = epw.Y[epw.treated_row, epw.treated_post_mask]
+    y_hat_post = Yhat[epw.treated_row, epw.treated_post_mask]
+    eff_post = y_obs_post - y_hat_post
+
+    y_obs_pre = epw.Y[epw.treated_row, epw.pre_mask]
+    y_hat_pre = Yhat[epw.treated_row, epw.pre_mask]
+
+    rmspe_pre = _rmspe(y_obs_pre, y_hat_pre)
+    mae_pre = _mae(y_obs_pre, y_hat_pre)
+    att_mean = float(np.nanmean(eff_post))
+    att_sum = float(np.nansum(eff_post))
+    base_level = float(np.nanmean(y_obs_pre))
+    rel_att = _safe_pct(att_mean, base_level)
+
+    # Guardar serie contrafactual
+    cf_dir = cfg.out_dir / "cf_series"
+    _ensure_dir(cf_dir)
+    cf = pd.DataFrame({
+        "episode_id": ep_id,
+        "date": [epw.dates[j] for j in range(len(epw.dates))],
+        "y_obs": epw.Y[epw.treated_row, :],
+        "y_hat": Yhat[epw.treated_row, :],
+        "treated_time": epw.treated_post_mask.astype(int),
+    })
+    cf["effect"] = cf["y_obs"] - cf["y_hat"]
+    cf["cum_effect"] = cf["effect"].cumsum()
+    cf_path = cf_dir / f"{ep_id}_cf.parquet"
+    cf.to_parquet(cf_path, index=False)
+
+    # Placebos y robustez
+    plac_dir = cfg.out_dir / "placebos"; _ensure_dir(plac_dir)
+    loo_dir = cfg.out_dir / "loo"; _ensure_dir(loo_dir)
+
+    if cfg.do_placebo_space:
+        ps = placebo_space(epw, best_cfg, max_units=cfg.max_placebos)
+        ps["episode_id"] = ep_id
+        ps_path = plac_dir / f"{ep_id}_space.parquet"
+        ps.to_parquet(ps_path, index=False)
+        # p-value (rank) para ATT_sum
+        if ps.shape[0] > 0 and np.isfinite(att_sum):
+            pval_space = (1 + np.sum(np.abs(ps["att_placebo_sum"].to_numpy()) >= abs(att_sum))) / (1 + ps.shape[0])
+        else:
+            pval_space = np.nan
     else:
-        D_np = D_w.loc[keep_units, :].to_numpy(dtype=float)
+        pval_space, ps_path = np.nan, None
 
-    n, tdim = Y_np.shape
+    if cfg.do_placebo_time:
+        pt = placebo_time(epw, best_cfg)
+        pt["episode_id"] = ep_id
+        pt_path = plac_dir / f"{ep_id}_time.parquet"
+        pt.to_parquet(pt_path, index=False)
+    else:
+        pt_path = None
 
-    # Backend (GPU/CPU)
-    xp_wrap = _XP(prefer_gpu=prefer_gpu, force_gpu=force_gpu)
-    xp = xp_wrap.xp
+    if cfg.do_loo:
+        loo = leave_one_out(epw, best_cfg, max_units=cfg.max_loo)
+        loo["episode_id"] = ep_id
+        loo_path = loo_dir / f"{ep_id}_loo.parquet"
+        loo.to_parquet(loo_path, index=False)
+        loo_sd = float(np.nanstd(loo["att_sum"])) if not loo.empty else np.nan
+        loo_range = float(np.nanmax(loo["att_sum"]) - np.nanmin(loo["att_sum"])) if not loo.empty else np.nan
+    else:
+        loo_sd, loo_range, loo_path = np.nan, np.nan, None
 
-    # A GPU
-    Y = xp_wrap.to_xp(Y_np, dtype=_np.float64)
-    D = xp_wrap.to_xp(D_np, dtype=_np.float64)
+    # Sensibilidad global
+    if cfg.do_sensitivity:
+        sens = global_sensitivity(epw, best_cfg, n_samples=cfg.sens_samples)
+        sens["episode_id"] = ep_id
+        sens_dir = cfg.out_dir / "sensitivity"; _ensure_dir(sens_dir)
+        sens_path = sens_dir / f"{ep_id}_sens.parquet"
+        sens.to_parquet(sens_path, index=False)
+        sens_sd = float(np.nanstd(sens["att_sum"])) if not sens.empty else np.nan
+    else:
+        sens_sd, sens_path = np.nan, None
 
-    # Máscaras
-    y_obs_mask = xp.isfinite(Y)
-    pre_cols_np = _np.array([(pre_start <= tt <= pre_end) for tt in times], dtype=bool)
-    post_cols_np = _np.array([(post_start <= tt <= post_end) for tt in times], dtype=bool)
-    pre_cols = xp_wrap.to_xp(pre_cols_np, dtype=bool)
-    post_cols = xp_wrap.to_xp(post_cols_np, dtype=bool)
-
-    treated_post_mask = (D == 1.0) & post_cols.reshape(1, -1)
-    obs_mask = y_obs_mask & (~treated_post_mask)
-
-    # EM-SVD en GPU/CPU
-    Y_filled, r_eff, em_metrics = _em_svd_xp(
-        xp=xp,
-        Y=Y,
-        obs_mask=obs_mask,
-        pre_mask=obs_mask & pre_cols.reshape(1, -1),
-        r=r,
-        r_grid=r_grid,
-        max_iter=max_iter,
-        tol=tol,
-    )
-
-    # Outputs principales
-    Y_hat = Y_filled
-    y0 = xp.full_like(Y_hat, xp.nan)
-    y0[treated_post_mask] = Y_hat[treated_post_mask]
-
-    tau = xp.full_like(Y_hat, xp.nan)
-    tau[treated_post_mask] = Y[treated_post_mask] - y0[treated_post_mask]
-
-    # A NumPy para pandas
-    y0_np = xp_wrap.to_np(y0)
-    tau_np = xp_wrap.to_np(tau)
-    full_hat_np = xp_wrap.to_np(Y_hat)
-
-    y0_df = pd.DataFrame(y0_np, index=keep_units, columns=times)
-    tau_df = pd.DataFrame(tau_np, index=keep_units, columns=times)
-    full_hat_df = pd.DataFrame(full_hat_np, index=keep_units, columns=times)
-
-    # ATT global y por tiempo/unidad (CPU)
-    treated_post_mask_np = (D_np == 1.0) & post_cols_np.reshape(1, -1)
-    att = float(_np.nanmean(tau_np[treated_post_mask_np])) if _np.any(treated_post_mask_np) else _np.nan
-
-    att_t_vals: List[float] = []
-    att_t_idx: List[Any] = []
-    for j, tt in enumerate(times):
-        if not post_cols_np[j]:
-            continue
-        mask_col = treated_post_mask_np[:, j]
-        if mask_col.any():
-            att_t_idx.append(tt)
-            att_t_vals.append(float(_np.nanmean(tau_np[mask_col, j])))
-    att_t = pd.Series(att_t_vals, index=pd.Index(att_t_idx, name=time_col), name="att_t")
-
-    att_i_vals: List[float] = []
-    att_i_idx: List[Any] = []
-    for i, uid in enumerate(keep_units):
-        mask_row = treated_post_mask_np[i, :]
-        if mask_row.any():
-            att_i_idx.append(uid)
-            att_i_vals.append(float(_np.nanmean(tau_np[i, mask_row])))
-    att_i = pd.Series(att_i_vals, index=pd.Index(att_i_idx, name=id_col), name="att_i")
-
-    # Factores/cargas desde SVD final (GPU/CPU y luego a NumPy)
-    Yhat_no_nan = xp.nan_to_num(Y_hat, copy=False, nan=0.0)
-    U, S, Vt = xp.linalg.svd(Yhat_no_nan, full_matrices=False)
-    r_show = int(min(r_eff, U.shape[1], Vt.shape[0]))
-    Ur, Sr, Vtr = U[:, :r_show], S[:r_show], Vt[:r_show, :]
-
-    loadings = Ur @ xp.diag(xp.sqrt(Sr))
-    factors = (Vtr.T) @ xp.diag(xp.sqrt(Sr))
-    loadings_df = pd.DataFrame(xp_wrap.to_np(loadings), index=keep_units, columns=[f"f{k+1}" for k in range(r_show)])
-    factors_df = pd.DataFrame(xp_wrap.to_np(factors), index=times, columns=[f"f{k+1}" for k in range(r_show)])
-
-    # Métricas
-    pre_mask_eval = obs_mask & pre_cols.reshape(1, -1)
-    pre_rmse = float(_np.sqrt(_np.nanmean((full_hat_np[pre_mask_eval.get() if xp is _cp else pre_mask_eval] - Y_np[pre_mask_eval.get() if xp is _cp else pre_mask_eval]) ** 2)))) if bool(pre_mask_eval.any()) else _np.nan  # type: ignore
-
-    metrics: Dict[str, Any] = {
-        **em_metrics,
-        "pre_rmse": pre_rmse,
-        "n_units": int(n),
-        "n_times": int(tdim),
-        "n_treated": int(len([u for u in keep_units if u in set(treated_units)])),
-        "backend": "cupy" if xp_wrap.using_gpu else "numpy",
-        "device": "gpu" if xp_wrap.using_gpu else "cpu",
+    # Reporte JSON por episodio
+    rep = {
+        "episode_id": ep_id,
+        "n_units": epw.meta["n_units"], "n_controls": epw.meta["n_controls"],
+        "n_time": epw.meta["n_time"], "n_pre": epw.meta["n_pre"], "n_post": epw.meta["n_post"],
+        "victim_unit": epw.meta["victim_unit"],
+        "include_covariates": cfg.include_covariates,
+        "features_used": epw.feats,
+        "cv": cv_info,
+        "fit": {
+            "rmspe_pre": rmspe_pre, "mae_pre": mae_pre,
+            "att_mean": att_mean, "att_sum": att_sum, "rel_att_vs_pre_mean": rel_att
+        },
+        "p_value_placebo_space": pval_space,
+        "paths": {
+            "cf": str(cf_path),
+            "placebo_space": str(ps_path) if cfg.do_placebo_space else None,
+            "placebo_time": str(pt_path) if cfg.do_placebo_time else None,
+            "loo": str(loo_path) if cfg.do_loo else None,
+            "sensitivity": str(sens_path) if cfg.do_sensitivity else None
+        },
+        "robustness": {
+            "loo_sd_att_sum": loo_sd, "loo_range_att_sum": loo_range,
+            "sens_sd_att_sum": sens_sd
+        },
+        "best_cfg": asdict(best_cfg)
     }
+    rep_dir = cfg.out_dir / "reports"; _ensure_dir(rep_dir)
+    with open(rep_dir / f"{ep_id}.json", "w", encoding="utf-8") as f:
+        json.dump(rep, f, ensure_ascii=False, indent=2, default=str)
 
-    return GSCResult(
-        att=att,
-        att_t=att_t,
-        att_i=att_i,
-        y0_hat=y0_df,
-        tau_it=tau_df,
-        full_y_hat=full_hat_df,
-        r=r_eff,
-        factors=factors_df,
-        loadings=loadings_df,
-        metrics=metrics,
+    # Resumen para gsc_metrics.parquet
+    summary = {
+        "episode_id": ep_id,
+        "victim_unit": epw.meta["victim_unit"],
+        "n_controls": epw.meta["n_controls"],
+        "n_pre": epw.meta["n_pre"], "n_post": epw.meta["n_post"],
+        "rmspe_pre": rmspe_pre, "mae_pre": mae_pre,
+        "att_mean": att_mean, "att_sum": att_sum, "rel_att_vs_pre_mean": rel_att,
+        "p_value_placebo_space": pval_space,
+        "loo_sd_att_sum": rep["robustness"]["loo_sd_att_sum"],
+        "loo_range_att_sum": rep["robustness"]["loo_range_att_sum"],
+        "sens_sd_att_sum": rep["robustness"]["sens_sd_att_sum"],
+        "rank": best_cfg.rank, "tau": best_cfg.tau, "alpha": best_cfg.alpha,
+        "include_covariates": best_cfg.include_covariates,
+        "cv_used": bool(rep["cv"]["cv_used"])
+    }
+    return summary
+
+
+def run_batch(cfg: RunConfig) -> None:
+    logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO),
+                        format="%(asctime)s | %(levelname)s | %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S")
+
+    # Descubrir episodios
+    gsc_dir = cfg.gsc_dir
+    if not gsc_dir.exists():
+        # fallback a layout alternativo
+        alt = Path("./data/processed/gsc")
+        if alt.exists():
+            gsc_dir = alt
+        else:
+            raise FileNotFoundError(f"No existe la carpeta GSC: {cfg.gsc_dir}")
+
+    files = _discover_episode_files(gsc_dir)
+    if cfg.max_episodes is not None:
+        files = files[: int(cfg.max_episodes)]
+
+    logging.info(f"Episodios detectados: {len(files)} en {gsc_dir}")
+
+    _ensure_dir(cfg.out_dir)
+    metrics = []
+    for k, p in enumerate(files, start=1):
+        try:
+            logging.info(f"[{k}/{len(files)}] Ejecutando GSC en {p.name} ...")
+            summ = run_episode(p, cfg)
+            metrics.append(summ)
+            logging.info(f"OK {p.stem} | ATT_sum={summ['att_sum']:.3f} | RMSPE_pre={summ['rmspe_pre']:.4f}")
+        except Exception as e:
+            logging.exception(f"Error en episodio {p.name}: {e}")
+
+    # Guardar resumen global
+    if metrics:
+        mdf = pd.DataFrame(metrics)
+        mpath = cfg.out_dir / "gsc_metrics.parquet"
+        mdf.to_parquet(mpath, index=False)
+        logging.info(f"Métricas globales guardadas: {mpath} ({mdf.shape[0]} episodios)")
+    else:
+        logging.warning("No se generaron métricas (¿sin episodios válidos?).")
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+def parse_args() -> RunConfig:
+    p = argparse.ArgumentParser(description="GSC (Generalized Synthetic Control) para episodios de canibalización.")
+    p.add_argument("--gsc_dir", type=str, default="./.data/processed_data/gsc", help="Directorio con parquets de episodios GSC.")
+    p.add_argument("--donors_csv", type=str, default="./.data/processed_data/donors_per_victim.csv", help="CSV donantes por víctima (opcional).")
+    p.add_argument("--episodes_index", type=str, default="./.data/processed_data/episodes_index.parquet", help="Índice de episodios (opcional).")
+    p.add_argument("--out_dir", type=str, default="./.data/processed_data/gsc_outputs", help="Directorio de salida.")
+    p.add_argument("--include_covariates", action="store_true", help="Usar covariables X_it en el ajuste.")
+    p.add_argument("--max_episodes", type=int, default=None, help="Limitar # episodios a procesar.")
+    p.add_argument("--log_level", type=str, default="INFO")
+
+    # CV
+    p.add_argument("--cv_folds", type=int, default=3)
+    p.add_argument("--cv_holdout", type=int, default=21)
+    p.add_argument("--grid_ranks", type=str, default="1,2,3")
+    p.add_argument("--grid_tau", type=str, default="0.5,1.0,2.0")
+    p.add_argument("--grid_alpha", type=str, default="0.0,0.01,0.1")
+
+    # Placebos / Robustez / Sensibilidad
+    p.add_argument("--max_placebos", type=int, default=20)
+    p.add_argument("--max_loo", type=int, default=20)
+    p.add_argument("--no_placebo_space", action="store_true")
+    p.add_argument("--no_placebo_time", action="store_true")
+    p.add_argument("--no_loo", action="store_true")
+    p.add_argument("--no_sensitivity", action="store_true")
+    p.add_argument("--sens_samples", type=int, default=24)
+
+    # Solver / hiperparámetros base
+    p.add_argument("--rank", type=int, default=2)
+    p.add_argument("--tau", type=float, default=1.0)
+    p.add_argument("--alpha", type=float, default=0.01)
+    p.add_argument("--max_inner", type=int, default=100)
+    p.add_argument("--max_outer", type=int, default=10)
+    p.add_argument("--tol", type=float, default=1e-4)
+    p.add_argument("--random_state", type=int, default=42)
+
+    a = p.parse_args()
+    grid_ranks = tuple(int(x.strip()) for x in a.grid_ranks.split(",") if x.strip())
+    grid_tau = tuple(float(x.strip()) for x in a.grid_tau.split(",") if x.strip())
+    grid_alpha = tuple(float(x.strip()) for x in a.grid_alpha.split(",") if x.strip())
+
+    return RunConfig(
+        gsc_dir=_to_path(a.gsc_dir),
+        donors_csv=_to_path(a.donors_csv),
+        episodes_index=_to_path(a.episodes_index) if a.episodes_index else None,
+        out_dir=_to_path(a.out_dir),
+        include_covariates=bool(a.include_covariates),
+        max_episodes=a.max_episodes,
+        log_level=a.log_level,
+        cv_folds=a.cv_folds, cv_holdout=a.cv_holdout,
+        grid_ranks=grid_ranks, grid_tau=grid_tau, grid_alpha=grid_alpha,
+        max_placebos=a.max_placebos, max_loo=a.max_loo,
+        do_placebo_space=(not a.no_placebo_space),
+        do_placebo_time=(not a.no_placebo_time),
+        do_loo=(not a.no_loo),
+        do_sensitivity=(not a.no_sensitivity),
+        sens_samples=a.sens_samples,
+        rank=a.rank, tau=a.tau, alpha=a.alpha,
+        max_inner=a.max_inner, max_outer=a.max_outer, tol=a.tol,
+        random_state=a.random_state
     )
 
 
-def att_by_event_time(
-    tau_it: pd.DataFrame,
-    adoption_times: Dict[Any, Any],
-    time_index: Sequence[Any],
-) -> pd.Series:
-    """Calcula ATT por "event time" k = t - t0_i usando la matriz tau_it (CPU)."""
-    time_pos = {t: idx for idx, t in enumerate(list(time_index))}
-    contrib: Dict[int, List[float]] = {}
-    for i, uid in enumerate(tau_it.index):
-        t0 = adoption_times.get(uid, None)
-        if pd.isna(t0) or t0 is None:
-            continue
-        pos0 = time_pos.get(t0, None)
-        if pos0 is None:
-            continue
-        row = tau_it.loc[uid]
-        for tval, eff in row.items():
-            if pd.isna(eff):
-                continue
-            k = time_pos[tval] - pos0
-            contrib.setdefault(k, []).append(float(eff))
-    if not contrib:
-        return pd.Series(dtype=float, name="att_event_time")
-    ks = sorted(contrib.keys())
-    vals = [float(_np.mean(contrib[k])) for k in ks]
-    return pd.Series(vals, index=pd.Index(ks, name="event_time"), name="att_event_time")
-
-
-__all__ = [
-    "GSCResult",
-    "derive_treat_from_adoption",
-    "prepare_panel",
-    "find_donors",
-    "generalized_synth_gpu",
-    "att_by_event_time",
-]
+if __name__ == "__main__":
+    cfg = parse_args()
+    run_batch(cfg)

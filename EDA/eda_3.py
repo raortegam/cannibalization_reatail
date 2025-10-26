@@ -526,7 +526,7 @@ def run(
 
     # Guardar únicamente PNGs numerados en el directorio de salida
     for k, fig in enumerate(pages, start=1):
-        p = os.path.join(out_dir, f"episodio_{k}.png")
+        p = os.path.join(out_dir, f"eda_3_episodio_{k}.png")
         fig.savefig(p, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
     saved_to = os.path.abspath(out_dir)

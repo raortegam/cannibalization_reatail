@@ -75,6 +75,28 @@ except Exception:
 # Configuración
 # -------------------------------
 
+from typing import Union
+
+PathLike = Union[str, Path]
+
+def _to_path(p: PathLike) -> Path:
+    return p if isinstance(p, Path) else Path(p)
+
+def _coerce_cfg(cfg: "PrepConfig") -> "PrepConfig":
+    # Coaccionar rutas a Path
+    cfg.episodes_path = _to_path(cfg.episodes_path)
+    cfg.donors_path   = _to_path(cfg.donors_path)
+    cfg.raw_dir       = _to_path(cfg.raw_dir)
+    cfg.out_dir       = _to_path(cfg.out_dir)
+    # Asegurar tipo de lags
+    if isinstance(cfg.lags_days, str):
+        cfg.lags_days = tuple(int(x.strip()) for x in cfg.lags_days.split(",") if x.strip())
+    elif isinstance(cfg.lags_days, (list, tuple)):
+        cfg.lags_days = tuple(int(x) for x in cfg.lags_days)
+    else:
+        cfg.lags_days = tuple([int(cfg.lags_days)]) if cfg.lags_days is not None else (7, 14, 28, 56)
+    return cfg
+
 @dataclass
 class PrepConfig:
     episodes_path: Path = Path("./data/preprocessed_data/pairs_windows.csv")
@@ -658,6 +680,7 @@ def prepare_datasets(cfg: PrepConfig) -> None:
     Orquesta el pipeline de preprocesamiento end-to-end.
     """
     _setup_logging(cfg.log_level)
+    cfg = _coerce_cfg(cfg)
 
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     (cfg.out_dir / "gsc").mkdir(parents=True, exist_ok=True)

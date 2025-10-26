@@ -147,7 +147,7 @@ def plot_daily_count(train: pd.DataFrame, out_dir: Path,
     ax.set_xlabel("Fecha")
     ax.set_ylabel("Filas por día")
     _title_with_range(ax, "Cobertura temporal (filas por día)", daily[date_col].min(), daily[date_col].max())
-    _save_letter_fig(fig, out_dir / "01_data_coverage.png", dpi=dpi)
+    _save_letter_fig(fig, out_dir / "eda_1_01_data_coverage.png", dpi=dpi)
 
 
 def plot_transactions_trend(transactions: pd.DataFrame, out_dir: Path,
@@ -162,7 +162,7 @@ def plot_transactions_trend(transactions: pd.DataFrame, out_dir: Path,
     ax.set_xlabel("Fecha")
     ax.set_ylabel("Transacciones (total)")
     _title_with_range(ax, "Tendencia de transacciones", daily_tx[date_col].min(), daily_tx[date_col].max())
-    _save_letter_fig(fig, out_dir / "02_transactions_trend.png", dpi=dpi)
+    _save_letter_fig(fig, out_dir / "eda_1_02_transactions_trend.png", dpi=dpi)
 
 
 def plot_unit_sales_trend(train: pd.DataFrame, out_dir: Path,
@@ -179,7 +179,7 @@ def plot_unit_sales_trend(train: pd.DataFrame, out_dir: Path,
     ax.set_xlabel("Fecha")
     ax.set_ylabel("Ventas (unit_sales)")
     _title_with_range(ax, "Tendencia de ventas", daily_sales[date_col].min(), daily_sales[date_col].max())
-    _save_letter_fig(fig, out_dir / "03_unit_sales_trend.png", dpi=dpi)
+    _save_letter_fig(fig, out_dir / "eda_1_03_unit_sales_trend.png", dpi=dpi)
 
 
 def plot_missingness_bar(df: pd.DataFrame, out_dir: Path, dpi: int):
@@ -190,7 +190,7 @@ def plot_missingness_bar(df: pd.DataFrame, out_dir: Path, dpi: int):
     ax.set_xticklabels(miss.index, rotation=45, ha="right")
     ax.set_ylabel("Proporción de faltantes")
     ax.set_title("Faltantes por columna (0–1)")
-    _save_letter_fig(fig, out_dir / "04_missingness_bar.png", dpi=dpi)
+    _save_letter_fig(fig, out_dir / "eda_1_04_missingness_bar.png", dpi=dpi)
 
 
 # --------------------------- Análisis profundo: onpromotion --------------------------- #
@@ -208,7 +208,7 @@ def plot_promo_rate_over_time(train: pd.DataFrame, out_dir: Path,
     ax.set_xlabel("Fecha")
     ax.set_ylabel("Tasa onpromotion (0–1)")
     _title_with_range(ax, "Tasa de onpromotion en el tiempo", daily_rate[date_col].min(), daily_rate[date_col].max())
-    _save_letter_fig(fig, out_dir / "10_promo_rate_over_time.png", dpi=dpi)
+    _save_letter_fig(fig, out_dir / "eda_1_10_promo_rate_over_time.png", dpi=dpi)
 
 
 def plot_promo_rate_by_dow(train: pd.DataFrame, out_dir: Path,
@@ -225,7 +225,7 @@ def plot_promo_rate_by_dow(train: pd.DataFrame, out_dir: Path,
     ax.set_xticklabels(_day_of_week_labels(idx))
     ax.set_ylabel("Tasa onpromotion (0–1)")
     ax.set_title("Tasa de onpromotion por día de semana")
-    _save_letter_fig(fig, out_dir / "11_promo_rate_by_dow.png", dpi=dpi)
+    _save_letter_fig(fig, out_dir / "eda_1_11_promo_rate_by_dow.png", dpi=dpi)
 
 
 def plot_promo_rate_store_hist(train: pd.DataFrame, out_dir: Path,
@@ -237,7 +237,7 @@ def plot_promo_rate_store_hist(train: pd.DataFrame, out_dir: Path,
     ax.set_xlabel("Tasa onpromotion por tienda")
     ax.set_ylabel("Frecuencia")
     ax.set_title("Distribución de tasa onpromotion a nivel tienda")
-    _save_letter_fig(fig, out_dir / "12_promo_rate_store_hist.png", dpi=dpi)
+    _save_letter_fig(fig, out_dir / "eda_1_12_promo_rate_store_hist.png", dpi=dpi)
 
 
 def _compute_run_lengths(train: pd.DataFrame,
@@ -275,7 +275,7 @@ def plot_promo_run_lengths_hist(train: pd.DataFrame, out_dir: Path,
     ax.set_xlabel("Longitud de racha en promoción (días consecutivos)")
     ax.set_ylabel("Frecuencia")
     ax.set_title("Distribución de longitudes de rachas de onpromotion")
-    _save_letter_fig(fig, out_dir / "13_promo_run_lengths_hist.png", dpi=dpi)
+    _save_letter_fig(fig, out_dir / "eda_1_13_promo_run_lengths_hist.png", dpi=dpi)
 
 
 def plot_promo_transition_matrix(train: pd.DataFrame, out_dir: Path,
@@ -313,7 +313,7 @@ def plot_promo_transition_matrix(train: pd.DataFrame, out_dir: Path,
             val = probs.values[i, j]
             txt = f"{val:.2f}" if np.isfinite(val) else "nan"
             ax.text(j, i, txt, ha="center", va="center")
-    _save_letter_fig(fig, out_dir / "14_promo_transition_matrix.png", dpi=dpi)
+    _save_letter_fig(fig, out_dir / "eda_1_14_promo_transition_matrix.png", dpi=dpi)
 
 
 def plot_promo_crowding_hist(train: pd.DataFrame, out_dir: Path,
@@ -329,7 +329,7 @@ def plot_promo_crowding_hist(train: pd.DataFrame, out_dir: Path,
     ax.set_xlabel("# ítems simultáneamente en promoción (tienda/día)")
     ax.set_ylabel("Frecuencia")
     ax.set_title("Distribución de 'crowding' promocional (tienda/día)")
-    _save_letter_fig(fig, out_dir / "15_promo_crowding_hist.png", dpi=dpi)
+    _save_letter_fig(fig, out_dir / "eda_1_15_promo_crowding_hist.png", dpi=dpi)
 
 
 def plot_promo_rate_by_neighborhood(train: pd.DataFrame, items: pd.DataFrame,
@@ -349,7 +349,7 @@ def plot_promo_rate_by_neighborhood(train: pd.DataFrame, items: pd.DataFrame,
     ax.set_xticklabels(top.index, rotation=45, ha="right")
     ax.set_ylabel("Tasa onpromotion (0–1)")
     ax.set_title(f"Tasa de onpromotion por {neighborhood_col} (top {top_n})")
-    _save_letter_fig(fig, out_dir / "16_promo_rate_by_neighborhood.png", dpi=dpi)
+    _save_letter_fig(fig, out_dir / "eda_1_16_promo_rate_by_neighborhood.png", dpi=dpi)
 
 
 # --------------------------- Runner principal --------------------------- #
@@ -409,49 +409,49 @@ def run_eda(
         opt_cols.append(tx_col)
 
     # 3) Gráficos generales (tamaño carta)
-    plot_daily_count(train, out_dir, date_col, dpi); out["01_data_coverage.png"] = str(out_dir / "01_data_coverage.png")
+    plot_daily_count(train, out_dir, date_col, dpi); out["eda_1_01_data_coverage.png"] = str(out_dir / "eda_1_01_data_coverage.png")
 
     if transactions is not None:
         plot_transactions_trend(transactions, out_dir, date_col, tx_col, dpi)
-        out["02_transactions_trend.png"] = str(out_dir / "02_transactions_trend.png")
+        out["eda_1_02_transactions_trend.png"] = str(out_dir / "eda_1_02_transactions_trend.png")
 
     if sales_col and sales_col in train.columns:
         plot_unit_sales_trend(train, out_dir, date_col, sales_col, dpi)
-        out["03_unit_sales_trend.png"] = str(out_dir / "03_unit_sales_trend.png")
+        out["eda_1_03_unit_sales_trend.png"] = str(out_dir / "eda_1_03_unit_sales_trend.png")
 
     # Missingness sólo sobre columnas de interés
     plot_missingness_bar(train[[c for c in base_cols + opt_cols if c in train.columns]], out_dir, dpi)
-    out["04_missingness_bar.png"] = str(out_dir / "04_missingness_bar.png")
+    out["eda_1_04_missingness_bar.png"] = str(out_dir / "eda_1_04_missingness_bar.png")
 
     # 4) Apartado profundo: onpromotion
     # 4.1) Tasa temporal
     plot_promo_rate_over_time(train, out_dir, date_col, promo_col, dpi)
-    out["10_promo_rate_over_time.png"] = str(out_dir / "10_promo_rate_over_time.png")
+    out["eda_1_10_promo_rate_over_time.png"] = str(out_dir / "eda_1_10_promo_rate_over_time.png")
 
     # 4.2) Estacionalidad semanal
     plot_promo_rate_by_dow(train, out_dir, date_col, promo_col, dpi)
-    out["11_promo_rate_by_dow.png"] = str(out_dir / "11_promo_rate_by_dow.png")
+    out["eda_1_11_promo_rate_by_dow.png"] = str(out_dir / "eda_1_11_promo_rate_by_dow.png")
 
     # 4.3) Heterogeneidad entre tiendas
     plot_promo_rate_store_hist(train, out_dir, store_col, promo_col, dpi)
-    out["12_promo_rate_store_hist.png"] = str(out_dir / "12_promo_rate_store_hist.png")
+    out["eda_1_12_promo_rate_store_hist.png"] = str(out_dir / "eda_1_12_promo_rate_store_hist.png")
 
     # 4.4) Dinámica de rachas
     plot_promo_run_lengths_hist(train, out_dir, date_col, store_col, item_col, promo_col, dpi)
-    out["13_promo_run_lengths_hist.png"] = str(out_dir / "13_promo_run_lengths_hist.png")
+    out["eda_1_13_promo_run_lengths_hist.png"] = str(out_dir / "eda_1_13_promo_run_lengths_hist.png")
 
     # 4.5) Persistencia/alternancia (matriz de transición)
     plot_promo_transition_matrix(train, out_dir, date_col, store_col, item_col, promo_col, dpi)
-    out["14_promo_transition_matrix.png"] = str(out_dir / "14_promo_transition_matrix.png")
+    out["eda_1_14_promo_transition_matrix.png"] = str(out_dir / "eda_1_14_promo_transition_matrix.png")
 
     # 4.6) Crowding promocional por tienda/día
     plot_promo_crowding_hist(train, out_dir, date_col, store_col, promo_col, dpi)
-    out["15_promo_crowding_hist.png"] = str(out_dir / "15_promo_crowding_hist.png")
+    out["eda_1_15_promo_crowding_hist.png"] = str(out_dir / "eda_1_15_promo_crowding_hist.png")
 
     # 4.7) Heterogeneidad por vecindario (si hay items + neighborhood_col)
     if items is not None and neighborhood_col:
         plot_promo_rate_by_neighborhood(train, items, out_dir, item_col, promo_col, neighborhood_col, dpi, top_n=20)
-        out["16_promo_rate_by_neighborhood.png"] = str(out_dir / "16_promo_rate_by_neighborhood.png")
+        out["eda_1_16_promo_rate_by_neighborhood.png"] = str(out_dir / "eda_1_16_promo_rate_by_neighborhood.png")
 
     return out
 

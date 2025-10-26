@@ -468,35 +468,35 @@ def run_eda_competitive_exposure(
     # 01: media diaria
     plot_exposure_over_time(
         daily_df,
-        out_path=out_dir / "eda2_01_exposure_over_time.png",
+        out_path=out_dir / "eda_2_01_exposure_over_time.png",
         orientation=orientation,
     )
 
     # 02: histograma global
     plot_histogram(
         hist_df,
-        out_path=out_dir / "eda2_02_exposure_histogram.png",
+        out_path=out_dir / "eda_2_02_exposure_histogram.png",
         orientation=orientation,
     )
 
     # 03: CDF global
     plot_cdf(
         cdf_df,
-        out_path=out_dir / "eda2_03_exposure_cdf.png",
+        out_path=out_dir / "eda_2_03_exposure_cdf.png",
         orientation=orientation,
     )
 
     # 04: barras por tienda (top N por volumen)
     plot_store_mean_bar(
         store_df, top_stores=top_stores, min_obs=min_store_obs,
-        out_path=out_dir / f"eda2_04_store_mean_exposure_top{top_stores}.png",
+        out_path=out_dir / f"eda_2_04_store_mean_exposure_top{top_stores}.png",
         orientation=orientation,
     )
 
     # 05: heatmap por fecha x top tiendas
     plot_heatmap(
         pivot_heat,
-        out_path=out_dir / f"eda2_05_heatmap_store_date_top{len(pivot_heat.columns) if hasattr(pivot_heat, 'columns') else 0}.png",
+        out_path=out_dir / f"eda_2_05_heatmap_store_date_top{len(pivot_heat.columns) if hasattr(pivot_heat, 'columns') else 0}.png",
         orientation=orientation,
     )
 

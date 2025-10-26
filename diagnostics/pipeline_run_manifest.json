@@ -1,7 +1,7 @@
 {
   "project_name": "cannibalization_retail",
-  "start_time": "2025-10-19T20:22:24.576323",
-  "log_file": "D:\\repos\\cannibalization_reatail\\diagnostics\\pipeline_20251019_202224.log",
+  "start_time": "2025-10-20T16:05:09.820604",
+  "log_file": "D:\\repos\\cannibalization_reatail\\diagnostics\\pipeline_20251020_160509.log",
   "steps": {
     "step1": {
       "status": "ok",
@@ -87,5 +87,5 @@
       "figures_dir": "figures\\favorita_analysis"
     }
   },
-  "end_time": "2025-10-19T20:37:32.748342"
+  "end_time": "2025-10-20T16:23:06.367878"
 }

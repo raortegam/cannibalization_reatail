@@ -50,6 +50,7 @@ import matplotlib.pyplot as plt
 from matplotlib.dates import MonthLocator, DateFormatter
 
 
+
 # ---------------------------------------------------------------------
 # Configuración y utilidades
 # ---------------------------------------------------------------------
@@ -81,6 +82,13 @@ class EDAConfig:
 # --- Helpers de rutas robustos a str | Path ---
 
 PathLike = Union[str, Path]
+
+def _format_time_axis(ax):
+    ax.xaxis.set_major_locator(MonthLocator(interval=1))
+    ax.xaxis.set_major_formatter(DateFormatter("%Y-%m"))
+    for label in ax.get_xticklabels():
+        label.set_rotation(45)
+        label.set_ha("right")
 
 def _to_path(p: Optional[PathLike]) -> Optional[Path]:
     if p is None:
@@ -249,6 +257,278 @@ def _format_time_axis(ax: mpl.axes.Axes):
         label.set_rotation(45)
         label.set_ha("right")
 
+def fig_meta_overview(df: pd.DataFrame, out_path: Path, cfg: EDAConfig):
+    """
+    Lámina 3: panorama temporal agregado (ventas, promociones, disponibilidad, proxies).
+    Usa meta/all_units si está disponible; de lo contrario panel_features.
+    """
+    # Copia y normalización de fecha
+    d = df.copy()
+    if "date" in d.columns and not np.issubdtype(d["date"].dtype, np.datetime64):
+        d["date"] = pd.to_datetime(d["date"], errors="coerce")
+
+    # Señales disponibles
+    has_sales = "sales" in d.columns
+    has_promo = "onpromotion" in d.columns
+    has_avail = "available_A" in d.columns
+    has_ow    = "Ow" in d.columns
+    has_fsw   = "Fsw_log1p" in d.columns
+
+    # Índice de días
+    daily = (
+        d.loc[d["date"].notna(), ["date"]]
+         .drop_duplicates()
+         .sort_values("date")
+         .set_index("date")
+    )
+
+    # Agregaciones por fecha
+    if has_sales:
+        tmp = d.groupby("date", as_index=True)["sales"].sum().rename("sales_sum")
+        daily = daily.join(tmp, how="left")
+    if has_promo:
+        tmp = (d.assign(promo_flag=(pd.to_numeric(d["onpromotion"], errors="coerce").fillna(0.0) > 0).astype(float))
+                 .groupby("date", as_index=True)["promo_flag"]
+                 .mean()
+                 .rename("promo_share"))
+        daily = daily.join(tmp, how="left")
+    if has_avail:
+        tmp = d.groupby("date", as_index=True)["available_A"].mean().rename("avail_share")
+        daily = daily.join(tmp, how="left")
+    if has_ow:
+        tmp = d.groupby("date", as_index=True)["Ow"].mean().rename("Ow_mean")
+        daily = daily.join(tmp, how="left")
+    if has_fsw:
+        tmp = d.groupby("date", as_index=True)["Fsw_log1p"].mean().rename("Fsw_mean")
+        daily = daily.join(tmp, how="left")
+
+    # Figura (formato carta)
+    fig = plt.figure(constrained_layout=False)
+    gs = fig.add_gridspec(nrows=4, ncols=1, hspace=0.65)
+
+    # Panel A: Ventas agregadas
+    axA = fig.add_subplot(gs[0, 0])
+    if "sales_sum" in daily.columns:
+        axA.plot(daily.index, daily["sales_sum"])
+        axA.set_title("Ventas agregadas diarias (suma)")
+        axA.set_ylabel("Unidades")
+        _format_time_axis(axA)
+    else:
+        axA.axis("off")
+        axA.text(0.5, 0.5, "Sin columna 'sales'", ha="center", va="center")
+
+    # Panel B: Proporción en promoción
+    axB = fig.add_subplot(gs[1, 0])
+    if "promo_share" in daily.columns:
+        axB.plot(daily.index, daily["promo_share"])
+        axB.set_title("Proporción de ítems en promoción (promedio diario)")
+        axB.set_ylabel("Proporción")
+        _format_time_axis(axB)
+    else:
+        axB.axis("off")
+        axB.text(0.5, 0.5, "Sin columna 'onpromotion'", ha="center", va="center")
+
+    # Panel C: Disponibilidad
+    axC = fig.add_subplot(gs[2, 0])
+    if "avail_share" in daily.columns:
+        axC.plot(daily.index, daily["avail_share"])
+        axC.set_title("Disponibilidad promedio (A_it)")
+        axC.set_ylabel("Fracción")
+        _format_time_axis(axC)
+    else:
+        axC.axis("off")
+        axC.text(0.5, 0.5, "Sin columna 'available_A'", ha="center", va="center")
+
+    # Panel D: Proxies (Ow y Fsw)
+    axD = fig.add_subplot(gs[3, 0])
+    lines = 0
+    if "Ow_mean" in daily.columns:
+        axD.plot(daily.index, daily["Ow_mean"], label="Precio del petróleo (Ow)")
+        lines += 1
+    if "Fsw_mean" in daily.columns:
+        axD.plot(daily.index, daily["Fsw_mean"], label="Tráfico tienda – log1p (Fsw)")
+        lines += 1
+    if lines > 0:
+        axD.set_title("Proxies macro y de tráfico")
+        _format_time_axis(axD)
+        axD.legend()
+    else:
+        axD.axis("off")
+        axD.text(0.5, 0.5, "Sin columnas 'Ow'/'Fsw_log1p'", ha="center", va="center")
+
+    fig.suptitle("Panorama temporal agregado del panel", x=0.02, ha="left", y=0.98, fontsize=13)
+    fig.text(0.02, 0.01, "Nota: estadísticas por fecha a nivel agregado; valores faltantes se dejan en blanco.", ha="left")
+    _save_letter(fig, out_path, cfg.orientation, cfg.dpi)
+
+# Alias opcional por si en algún lugar la llamaste distinto
+plot_meta_overview = fig_meta_overview
+
+def fig_episode_page(gsc: pd.DataFrame,
+                     ep_row: Dict,
+                     out_path: Path,
+                     cfg: EDAConfig):
+    """
+    Lámina 4: episodio de ejemplo — trayectoria de víctima vs. promedio de donantes.
+    """
+    df = gsc.copy()
+    if "date" in df.columns and not np.issubdtype(df["date"].dtype, np.datetime64):
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    treated_mask = (df.get("treated_unit", 0) == 1)
+    victim = df.loc[treated_mask].sort_values("date")
+    donors = df.loc[~treated_mask].sort_values("date")
+
+    # Promedio de donantes por fecha (ventas)
+    if "sales" not in df.columns:
+        # Si faltara, evita romper
+        fig = plt.figure()
+        ax = fig.add_subplot(111); ax.axis("off")
+        ax.text(0.5, 0.5, "El panel GSC no tiene columna 'sales'", ha="center", va="center")
+        _save_letter(fig, out_path, cfg.orientation, cfg.dpi)
+        return
+
+    donors_avg = donors.groupby("date", as_index=False)["sales"].mean().rename(columns={"sales": "sales_donors_mean"})
+    merged = victim[["date", "sales"]].merge(donors_avg, on="date", how="left")
+
+    # Ventanas
+    pre_start  = ep_row.get("pre_start")
+    treat_start = ep_row.get("treat_start")
+    post_start = ep_row.get("post_start")
+    post_end   = ep_row.get("post_end")
+
+    pre_mask  = (merged["date"] >= pre_start) & (merged["date"] < treat_start) if (pd.notnull(pre_start) and pd.notnull(treat_start)) else None
+    post_mask = (merged["date"] >= post_start) & (merged["date"] <= post_end)   if (pd.notnull(post_start) and pd.notnull(post_end)) else None
+
+    def _safe_mean(x): 
+        arr = np.asarray(x, dtype=float)
+        return float(np.nanmean(arr)) if arr.size else np.nan
+
+    diff_pre  = _safe_mean(merged.loc[pre_mask,  "sales"] - merged.loc[pre_mask,  "sales_donors_mean"]) if pre_mask is not None else np.nan
+    diff_post = _safe_mean(merged.loc[post_mask, "sales"] - merged.loc[post_mask, "sales_donors_mean"]) if post_mask is not None else np.nan
+    did_naive = diff_post - diff_pre if (np.isfinite(diff_pre) and np.isfinite(diff_post)) else np.nan
+
+    # RMSPE pre
+    if pre_mask is not None and pre_mask.any():
+        base = merged.loc[pre_mask]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pct = (base["sales"] - base["sales_donors_mean"]) / base["sales"].replace({0: np.nan})
+        rmspe_pre = float(np.sqrt(np.nanmean((pct * 100) ** 2)))
+    else:
+        rmspe_pre = np.nan
+
+    fig = plt.figure(constrained_layout=False)
+    gs = fig.add_gridspec(nrows=3, ncols=1, height_ratios=[1.4, 0.8, 0.8], hspace=0.6)
+
+    # Panel A: Serie temporal
+    axA = fig.add_subplot(gs[0, 0])
+    axA.plot(merged["date"], merged["sales"], label="Víctima (ventas)")
+    axA.plot(merged["date"], merged["sales_donors_mean"], label="Donantes (promedio)")
+    for t, label in [(pre_start, "pre_start"), (treat_start, "treat_start"), (post_start, "post_start"), (post_end, "post_end")]:
+        if pd.notnull(t):
+            axA.axvline(pd.to_datetime(t), linestyle="--", alpha=0.7)
+            axA.text(pd.to_datetime(t), axA.get_ylim()[1], label, rotation=90, va="top", ha="right", fontsize=8)
+    axA.set_title("Trayectorias de ventas: víctima vs. promedio de donantes")
+    axA.set_ylabel("Unidades")
+    _format_time_axis(axA)
+    axA.legend()
+
+    # Panel B: Diferencia (víctima - donantes)
+    axB = fig.add_subplot(gs[1, 0])
+    axB.plot(merged["date"], merged["sales"] - merged["sales_donors_mean"])
+    axB.axhline(0.0, linewidth=0.8, alpha=0.6)
+    axB.set_title("Diferencia diaria (víctima – prom. donantes)")
+    _format_time_axis(axB)
+
+    # Panel C: Resumen
+    axC = fig.add_subplot(gs[2, 0])
+    axC.axis("off")
+    meta_lines = [
+        f"Episodio: {ep_row.get('episode_id', 'NA')}",
+        f"Víctima: store {ep_row.get('j_store','?')}, item {ep_row.get('j_item','?')}",
+        f"Caníbal: store {ep_row.get('i_store','?')}, item {ep_row.get('i_item','?')}",
+        f"Donantes retenidos: {ep_row.get('n_donors_kept','?')} / {ep_row.get('n_donors_input','?')}",
+        f"Naive DiD (post-pre): {did_naive:.2f}",
+        f"RMSPE pre (donantes vs víctima): {rmspe_pre:.2f}%",
+    ]
+    axC.text(0.02, 0.95, "\n".join(meta_lines), va="top", ha="left", fontsize=10)
+
+    fig.suptitle("Episodio de ejemplo — diagnóstico descriptivo", x=0.02, ha="left", y=0.98, fontsize=13)
+    fig.text(0.02, 0.01, "Nota: Medidas descriptivas; no sustituyen la inferencia GSC/Meta.", ha="left")
+    _save_letter(fig, out_path, cfg.orientation, cfg.dpi)
+
+# Alias opcional
+plot_episode_page = fig_episode_page
+
+def fig_donor_quality(quality: pd.DataFrame, out_path: Path, cfg: EDAConfig):
+    """
+    Lámina 2: calidad de donantes — distribuciones y umbrales.
+    Compatible con el expected schema de pre_algorithm.py (donor_quality.parquet).
+    """
+    df = quality.copy()
+
+    # Excluir la víctima para evaluar solo donantes, si viene marcado
+    if "is_victim" in df.columns:
+        df = df.loc[df["is_victim"] == False].copy()
+
+    fig = plt.figure(constrained_layout=False)
+    gs = fig.add_gridspec(nrows=2, ncols=2, hspace=0.6, wspace=0.35)
+
+    # --- Panel 1: Distribución de proporción de días en promoción (donantes) ---
+    ax1 = fig.add_subplot(gs[0, 0])
+    if "promo_share" in df.columns:
+        ax1.hist(df["promo_share"].dropna(), bins=30, alpha=0.9)
+        ax1.axvline(cfg.promo_thresh, linestyle="--", alpha=0.8)
+        ax1.set_title("Distribución de proporción de días en promoción (donantes)")
+        ax1.set_xlabel("Proporción de días con promoción")
+        ax1.set_ylabel("Frecuencia")
+        above = (df["promo_share"] > cfg.promo_thresh).mean() if len(df) else 0.0
+        ax1.text(0.02, 0.92, f"Sobre umbral: {100*above:.1f}%", transform=ax1.transAxes)
+    else:
+        ax1.axis("off")
+        ax1.text(0.5, 0.5, "Sin columna 'promo_share'", ha="center", va="center")
+
+    # --- Panel 2: Distribución de disponibilidad (donantes) ---
+    ax2 = fig.add_subplot(gs[0, 1])
+    if "avail_share" in df.columns:
+        ax2.hist(df["avail_share"].dropna(), bins=30, alpha=0.9)
+        ax2.axvline(cfg.avail_thresh, linestyle="--", alpha=0.8)
+        ax2.set_title("Distribución de disponibilidad (donantes)")
+        ax2.set_xlabel("Fracción de días disponibles")
+        ax2.set_ylabel("Frecuencia")
+        below = (df["avail_share"] < cfg.avail_thresh).mean() if len(df) else 0.0
+        ax2.text(0.02, 0.92, f"Bajo umbral: {100*below:.1f}%", transform=ax2.transAxes)
+    else:
+        ax2.axis("off")
+        ax2.text(0.5, 0.5, "Sin columna 'avail_share'", ha="center", va="center")
+
+    # --- Panel 3: Motivos de descarte (Top 10) ---
+    ax3 = fig.add_subplot(gs[1, :])
+    if "keep" in df.columns and "reason" in df.columns:
+        reasons = df.loc[df["keep"] == False, "reason"].fillna("sin_razón")
+        exploded = reasons.astype(str).str.split(";").explode().str.strip()
+        counts = exploded.value_counts().head(10)
+        if not counts.empty:
+            ax3.bar(counts.index.astype(str), counts.values)
+            ax3.set_title("Principales motivos de descarte de donantes (Top 10)")
+            ax3.set_ylabel("Frecuencia")
+            ax3.set_xticklabels(counts.index.astype(str), rotation=45, ha="right")
+        else:
+            ax3.axis("off")
+            ax3.text(0.5, 0.5, "Sin descartes de donantes", ha="center", va="center")
+    else:
+        ax3.axis("off")
+        ax3.text(0.5, 0.5, "Sin columnas 'keep'/'reason'", ha="center", va="center")
+
+    fig.suptitle("Calidad de donantes: distribución de métricas y filtros",
+                 x=0.02, ha="left", y=0.98, fontsize=13)
+    fig.text(0.02, 0.01,
+             f"Umbrales: promoción ≤ {cfg.promo_thresh:.2f}, disponibilidad ≥ {cfg.avail_thresh:.2f}.",
+             ha="left")
+
+    _save_letter(fig, out_path, cfg.orientation, cfg.dpi)
+
+# Alias opcional (por si en algún lado se llamó 'plot_donor_quality')
+plot_donor_quality = fig_donor_quality
 
 def fig_episodes_summary(episodes: pd.DataFrame, out_path: Path, cfg: EDAConfig):
     """
@@ -314,257 +594,6 @@ def fig_episodes_summary(episodes: pd.DataFrame, out_path: Path, cfg: EDAConfig)
     table_data = [[k, v] for k, v in summary.items()]
     tbl = axD.table(cellText=table_data, colLabels=["Métrica", "Valor"], loc="center")
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(9)
-    tbl.scale(1.0, 1.2)
-
-    fig.suptitle("Resumen de episodios y estructura muestral", x=0.02, ha="left", y=0.98, fontsize=13)
-    fig.text(0.02, 0.01, "Nota: Retención tras filtros de promoción y disponibilidad; figura en formato carta.", ha="left")
-    _save_letter(fig, out_path, cfg.orientation, cfg.dpi)
-
-
-def fig_donor_quality(quality: pd.DataFrame, out_path: Path, cfg: EDAConfig):
-    """
-    Lámina 2: calidad de donantes — distribuciones y umbrales.
-    """
-    df = quality.copy()
-    if "is_victim" in df.columns:
-        df = df.loc[df["is_victim"] == False].copy()
-
-    fig = plt.figure(constrained_layout=False)
-    gs = fig.add_gridspec(nrows=2, ncols=2, hspace=0.6, wspace=0.35)
-
-    # --- Promo share ---
-    ax1 = fig.add_subplot(gs[0, 0])
-    if "promo_share" in df.columns:
-        ax1.hist(df["promo_share"].dropna(), bins=30, alpha=0.9)
-        ax1.axvline(cfg.promo_thresh, linestyle="--", alpha=0.8)
-        ax1.set_title("Distribución de proporción de días en promoción (donantes)")
-        ax1.set_xlabel("Proporción de días con promoción")
-        ax1.set_ylabel("Frecuencia")
-        # % sobre umbral
-        above = (df["promo_share"] > cfg.promo_thresh).mean()
-        ax1.text(0.02, 0.92, f"Sobre umbral: {100*above:.1f}%", transform=ax1.transAxes)
-    else:
-        ax1.axis("off")
-        ax1.text(0.5, 0.5, "Sin columna promo_share", ha="center", va="center")
-
-    # --- Availability share ---
-    ax2 = fig.add_subplot(gs[0, 1])
-    if "avail_share" in df.columns:
-        ax2.hist(df["avail_share"].dropna(), bins=30, alpha=0.9)
-        ax2.axvline(cfg.avail_thresh, linestyle="--", alpha=0.8)
-        ax2.set_title("Distribución de disponibilidad (donantes)")
-        ax2.set_xlabel("Fracción de días disponibles")
-        ax2.set_ylabel("Frecuencia")
-        below = (df["avail_share"] < cfg.avail_thresh).mean()
-        ax2.text(0.02, 0.92, f"Bajo umbral: {100*below:.1f}%", transform=ax2.transAxes)
-    else:
-        ax2.axis("off")
-        ax2.text(0.5, 0.5, "Sin columna avail_share", ha="center", va="center")
-
-    # --- Motivos de descarte ---
-    ax3 = fig.add_subplot(gs[1, :])
-    if "keep" in df.columns and "reason" in df.columns:
-        reasons = df.loc[df["keep"] == False, "reason"].fillna("sin_razón")
-        # normalizar etiquetas compuestas
-        exploded = reasons.str.split(";").explode().str.strip()
-        counts = exploded.value_counts().head(10)
-        ax3.bar(counts.index.astype(str), counts.values)
-        ax3.set_title("Principales motivos de descarte de donantes (Top 10)")
-        ax3.set_ylabel("Frecuencia")
-        ax3.set_xticklabels(counts.index.astype(str), rotation=45, ha="right")
-    else:
-        ax3.axis("off")
-        ax3.text(0.5, 0.5, "Sin columnas keep/reason", ha="center", va="center")
-
-    fig.suptitle("Calidad de donantes: distribución de métricas y filtros", x=0.02, ha="left", y=0.98, fontsize=13)
-    fig.text(0.02, 0.01, f"Umbrales: promoción ≤ {cfg.promo_thresh:.2f}, disponibilidad ≥ {cfg.avail_thresh:.2f}.", ha="left")
-    _save_letter(fig, out_path, cfg.orientation, cfg.dpi)
-
-
-def fig_meta_overview(df: pd.DataFrame, out_path: Path, cfg: EDAConfig):
-    """
-    Lámina 3: panorama temporal agregado (ventas, promociones, disponibilidad, proxies).
-    Usa meta/all_units si está disponible; de lo contrario panel_features.
-    """
-    d = df.copy()
-    d = _ensure_datetime(d, "date")
-
-    # Inferencias robustas
-    has_sales = "sales" in d.columns
-    has_promo = "onpromotion" in d.columns
-    has_avail = "available_A" in d.columns
-    has_ow = "Ow" in d.columns
-    has_fsw = "Fsw_log1p" in d.columns
-
-    # Agregaciones por fecha
-    daily = pd.DataFrame({"date": pd.to_datetime(d["date"]).dropna().unique()})
-    daily = daily.sort_values("date")
-    daily = daily.set_index("date")
-
-    if has_sales:
-        tmp = d.groupby("date", as_index=True)["sales"].sum().rename("sales_sum")
-        daily = daily.join(tmp, how="left")
-    if has_promo:
-        # proporción de filas con promo>0
-        tmp = d.assign(promo_flag=(d["onpromotion"] > 0).astype(float)).groupby("date")["promo_flag"].mean().rename("promo_share")
-        daily = daily.join(tmp, how="left")
-    if has_avail:
-        tmp = d.groupby("date")["available_A"].mean().rename("avail_share")
-        daily = daily.join(tmp, how="left")
-    if has_ow:
-        tmp = d.groupby("date")["Ow"].mean().rename("Ow_mean")
-        daily = daily.join(tmp, how="left")
-    if has_fsw:
-        tmp = d.groupby("date")["Fsw_log1p"].mean().rename("Fsw_mean")
-        daily = daily.join(tmp, how="left")
-
-    fig = plt.figure(constrained_layout=False)
-    gs = fig.add_gridspec(nrows=4, ncols=1, hspace=0.65)
-
-    # Panel A: Ventas agregadas
-    axA = fig.add_subplot(gs[0, 0])
-    if "sales_sum" in daily.columns:
-        axA.plot(daily.index, daily["sales_sum"])
-        axA.set_title("Ventas agregadas diarias (suma)")
-        axA.set_ylabel("Unidades")
-        _format_time_axis(axA)
-    else:
-        axA.axis("off")
-        axA.text(0.5, 0.5, "Sin columna 'sales'", ha="center", va="center")
-
-    # Panel B: Proporción en promoción
-    axB = fig.add_subplot(gs[1, 0])
-    if "promo_share" in daily.columns:
-        axB.plot(daily.index, daily["promo_share"])
-        axB.set_title("Proporción de ítems en promoción (promedio diario)")
-        axB.set_ylabel("Proporción")
-        _format_time_axis(axB)
-    else:
-        axB.axis("off")
-        axB.text(0.5, 0.5, "Sin columna 'onpromotion'", ha="center", va="center")
-
-    # Panel C: Disponibilidad
-    axC = fig.add_subplot(gs[2, 0])
-    if "avail_share" in daily.columns:
-        axC.plot(daily.index, daily["avail_share"])
-        axC.set_title("Disponibilidad promedio (A_it)")
-        axC.set_ylabel("Fracción")
-        _format_time_axis(axC)
-    else:
-        axC.axis("off")
-        axC.text(0.5, 0.5, "Sin columna 'available_A'", ha="center", va="center")
-
-    # Panel D: Proxies (Ow y Fsw)
-    axD = fig.add_subplot(gs[3, 0])
-    lines = 0
-    if "Ow_mean" in daily.columns:
-        axD.plot(daily.index, daily["Ow_mean"], label="Precio del petróleo (Ow)")
-        lines += 1
-    if "Fsw_mean" in daily.columns:
-        axD.plot(daily.index, daily["Fsw_mean"], label="Tráfico tienda – log1p (Fsw)")
-        lines += 1
-    if lines > 0:
-        axD.set_title("Proxies macro y de tráfico")
-        _format_time_axis(axD)
-        axD.legend()
-    else:
-        axD.axis("off")
-        axD.text(0.5, 0.5, "Sin columnas 'Ow'/'Fsw_log1p'", ha="center", va="center")
-
-    fig.suptitle("Panorama temporal agregado del panel", x=0.02, ha="left", y=0.98, fontsize=13)
-    fig.text(0.02, 0.01, "Nota: estadísticas por fecha a nivel agregado; valores faltantes se dejan en blanco.", ha="left")
-    _save_letter(fig, out_path, cfg.orientation, cfg.dpi)
-
-
-def fig_episode_page(gsc: pd.DataFrame,
-                     ep_row: Dict,
-                     out_path: Path,
-                     cfg: EDAConfig):
-    """
-    Lámina 4: episodio de ejemplo — trayectoria de víctima vs. promedio de donantes.
-    """
-    df = gsc.copy()
-    df = _ensure_datetime(df, "date")
-
-    # Identificación de víctima y periodo
-    treated_mask = (df.get("treated_unit", 0) == 1)
-    victim = df.loc[treated_mask].sort_values("date")
-    donors = df.loc[~treated_mask].sort_values("date")
-
-    # Promedio de donantes por fecha (ventas)
-    donors_avg = donors.groupby("date", as_index=False)["sales"].mean().rename(columns={"sales": "sales_donors_mean"})
-    merged = victim[["date", "sales"]].merge(donors_avg, on="date", how="left")
-
-    # Fechas de ventanas
-    pre_start = ep_row.get("pre_start")
-    treat_start = ep_row.get("treat_start")
-    post_start = ep_row.get("post_start")
-    post_end = ep_row.get("post_end")
-
-    # Métricas diagnósticas simples
-    pre_mask = (merged["date"] >= pre_start) & (merged["date"] < treat_start) if (pre_start is not None and treat_start is not None) else None
-    post_mask = (merged["date"] >= post_start) & (merged["date"] <= post_end) if (post_start is not None and post_end is not None) else None
-
-    def _safe_mean(x): return float(np.nanmean(x)) if len(x) else np.nan
-
-    diff_pre = _safe_mean(merged.loc[pre_mask, "sales"] - merged.loc[pre_mask, "sales_donors_mean"]) if pre_mask is not None else np.nan
-    diff_post = _safe_mean(merged.loc[post_mask, "sales"] - merged.loc[post_mask, "sales_donors_mean"]) if post_mask is not None else np.nan
-    did_naive = diff_post - diff_pre if (np.isfinite(diff_pre) and np.isfinite(diff_post)) else np.nan
-
-    # RMSPE pre
-    if pre_mask is not None and pre_mask.any():
-        base = merged.loc[pre_mask]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            pct = (base["sales"] - base["sales_donors_mean"]) / base["sales"].replace({0: np.nan})
-        rmspe_pre = float(np.sqrt(np.nanmean((pct * 100) ** 2)))
-    else:
-        rmspe_pre = np.nan
-
-    fig = plt.figure(constrained_layout=False)
-    gs = fig.add_gridspec(nrows=3, ncols=1, height_ratios=[1.4, 0.8, 0.8], hspace=0.6)
-
-    # Panel A: Serie temporal
-    axA = fig.add_subplot(gs[0, 0])
-    axA.plot(merged["date"], merged["sales"], label="Víctima (ventas)")
-    axA.plot(merged["date"], merged["sales_donors_mean"], label="Donantes (promedio)")
-    # Líneas de ventana
-    for t, label in [(pre_start, "pre_start"), (treat_start, "treat_start"),
-                     (post_start, "post_start"), (post_end, "post_end")]:
-        if pd.notnull(t):
-            axA.axvline(pd.to_datetime(t), linestyle="--", alpha=0.7)
-            axA.text(pd.to_datetime(t), axA.get_ylim()[1], label, rotation=90, va="top", ha="right", fontsize=8)
-    axA.set_title("Trayectorias de ventas: víctima vs. promedio de donantes")
-    axA.set_ylabel("Unidades")
-    _format_time_axis(axA)
-    axA.legend()
-
-    # Panel B: Diferencia (víctima - donantes)
-    axB = fig.add_subplot(gs[1, 0])
-    axB.plot(merged["date"], merged["sales"] - merged["sales_donors_mean"])
-    axB.axhline(0.0, color="k", linewidth=0.8, alpha=0.6)
-    axB.set_title("Diferencia diaria (víctima – prom. donantes)")
-    _format_time_axis(axB)
-
-    # Panel C: Resumen numérico
-    axC = fig.add_subplot(gs[2, 0])
-    axC.axis("off")
-    meta_lines = [
-        f"Episodio: {ep_row.get('episode_id', 'NA')}",
-        f"Víctima: store {ep_row.get('j_store','?')}, item {ep_row.get('j_item','?')}",
-        f"Caníbal: store {ep_row.get('i_store','?')}, item {ep_row.get('i_item','?')}",
-        f"Donantes retenidos: {ep_row.get('n_donors_kept','?')} / {ep_row.get('n_donors_input','?')}",
-        f"Naive DiD (post-pre): {did_naive:.2f}",
-        f"RMSPE pre (donantes vs víctima): {rmspe_pre:.2f}%",
-    ]
-    axC.text(0.02, 0.95, "\n".join(meta_lines), va="top", ha="left", fontsize=10)
-
-    fig.suptitle("Episodio de ejemplo — diagnóstico descriptivo", x=0.02, ha="left", y=0.98, fontsize=13)
-    fig.text(0.02, 0.01, "Nota: Medidas descriptivas; no sustituyen la inferencia GSC/Meta.", ha="left")
-    _save_letter(fig, out_path, cfg.orientation, cfg.dpi)
-
-
-# ---------------------------------------------------------------------
 # Orquestación
 # ---------------------------------------------------------------------
 
@@ -591,21 +620,21 @@ def run(cfg: EDAConfig) -> None:
 
     # Lámina 1
     if ep_idx is not None and not ep_idx.empty:
-        fig_episodes_summary(ep_idx, cfg.out_dir / "01_resumen_episodios.png", cfg)
+        fig_episodes_summary(ep_idx, cfg.out_dir / "eda_4_01_resumen_episodios.png", cfg)
     else:
-        logging.warning("No se generó '01_resumen_episodios.png' por ausencia de episodes_index.")
+        logging.warning("No se generó 'eda_4_01_resumen_episodios.png' por ausencia de episodes_index.")
 
     # Lámina 2
     if dq is not None and not dq.empty:
-        fig_donor_quality(dq, cfg.out_dir / "02_calidad_donantes.png", cfg)
+        fig_donor_quality(dq, cfg.out_dir / "eda_4_02_calidad_donantes.png", cfg)
     else:
-        logging.warning("No se generó '02_calidad_donantes.png' por ausencia de donor_quality.")
+        logging.warning("No se generó 'eda_4_02_calidad_donantes.png' por ausencia de donor_quality.")
 
     # Lámina 3
     if meta_or_panel is not None and not meta_or_panel.empty:
-        fig_meta_overview(meta_or_panel, cfg.out_dir / "03_panorama_panel.png", cfg)
+        fig_meta_overview(meta_or_panel, cfg.out_dir / "eda_4_03_panorama_panel.png", cfg)
     else:
-        logging.warning("No se generó '03_panorama_panel.png' por ausencia de meta/all_units o panel_features.")
+        logging.warning("No se generó 'eda_4_03_panorama_panel.png' por ausencia de meta/all_units o panel_features.")
 
     # Lámina 4: episodio(s) de ejemplo
     if ep_idx is not None and not ep_idx.empty and cfg.gsc_dir is not None and cfg.gsc_dir.exists():
@@ -614,7 +643,7 @@ def run(cfg: EDAConfig) -> None:
             ep_id = row["episode_id"]
             gsc = _read_gsc_episode(cfg, ep_id)
             if gsc is not None and not gsc.empty:
-                out = cfg.out_dir / f"04_episodio_{ep_id}.png"
+                out = cfg.out_dir / f"eda_4_04_episodio_{ep_id}.png"
                 fig_episode_page(gsc, row.to_dict(), out, cfg)
             else:
                 logging.warning(f"Omitida lámina de episodio {ep_id}: no se encontró el panel GSC.")
