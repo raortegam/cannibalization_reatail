@@ -17,8 +17,8 @@ en formato carta (8.5 x 11 pulgadas), que documenta:
 Uso (CLI)
 ---------
 python EDA/EDA_pairs.py \
-  --pairs-path data/preprocessed_data/pairs_windows.csv \
-  --donors-path data/preprocessed_data/donors_per_victim.csv \
+  --pairs-path data/processed_data/pairs_windows.csv \
+  --donors-path data/processed_data/donors_per_victim.csv \
   --out-dir EDA/outputs/episodios_muestra \
   --n 5 --strategy stratified --seed 2025
 
@@ -553,9 +553,9 @@ def main():
         description="EDA académica de episodios de canibalización (tamaño carta).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("--pairs-path", type=str, default="data/preprocessed_data/pairs_windows.csv",
+    parser.add_argument("--pairs-path", type=str, default="data/processed_data/pairs_windows.csv",
                         help="Ruta al CSV de episodios (pairs_windows.csv).")
-    parser.add_argument("--donors-path", type=str, default="data/preprocessed_data/donors_per_victim.csv",
+    parser.add_argument("--donors-path", type=str, default="data/processed_data/donors_per_victim.csv",
                         help="Ruta al CSV de donantes (donors_per_victim.csv).")
     parser.add_argument("--out-dir", type=str, default="EDA/outputs/episodios_muestra",
                         help="Directorio de salida para las imágenes PNG.")

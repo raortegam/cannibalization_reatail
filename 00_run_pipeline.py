@@ -2,23 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 00_run_pipeline.py
-Orquestador del pipeline de preprocesamiento y EDA para canibalización promocional en retail.
+Orquestador del pipeline de preprocesamiento, modelado y EDA para canibalización promocional en retail.
 
-Características principales:
-- Ejecuta los 4 pasos de preprocesamiento (1 a 4) y los 4 EDAs (1 a 4), de forma configurable.
-- Carga configuración desde un archivo YAML.
-- Logs dicientes a consola y archivo (diagnostics/).
-- Maneja módulos con nombres de archivo no estándar (p.ej., "1. data_quality.py") vía import dinámico.
-- Guarda artefactos en las rutas definidas por la configuración.
-- Continúa o se detiene ante errores según "fail_fast".
+Novedades (parches):
+- Soporte de barridos/iteraciones vía 'exp_tag' (inyectado desde YAML), con rutas derivadas por iteración.
+- Sellado de imágenes PNG/JPG de TODOS los EDA con 'exp_tag' y un resumen corto de configuración.
+- Filtrado post Step 3 a 10 caníbales x 10 víctimas (parametrizable en ParamsConfig).
+- Registro de README por iteración con la configuración efectiva.
 
 Uso:
     python 00_run_pipeline.py --config pipeline_config.yaml
-
-Requisitos:
-    - PyYAML (pip install pyyaml)
-    - Estructura de repo según el contexto provisto.
 """
+# 00_run_pipeline.py
 from __future__ import annotations
 
 import argparse
@@ -35,32 +30,58 @@ from datetime import datetime
 from importlib import util as importlib_util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
+import pandas as pd  # <- usado en validaciones rápidas
 try:
     import yaml  # PyYAML
 except Exception as e:
     raise RuntimeError("Se requiere PyYAML. Instálalo con `pip install pyyaml`.") from e
 
+# Opcional: para sellar imágenes de EDA con exp_tag
+try:
+    from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    _HAS_PIL = True
+except Exception:
+    _HAS_PIL = False
 
-# -------------------- Utilidades generales --------------------
+
+# -------------------- Constantes / Paths base --------------------
 
 REPO_ROOT = Path(__file__).resolve().parent
 SRC_DIR = REPO_ROOT / "src"
 EDA_DIR = REPO_ROOT / "EDA"
 DIAG_DIR = REPO_ROOT / "diagnostics"
 
+
+# -------------------- Utilidades generales --------------------
+
+def _parquet_has_rows(p: Path) -> bool:
+    try:
+        if not p.exists():
+            return False
+        df = pd.read_parquet(p)
+        return (df is not None) and (not df.empty)
+    except Exception:
+        return False
+
+
 def ensure_dir(p: str | Path) -> Path:
     p = Path(p)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-def setup_logging(level: str = "INFO", log_to_file: bool = True) -> Path:
+
+def setup_logging(level: str = "INFO", log_to_file: bool = True, exp_tag: Optional[str] = None) -> Path:
+    """
+    Configura logging. Si 'exp_tag' viene definido, nombra el archivo con dicha etiqueta.
+    """
     ensure_dir(DIAG_DIR)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = DIAG_DIR / f"pipeline_{ts}.log"
+    log_name = f"pipeline_{exp_tag}_{ts}.log" if exp_tag else f"pipeline_{ts}.log"
+    log_path = DIAG_DIR / log_name
 
-    # Limpiar handlers previos si se reejecuta en el mismo intérprete
+    # limpiar handlers previos
     for h in logging.root.handlers[:]:
         logging.root.removeHandler(h)
 
@@ -91,32 +112,48 @@ def seed_everything(seed: int = 2025) -> None:
     except Exception:
         pass
 
+
 def import_module_spawn_safe(module_name: str, real_path: Path):
     """
     Garantiza que el módulo sea importable por nombre en procesos hijos (Windows spawn).
-    Crea una copia con nombre válido en .data/_temp_modules/<module_name>.py y la importa.
+    Copia el módulo Y su directorio padre completo para resolver dependencias locales.
     """
     tmp_dir = REPO_ROOT / ".data" / "_temp_modules"
     ensure_dir(tmp_dir)
+
+    # Copiar el archivo principal
     dest = tmp_dir / f"{module_name}.py"
     try:
-        # Copia si no existe o si el source es más nuevo
         if (not dest.exists()) or (real_path.stat().st_mtime > dest.stat().st_mtime):
             shutil.copy2(str(real_path), str(dest))
     except Exception as e:
         raise ImportError(f"No pude preparar alias spawn-safe para {module_name}: {e}")
 
-    # Asegura que el tmp_dir esté al frente del sys.path
+    # Copiar todo el directorio padre (para dependencias locales)
+    parent_dir = real_path.parent
+    tmp_parent = tmp_dir / parent_dir.name
+    if parent_dir.exists() and parent_dir.is_dir():
+        try:
+            ensure_dir(tmp_parent)
+            for py_file in parent_dir.glob("*.py"):
+                dest_py = tmp_parent / py_file.name
+                if (not dest_py.exists()) or (py_file.stat().st_mtime > dest_py.stat().st_mtime):
+                    shutil.copy2(str(py_file), str(dest_py))
+        except Exception as e:
+            logging.warning(f"No pude copiar dependencias del directorio {parent_dir}: {e}")
+
+    # Añadir ambas rutas al sys.path
     if str(tmp_dir) not in sys.path:
         sys.path.insert(0, str(tmp_dir))
+    if str(tmp_parent) not in sys.path:
+        sys.path.insert(0, str(tmp_parent))
 
-    # Importación normal: esto asegura presencia en sys.modules
     return importlib.import_module(module_name)
+
 
 def _dynamic_import(module_name: str, py_path: Path):
     """
     Carga dinámica de un módulo desde ruta absoluta (soporta nombres con espacios o puntos).
-    Devuelve el módulo cargado.
     """
     if not py_path.exists():
         raise FileNotFoundError(f"No existe el archivo de módulo: {py_path}")
@@ -162,6 +199,38 @@ def _safe_call(fn, logger: logging.Logger, fail_fast: bool, step_name: str, **kw
         return None
 
 
+# -------------------- NUEVO: helpers de aislamiento por experimento --------------------
+
+def _touch_fingerprint(dirpath: Path, exp_tag: Optional[str]) -> None:
+    """Crea un 'fingerprint' en cada carpeta crítica para evidenciar el experimento activo."""
+    if not exp_tag:
+        return
+    ensure_dir(dirpath)
+    stamp = dirpath / f".exp_{exp_tag}.stamp"
+    try:
+        stamp.write_text(
+            json.dumps({"exp_tag": exp_tag, "ts": datetime.now().isoformat(), "dir": str(dirpath)}, ensure_ascii=False),
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _assert_scoped(path: Path, exp_tag: Optional[str], label: str) -> None:
+    """Advierte si 'path' NO está bajo una carpeta cuyo nombre termina en exp_tag."""
+    if not exp_tag:
+        return
+    p = Path(path).resolve()
+    ok = any(part == exp_tag for part in p.parts)
+    if not ok:
+        logging.warning("[SCOPE] %s NO está bajo exp_tag='%s' -> %s", label, exp_tag, str(p))
+
+
+def _assert_exists(path: Path, label: str) -> None:
+    if not Path(path).exists():
+        logging.warning("[MISSING] %s no existe -> %s", label, str(path))
+
+
 # -------------------- Configuración --------------------
 
 @dataclass
@@ -174,6 +243,10 @@ class StepToggles:
     eda2: bool = True
     eda3: bool = True
     eda4: bool = True
+    # Nuevos pasos
+    step5_gsc: bool = True
+    step6_meta: bool = True
+    eda_algorithms: bool = True
 
 
 @dataclass
@@ -187,12 +260,16 @@ class PathsConfig:
 
     # Salidas/Intermedios
     processed_dir: Path = Path(".data/processed_data")
-    preprocessed_dir: Path = Path(".data/preprocessed_data")
+    preprocessed_dir: Path = Path(".data/processed_data")
     figures_dir: Path = Path("figures/favorita_analysis")
     exposure_csv: Path = Path(".data/processed_data/competitive_exposure.csv")
 
     # Artefactos de Step 1 (si se desea forzar rutas)
     step1_out_dir: Optional[Path] = None
+
+    # NUEVO: rutas de salida de algoritmos
+    gsc_out_dir: Path = Path(".data/processed_data/gsc_outputs")
+    meta_out_root: Path = Path(".data/processed_data/meta_outputs")
 
 
 @dataclass
@@ -209,14 +286,13 @@ class ParamsConfig:
     h_bin_threshold: float = 0.02
 
     # Step 2: Competitive Exposure
-    neighborhood_col: Optional[str] = None  # si aplica
-    save_format: Optional[str] = None  # infiere por extensión si None
+    neighborhood_col: Optional[str] = None
+    save_format: Optional[str] = None
 
     # Step 3: select_pairs_and_donors
-    outdir_pairs_donors: Path = Path(".data/preprocessed_data")
+    outdir_pairs_donors: Path = Path(".data/processed_data")
 
     # Step 4: pre_algorithm -> PrepConfig
-    # Ver defaults en el módulo original; aquí exponemos más usados.
     top_k_donors: int = 10
     donor_kind: str = "same_item"
     lags_days: Tuple[int, ...] = (7, 14, 28, 56)
@@ -229,9 +305,9 @@ class ParamsConfig:
     dry_run: bool = False
     max_episodes: Optional[int] = None
     prep_log_level: str = "INFO"
-    fail_fast: bool = False  # del pre_algorithm
+    fail_fast: bool = False
 
-    # EDA 2: parámetros de visualización
+    # EDA 2
     eda2_orientation: str = "portrait"
     eda2_dpi: int = 300
     eda2_bins: int = 50
@@ -241,15 +317,14 @@ class ParamsConfig:
     eda2_chunksize: int = 1_000_000
     eda2_log_level: str = "INFO"
 
-    # EDA 3: sampleo y calidad
+    # EDA 3
     eda3_n: int = 5
     eda3_strategy: str = "stratified"
     eda3_seed: int = 2025
     eda3_orientation: str = "portrait"
     eda3_dpi: int = 300
-    # Para quality_cfg usar los defaults del módulo si existe
 
-    # EDA 4: reporte final
+    # EDA 4
     eda4_promo_thresh: float = 0.02
     eda4_avail_thresh: float = 0.90
     eda4_limit_episodes: int = 1
@@ -258,6 +333,63 @@ class ParamsConfig:
     eda4_dpi: int = 300
     eda4_log_level: str = "INFO"
 
+    # -------- NUEVO: Algoritmos ----------
+    # GSC
+    gsc_log_level: str = "INFO"
+    gsc_max_episodes: Optional[int] = None
+    gsc_do_placebo_space: bool = True
+    gsc_do_placebo_time: bool = True
+    gsc_do_loo: bool = False
+    gsc_max_loo: int = 5
+    gsc_sens_samples: int = 0
+    gsc_cv_folds: int = 3
+    gsc_cv_holdout: int = 21
+    gsc_eval_n: int = 10
+    gsc_eval_selection: str = "head"
+    # Hiperparámetros ejemplo
+    gsc_rank: int = 5
+    gsc_tau: float = 0.0001
+    gsc_alpha: float = 0.0
+
+    # Meta-learners
+    meta_learners: Tuple[str, ...] = ("x",)  # subset de {"t","s","x"}
+    meta_model: str = "hgbt"
+    meta_prop_model: str = "logit"
+    meta_random_state: int = 42
+    meta_cv_folds: int = 3
+    meta_cv_holdout: int = 21
+    meta_min_train_samples: int = 50
+    meta_max_episodes: Optional[int] = None
+    meta_do_placebo_space: bool = True
+    meta_do_placebo_time: bool = True
+    meta_do_loo: bool = False
+    meta_max_loo: int = 5
+    meta_sens_samples: int = 0
+    meta_max_depth: int = 6
+    meta_learning_rate: float = 0.05
+    meta_max_iter: int = 500
+    meta_min_samples_leaf: int = 20
+    meta_l2: float = 0.0
+    # Tratamientos
+    treat_col_s: str = "H_disc"
+    s_ref: float = 0.0
+    treat_col_b: str = "H_prop"
+    bin_threshold: float = 0.0
+
+    # EDA final de algoritmos
+    eda_alg_orientation: str = "landscape"
+    eda_alg_dpi: int = 300
+    eda_alg_learners: Tuple[str, ...] = ("t", "s", "x")
+    eda_alg_export_pdf: bool = True
+    eda_alg_max_episodes_gsc: Optional[int] = None
+    eda_alg_max_episodes_meta: Optional[int] = None
+
+    # --- NUEVO: objetivo 10x10 episodios y nombres de columnas en pairs_windows
+    n_cannibals: int = 10
+    n_victims_per_cannibal: int = 10
+    pairs_cannibal_col: Optional[str] = None
+    pairs_victim_col: Optional[str] = None
+
 
 @dataclass
 class OrchestratorConfig:
@@ -265,9 +397,9 @@ class OrchestratorConfig:
     seed: int = 2025
     log_level: str = "INFO"
     log_to_file: bool = True
-    fail_fast: bool = False  # a nivel orquestador
-    use_filtered_from_step1: bool = True  # usar outputs filtrados del paso 1
-
+    fail_fast: bool = False
+    use_filtered_from_step1: bool = True
+    exp_tag: Optional[str] = None
     toggles: StepToggles = field(default_factory=StepToggles)
     paths: PathsConfig = field(default=None)   # type: ignore[assignment]
     params: ParamsConfig = field(default_factory=ParamsConfig)
@@ -277,7 +409,6 @@ def load_yaml_config(path: Path) -> OrchestratorConfig:
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    # Ensamblar las dataclasses con casting a Path donde aplique
     toggles = StepToggles(**cfg.get("toggles", {}))
 
     paths_raw = cfg["paths"]
@@ -288,10 +419,12 @@ def load_yaml_config(path: Path) -> OrchestratorConfig:
         items_csv=Path(paths_raw["items_csv"]) if paths_raw.get("items_csv") else None,
         stores_csv=Path(paths_raw["stores_csv"]) if paths_raw.get("stores_csv") else None,
         processed_dir=Path(paths_raw.get("processed_dir", ".data/processed_data")),
-        preprocessed_dir=Path(paths_raw.get("preprocessed_dir", ".data/preprocessed_data")),
+        preprocessed_dir=Path(paths_raw.get("preprocessed_dir", ".data/processed_data")),
         figures_dir=Path(paths_raw.get("figures_dir", "figures/favorita_analysis")),
         exposure_csv=Path(paths_raw.get("exposure_csv", ".data/processed_data/competitive_exposure.csv")),
         step1_out_dir=Path(paths_raw["step1_out_dir"]) if paths_raw.get("step1_out_dir") else None,
+        gsc_out_dir=Path(paths_raw.get("gsc_out_dir", ".data/processed_data/gsc_outputs")),
+        meta_out_root=Path(paths_raw.get("meta_out_root", ".data/processed_data/meta_outputs")),
     )
 
     params = ParamsConfig(**cfg.get("params", {}))
@@ -303,6 +436,7 @@ def load_yaml_config(path: Path) -> OrchestratorConfig:
         log_to_file=cfg.get("log_to_file", True),
         fail_fast=cfg.get("fail_fast", False),
         use_filtered_from_step1=cfg.get("use_filtered_from_step1", True),
+        exp_tag=cfg.get("exp_tag"),
         toggles=toggles,
         paths=paths,
         params=params,
@@ -310,13 +444,207 @@ def load_yaml_config(path: Path) -> OrchestratorConfig:
     return orch
 
 
+# -------------------- Helpers para iteraciones/sello/README --------------------
+
+def derive_iter_paths(paths: 'PathsConfig', exp_tag: Optional[str]) -> 'PathsConfig':
+    """
+    Si se provee exp_tag, deriva subcarpetas por iteración para:
+      processed_dir, preprocessed_dir, figures_dir, gsc_out_dir, meta_out_root y exposure_csv.
+    """
+    if not exp_tag:
+        return paths
+    suffix = Path(exp_tag)
+    processed_dir = (paths.processed_dir / suffix)
+    preprocessed_dir = (paths.preprocessed_dir / suffix)
+    figures_dir = (paths.figures_dir / suffix)
+    gsc_out_dir = (paths.gsc_out_dir / suffix)
+    meta_out_root = (paths.meta_out_root / suffix)
+    exposure_csv = processed_dir / "competitive_exposure.csv"
+    return PathsConfig(
+        raw_dir=paths.raw_dir,
+        train_csv=paths.train_csv,
+        transactions_csv=paths.transactions_csv,
+        items_csv=paths.items_csv,
+        stores_csv=paths.stores_csv,
+        processed_dir=processed_dir,
+        preprocessed_dir=preprocessed_dir,
+        figures_dir=figures_dir,
+        exposure_csv=exposure_csv,
+        step1_out_dir=paths.step1_out_dir,
+        gsc_out_dir=gsc_out_dir,
+        meta_out_root=meta_out_root,
+    )
+
+
+def _short_cfg_summary(params: 'ParamsConfig') -> str:
+    return (
+        f"donors={params.top_k_donors}({params.donor_kind}) | "
+        f"lags={list(params.lags_days)} | Fourier={params.fourier_k} | "
+        f"STL={'on' if params.use_stl else 'off'} | "
+        f"GSC(rank={params.gsc_rank},tau={params.gsc_tau},alpha={params.gsc_alpha}) | "
+        f"Meta:{','.join(params.meta_learners)}->{params.meta_model} | "
+        f"Hbin={getattr(params,'h_bin_threshold',None)}"
+    )
+
+
+def stamp_pngs(fig_dir: Path, exp_tag: str, summary: str) -> None:
+    """
+    Agrega una franja con exp_tag y un resumen de configuración a PNG/JPG en fig_dir (recursivo).
+    Si Pillow no está disponible o falla, se omite silenciosamente.
+    """
+    if not _HAS_PIL:
+        return
+    if not fig_dir.exists():
+        return
+    png_exts = {".png", ".jpg", ".jpeg"}
+    for p in fig_dir.rglob("*"):
+        if p.suffix.lower() not in png_exts or not p.is_file():
+            continue
+        try:
+            img = Image.open(p).convert("RGBA")
+            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+            text = f"{exp_tag}  |  {summary}"
+            try:
+                font = ImageFont.load_default()
+            except Exception:
+                font = None
+            w, h = img.size
+            pad = max(8, int(w * 0.01))
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            rect_h = th + 2 * pad
+            draw.rectangle([(0, h - rect_h), (w, h)], fill=(0, 0, 0, 140))
+            draw.text((pad, h - rect_h + pad), text, fill=(255, 255, 255, 230), font=font)
+            out = Image.alpha_composite(img, overlay).convert("RGB")
+            out.save(p)
+        except Exception:
+            continue  # No bloquear el pipeline si falla el sellado
+
+
+def _params_to_plain_dict(params: 'ParamsConfig') -> Dict[str, Any]:
+    """
+    Convierte ParamsConfig a dict serializable (paths->str, tuples->list).
+    """
+    from pathlib import Path as _Path
+    plain: Dict[str, Any] = {}
+    for k, v in params.__dict__.items():
+        if isinstance(v, tuple):
+            plain[k] = list(v)
+        elif isinstance(v, _Path):
+            plain[k] = str(v)
+        else:
+            plain[k] = v
+    return plain
+
+
+def write_iter_readme(fig_dir: Path, exp_tag: str, orch_cfg: 'OrchestratorConfig') -> None:
+    """Guarda un README.md con la configuración efectiva de la iteración."""
+    ensure_dir(fig_dir)
+    readme = fig_dir / "00__experiment_meta.md"
+    lines = [
+        f"# Experimento {exp_tag}",
+        "",
+        f"- Proyecto: {orch_cfg.project_name}",
+        f"- Procesados: {orch_cfg.paths.processed_dir}",
+        f"- GSC out: {orch_cfg.paths.gsc_out_dir}",
+        f"- Meta out: {orch_cfg.paths.meta_out_root}",
+        "",
+        "## Parámetros",
+        "```yaml",
+        yaml.safe_dump({"params": _params_to_plain_dict(orch_cfg.params)}, sort_keys=False, allow_unicode=True).strip(),
+        "```",
+        "",
+    ]
+    readme.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _filter_pairs_and_donors(
+    pairs_csv: Path,
+    donors_csv: Path,
+    outdir: Path,
+    n_cann: int,
+    n_vict: int,
+    cann_col: Optional[str],
+    vict_col: Optional[str],
+    seed: int = 2025
+) -> tuple[Path, Path]:
+    """
+    Filtra a n_cann caníbales y n_vict víctimas por caníbal. Requiere columnas identificables.
+    Si no se especifican columnas, intenta detectarlas por heurística.
+    """
+    df = pd.read_csv(pairs_csv)
+
+    # Heurística de columnas si no se proveen
+    if cann_col is None or vict_col is None:
+        cann_candidates = [c for c in df.columns if any(k in c.lower() for k in
+                           ["cannibal", "canibal", "treated", "i_", "iitem", "treat_item", "treated_item", "i_id"])]
+        vict_candidates = [c for c in df.columns if any(k in c.lower() for k in
+                           ["victim", "victima", "j_", "jitem", "target_item", "victim_item", "j_id"])]
+        if cann_col is None and len(cann_candidates) > 0:
+            cann_col = cann_candidates[0]
+        if vict_col is None and len(vict_candidates) > 0:
+            vict_col = vict_candidates[0]
+    if cann_col is None or vict_col is None:
+        raise ValueError("No pude identificar columnas de caníbal/víctima. Define params.pairs_cannibal_col / pairs_victim_col.")
+
+    # Muestreo determinista: caníbales más frecuentes y top víctimas por caníbal
+    cann_counts = df[cann_col].value_counts()
+    chosen_cann = list(cann_counts.index[:n_cann]) if len(cann_counts) >= n_cann else list(cann_counts.index)
+    df = df[df[cann_col].isin(chosen_cann)].copy()
+
+    keep_idx: List[int] = []
+    for _, g in df.groupby(cann_col):
+        vict_counts = g[vict_col].value_counts().index.tolist()
+        chosen_v = vict_counts[:n_vict]
+        keep_idx.extend(g[g[vict_col].isin(chosen_v)].index.tolist())
+    df_f = df.loc[sorted(set(keep_idx))].copy()
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    pairs_out = outdir / (pairs_csv.stem + f"__subset_{n_cann}x{n_vict}.csv")
+    df_f.to_csv(pairs_out, index=False)
+
+    # Filtra donantes solo a víctimas retenidas
+    dv = set(df_f[vict_col].unique())
+    ddf = pd.read_csv(donors_csv)
+    vict_cols_don = [c for c in ddf.columns if any(k in c.lower() for k in
+                    ["victim", "victima", "target_item", "victim_item", "j_id", "victim_id"])]
+    if len(vict_cols_don) == 0:
+        raise ValueError("No pude identificar la columna de víctima en donors_per_victim.csv")
+    vict_don_col = vict_cols_don[0]
+    ddf_f = ddf[ddf[vict_don_col].isin(dv)].copy()
+    donors_out = outdir / (donors_csv.stem + f"__subset_{n_cann}x{n_vict}.csv")
+    ddf_f.to_csv(donors_out, index=False)
+    return pairs_out, donors_out
+
+
 # -------------------- Orquestador --------------------
 
 def run_pipeline(config_path: Path) -> Dict[str, Any]:
     cfg = load_yaml_config(config_path)
 
+    # exp_tag opcional desde YAML (inyectado por 01_run_sweep.py)
+    exp_tag: Optional[str] = None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            _raw = yaml.safe_load(f)
+            exp_tag = _raw.get("exp_tag")
+    except Exception:
+        pass
+
+    # Deriva rutas por iteración (si aplica)
+    cfg.paths = derive_iter_paths(cfg.paths, exp_tag)
+    if exp_tag:
+        cfg.project_name = f"{cfg.project_name}__{exp_tag}"
+
+    # --- Validación de scoping por experimento (antes de crear nada) ---
+    for name in ["processed_dir", "preprocessed_dir", "figures_dir", "gsc_out_dir", "meta_out_root"]:
+        _assert_scoped(getattr(cfg.paths, name), exp_tag, name)
+        _touch_fingerprint(getattr(cfg.paths, name), exp_tag)
+    _assert_scoped(cfg.paths.exposure_csv.parent, exp_tag, "exposure_csv.parent")
+
     # Logging y seeds
-    log_path = setup_logging(cfg.log_level, cfg.log_to_file)
+    log_path = setup_logging(cfg.log_level, cfg.log_to_file, exp_tag=exp_tag)
     logger = logging.getLogger("pipeline")
     seed_everything(cfg.seed)
 
@@ -328,6 +656,8 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     ensure_dir(cfg.paths.processed_dir)
     ensure_dir(cfg.paths.preprocessed_dir)
     ensure_dir(cfg.paths.figures_dir)
+    ensure_dir(cfg.paths.gsc_out_dir)
+    ensure_dir(cfg.paths.meta_out_root)
 
     # Ajustar sys.path para 'src' y 'EDA'
     sys.path.insert(0, str(SRC_DIR))
@@ -338,20 +668,31 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         "start_time": datetime.now().isoformat(),
         "log_file": str(log_path),
         "steps": {},
+        "exp_tag": exp_tag,
+        "paths_effective": {
+            "processed_dir": str(cfg.paths.processed_dir),
+            "preprocessed_dir": str(cfg.paths.preprocessed_dir),
+            "figures_dir": str(cfg.paths.figures_dir),
+            "gsc_out_dir": str(cfg.paths.gsc_out_dir),
+            "meta_out_root": str(cfg.paths.meta_out_root),
+            "exposure_csv": str(cfg.paths.exposure_csv),
+        },
     }
 
     # -------------------- Paso 1: Data Quality --------------------
     step1_outputs = {}
     if cfg.toggles.step1:
         logger.info("Paso 1: Control de calidad y filtrado de datos 'train' y 'transactions'.")
+
+        # assert de scoping de salida
+        _assert_scoped(cfg.paths.processed_dir, exp_tag, "step1.out_dir(processed_dir)")
+
         try:
-            # Intentar importar dinámicamente el archivo con nombre atípico
             dq_path = SRC_DIR / "preprocess_data" / "1. data_quality.py"
             if dq_path.exists():
                 dq_mod = _dynamic_import("data_quality", dq_path)
                 run_data_quality = getattr(dq_mod, "run_data_quality")
             else:
-                # Fallback por si existe un módulo regular sin prefijo
                 from preprocess_data.data_quality import run_data_quality  # type: ignore
         except Exception:
             logger.exception("No se pudo localizar 'run_data_quality'.")
@@ -408,6 +749,9 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     exposure_path = cfg.paths.exposure_csv
     if cfg.toggles.step2:
         logger.info("Paso 2: Cálculo de exposición competitiva (H).")
+        _assert_scoped(cfg.paths.exposure_csv.parent, exp_tag, "step2.exposure_dir")
+        _touch_fingerprint(cfg.paths.exposure_csv.parent, exp_tag)
+
         try:
             ce_path = SRC_DIR / "preprocess_data" / "2. competitive_exposure.py"
             if ce_path.exists():
@@ -424,21 +768,21 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         if compute_competitive_exposure is not None:
             ensure_dir(cfg.paths.processed_dir)
             _ = _safe_call(
-            compute_competitive_exposure,
-            logger,
-            cfg.fail_fast,
-            "2. Competitive Exposure",
-            train_path=str(train_for_next),
-            items_path=str(cfg.paths.items_csv) if cfg.paths.items_csv else None,
-            date_col=cfg.params.date_col,
-            store_col=cfg.params.store_col,
-            item_col=cfg.params.item_col,
-            promo_col=cfg.params.promo_col,
-            neighborhood_col=cfg.params.neighborhood_col if cfg.params.neighborhood_col else "neighborhood",
-            bin_threshold=cfg.params.h_bin_threshold,  # <--- NUEVO
-            save_path=str(exposure_path),
-            save_format=cfg.params.save_format,
-        )
+                compute_competitive_exposure,
+                logger,
+                cfg.fail_fast,
+                "2. Competitive Exposure",
+                train_path=str(train_for_next),
+                items_path=str(cfg.paths.items_csv) if cfg.paths.items_csv else None,
+                date_col=cfg.params.date_col,
+                store_col=cfg.params.store_col,
+                item_col=cfg.params.item_col,
+                promo_col=cfg.params.promo_col,
+                neighborhood_col=cfg.params.neighborhood_col if cfg.params.neighborhood_col else "class",
+                bin_threshold=cfg.params.h_bin_threshold,
+                save_path=str(exposure_path),
+                save_format=cfg.params.save_format,
+            )
         else:
             logger.warning("Paso 2 omitido (función no disponible).")
 
@@ -448,99 +792,43 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         }
     else:
         logger.info("Paso 2 deshabilitado por configuración.")
-        manifest["steps"]["step2"] = {"status": "disabled"}
+    manifest["steps"]["step2"] = manifest["steps"].get("step2", {"status": "disabled"})
 
-    # EDA 1 (descriptivo general)
-    if cfg.toggles.eda1:
-        logger.info("EDA 1: Resumen general (ventas, promos, transacciones).")
-        try:
-            from eda_1 import run_eda  # type: ignore
-        except Exception:
-            try:
-                from EDA.eda_1 import run_eda  # type: ignore
-            except Exception:
-                run_eda = None  # type: ignore
-
-        if run_eda is None:
-            logger.warning("EDA 1 no disponible (run_eda no encontrado).")
-            manifest["steps"]["eda1"] = {"status": "skipped_or_failed"}
+    # Validación ligera del archivo de exposure
+    logger.info("Competitive Exposure guardado en: %s", str(exposure_path))
+    try:
+        if str(exposure_path).lower().endswith((".csv", ".txt")):
+            head = pd.read_csv(exposure_path, nrows=5)
         else:
-            ensure_dir(cfg.paths.figures_dir)
-            _safe_call(
-                run_eda,
-                logger,
-                cfg.fail_fast,
-                "EDA 1",
-                train_path=str(train_for_next),
-                out_dir=str(cfg.paths.figures_dir),
-                transactions_path=str(transactions_for_next) if transactions_for_next else None,
-                items_path=str(cfg.paths.items_csv) if cfg.paths.items_csv else None,
-                date_col=cfg.params.date_col,
-                store_col=cfg.params.store_col,
-                item_col=cfg.params.item_col,
-                promo_col=cfg.params.promo_col,
-                sales_col=cfg.params.sales_col,
-                tx_col=cfg.params.tx_col,
-                neighborhood_col=cfg.params.neighborhood_col,
-            )
-            manifest["steps"]["eda1"] = {"status": "ok", "figures_dir": str(cfg.paths.figures_dir)}
-    else:
-        logger.info("EDA 1 deshabilitado por configuración.")
-        manifest["steps"]["eda1"] = {"status": "disabled"}
-
-    # EDA 2 (exposición competitiva)
-    if cfg.toggles.eda2:
-        logger.info("EDA 2: Exploración de exposición competitiva.")
-        try:
-            from eda_2 import run_eda_competitive_exposure  # type: ignore
-        except Exception:
-            try:
-                from EDA.eda_2 import run_eda_competitive_exposure  # type: ignore
-            except Exception:
-                run_eda_competitive_exposure = None  # type: ignore
-
-        if run_eda_competitive_exposure is None:
-            logger.warning("EDA 2 no disponible (run_eda_competitive_exposure no encontrado).")
-            manifest["steps"]["eda2"] = {"status": "skipped_or_failed"}
-        else:
-            ensure_dir(cfg.paths.figures_dir)
-            _safe_call(
-                run_eda_competitive_exposure,
-                logger,
-                cfg.fail_fast,
-                "EDA 2",
-                input_path=str(exposure_path),
-                output_dir=str(cfg.paths.figures_dir),
-                date_col=cfg.params.date_col,
-                store_col=cfg.params.store_col,
-                item_col=cfg.params.item_col,
-                exposure_col="competitive_exposure",
-                orientation=cfg.params.eda2_orientation,
-                dpi=cfg.params.eda2_dpi,
-                bins=cfg.params.eda2_bins,
-                top_stores=cfg.params.eda2_top_stores,
-                min_store_obs=cfg.params.eda2_min_store_obs,
-                heatmap_stores=cfg.params.eda2_heatmap_stores,
-                chunksize=cfg.params.eda2_chunksize,
-                log_level=cfg.params.eda2_log_level,
-            )
-            manifest["steps"]["eda2"] = {"status": "ok", "figures_dir": str(cfg.paths.figures_dir)}
-    else:
-        logger.info("EDA 2 deshabilitado por configuración.")
-        manifest["steps"]["eda2"] = {"status": "disabled"}
+            head = pd.read_parquet(exposure_path)
+        must = {"H_prop", "H_prop_raw", "competitive_exposure"}
+        miss = must - set(head.columns)
+        if miss:
+            logger.warning("Archivo de exposure SIN columnas %s. Revisa que el código actualizado esté en uso (%s).", miss, exposure_path)
+    except Exception as e:
+        logger.warning("No pude validar columnas de exposure (%s): %s", exposure_path, e)
 
     # -------------------- Paso 3: select_pairs_and_donors + EDA 3 --------------------
     pairs_path = cfg.paths.preprocessed_dir / "pairs_windows.csv"
     donors_path = cfg.paths.preprocessed_dir / "donors_per_victim.csv"
+
     if cfg.toggles.step3:
+        exp_tag_local = cfg.exp_tag if hasattr(cfg, 'exp_tag') and cfg.exp_tag else (exp_tag or "default")
+        outdir_exp = cfg.params.outdir_pairs_donors / exp_tag_local
+        ensure_dir(outdir_exp)
+        _assert_scoped(outdir_exp, exp_tag_local, "step3.outdir_exp")
+        _touch_fingerprint(outdir_exp, exp_tag_local)
+
+        logger.info(f"📁 Guardando pairs/donors en: {outdir_exp}")
         logger.info("Paso 3: Selección de episodios (pares i-j) y donantes.")
+
         try:
             sp_path = SRC_DIR / "preprocess_data" / "3. select_pairs_and_donors.py"
             if sp_path.exists():
-                sp_mod = import_module_spawn_safe("select_pairs_and_donors", sp_path)  # <-- usar helper spawn-safe
+                sp_mod = import_module_spawn_safe("select_pairs_and_donors", sp_path)
                 select_pairs_and_donors = getattr(sp_mod, "select_pairs_and_donors")
             else:
-                from preprocess_data.select_pairs_and_donors import select_pairs_and_donors  # fallback
+                from preprocess_data.select_pairs_and_donors import select_pairs_and_donors  # type: ignore
         except Exception:
             logger.exception("No se pudo localizar 'select_pairs_and_donors'.")
             if cfg.fail_fast:
@@ -556,16 +844,53 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 "3. Select Pairs & Donors",
                 H_csv=str(exposure_path),
                 train_csv=str(train_for_next),
-                items_csv=str(cfg.paths.items_csv) if cfg.paths.items_csv else None,
-                stores_csv=str(cfg.paths.stores_csv) if cfg.paths.stores_csv else None,
-                outdir=str(cfg.params.outdir_pairs_donors),
+                items_csv=str(cfg.paths.items_csv),
+                stores_csv=str(cfg.paths.stores_csv),
+                outdir=str(outdir_exp),  # ← con exp_tag
             )
-            # Si la función devuelve rutas, usarlas
-            if isinstance(out, (tuple, list)) and len(out) >= 2:
+            # Si el módulo devolvió paths concretos, respétalos
+            if isinstance(out, (tuple, list)) and len(out) >= 2 and out[0] and out[1]:
                 pairs_path = Path(out[0])
                 donors_path = Path(out[1])
+
         else:
             logger.warning("Paso 3 omitido (función no disponible).")
+
+        # Filtrado a 10x10 episodios (si aplica)
+        if cfg.params.n_cannibals and cfg.params.n_victims_per_cannibal:
+            try:
+                subset_dir = cfg.paths.preprocessed_dir / "subset"
+                pairs_path, donors_path = _filter_pairs_and_donors(
+                    pairs_path, donors_path, subset_dir,
+                    n_cann=cfg.params.n_cannibals,
+                    n_vict=cfg.params.n_victims_per_cannibal,
+                    cann_col=getattr(cfg.params, "pairs_cannibal_col", None),
+                    vict_col=getattr(cfg.params, "pairs_victim_col", None),
+                    seed=cfg.seed
+                )
+                logger.info("Pairs/Donors filtrados a %dx%d (outdir=%s).",
+                            cfg.params.n_cannibals, cfg.params.n_victims_per_cannibal, str(subset_dir))
+            except Exception as e:
+                logger.warning("No se pudo filtrar a %dx%d: %s (se continúa con el total).",
+                               cfg.params.n_cannibals, cfg.params.n_victims_per_cannibal, e)
+
+        # Normalizar nombres canónicos (por si el selector usó sufijos)
+        canonical_pairs = outdir_exp / "pairs_windows.csv"
+        canonical_donors = outdir_exp / "donors_per_victim.csv"
+        try:
+            if pairs_path.resolve() != canonical_pairs.resolve() and pairs_path.exists():
+                shutil.copy2(pairs_path, canonical_pairs)
+                pairs_path = canonical_pairs
+            if donors_path.resolve() != canonical_donors.resolve() and donors_path.exists():
+                shutil.copy2(donors_path, canonical_donors)
+                donors_path = canonical_donors
+        except Exception as e:
+            logger.warning("No pude normalizar nombres de pairs/donors: %s", e)
+
+        _assert_exists(pairs_path, "step3.pairs_path")
+        _assert_exists(donors_path, "step3.donors_path")
+        _assert_scoped(pairs_path.parent, exp_tag_local, "step3.pairs_dir")
+        _assert_scoped(donors_path.parent, exp_tag_local, "step3.donors_dir")
 
         manifest["steps"]["step3"] = {
             "status": "ok" if pairs_path.exists() and donors_path.exists() else "skipped_or_failed",
@@ -575,7 +900,12 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         logger.info("Paso 3 deshabilitado por configuración.")
         manifest["steps"]["step3"] = {"status": "disabled"}
 
-    # EDA 3 (muestras de episodios y calidad)
+    # Actualizar config para el paso 4
+    cfg.params.episodes_path = pairs_path
+    cfg.params.donors_path = donors_path
+    cfg.params.outdir_pairs_donors = pairs_path.parent
+
+    # -------------------- EDA 3 --------------------
     if cfg.toggles.eda3:
         logger.info("EDA 3: Muestreo de episodios y diagnóstico de calidad.")
         try:
@@ -604,20 +934,29 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 seed=cfg.params.eda3_seed,
                 orientation=cfg.params.eda3_orientation,
                 dpi=cfg.params.eda3_dpi,
-                quality_cfg=None,  # usar defaults del módulo
+                quality_cfg=None,
             )
             manifest["steps"]["eda3"] = {"status": "ok", "figures_dir": str(cfg.paths.figures_dir)}
+            if exp_tag:
+                stamp_pngs(cfg.paths.figures_dir, exp_tag, _short_cfg_summary(cfg.params))
     else:
         logger.info("EDA 3 deshabilitado por configuración.")
         manifest["steps"]["eda3"] = {"status": "disabled"}
 
     # -------------------- Paso 4: pre_algorithm + EDA 4 --------------------
     processed_out_dir = cfg.paths.processed_dir
-    episodes_path_for_step4 = pairs_path
-    donors_path_for_step4 = donors_path
+    episodes_path_for_step4 = cfg.params.episodes_path
+    donors_path_for_step4 = cfg.params.donors_path
 
     if cfg.toggles.step4:
         logger.info("Paso 4: Preparación de datasets para GSC y Meta-learners.")
+        logger.info(f"Usando episodios desde: {episodes_path_for_step4}")
+        logger.info(f"Usando donantes desde: {donors_path_for_step4}")
+
+        _assert_scoped(processed_out_dir, exp_tag, "step4.processed_out_dir")
+        _assert_exists(episodes_path_for_step4, "step4.episodes_path")
+        _assert_exists(donors_path_for_step4, "step4.donors_path")
+
         try:
             pa_path = SRC_DIR / "preprocess_data" / "4. pre_algorithm.py"
             if pa_path.exists():
@@ -634,7 +973,6 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
             PrepConfig = None  # type: ignore
 
         if prepare_datasets is not None and PrepConfig is not None:
-            # Construir la configuración del pre_algorithm a partir de nuestro YAML
             pa_cfg = PrepConfig(
                 episodes_path=str(episodes_path_for_step4),
                 donors_path=str(donors_path_for_step4),
@@ -646,6 +984,8 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 fourier_k=cfg.params.fourier_k,
                 max_donor_promo_share=cfg.params.max_donor_promo_share,
                 min_availability_share=cfg.params.min_availability_share,
+                gsc_eval_n=cfg.params.gsc_eval_n,
+                gsc_eval_selection=cfg.params.gsc_eval_selection,
                 save_intermediate=cfg.params.save_intermediate,
                 use_stl=cfg.params.use_stl,
                 drop_city=cfg.params.drop_city,
@@ -662,6 +1002,11 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 "4. Pre-Algorithm Prep",
                 cfg=pa_cfg,
             )
+
+            # Esperables del prep
+            for must_dir in [processed_out_dir / "gsc", processed_out_dir / "intermediate", processed_out_dir / "meta"]:
+                _assert_scoped(must_dir, exp_tag, f"step4.out_dir::{must_dir.name}")
+                _touch_fingerprint(must_dir, exp_tag)
 
             manifest["steps"]["step4"] = {
                 "status": "ok",
@@ -680,30 +1025,29 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         logger.info("Paso 4 deshabilitado por configuración.")
         manifest["steps"]["step4"] = {"status": "disabled"}
 
-    # EDA 4 (resumen de artefactos procesados)
+    # -------------------- EDA 4 --------------------
     if cfg.toggles.eda4:
         logger.info("EDA 4: Reporte de datasets procesados.")
         try:
-            from eda_4 import EDAConfig, run as eda4_run  # type: ignore
+            from eda_4 import EDAConfig as EDA4Config, run as eda4_run  # type: ignore
         except Exception:
             try:
-                from EDA.eda_4 import EDAConfig, run as eda4_run  # type: ignore
+                from EDA.eda_4 import EDAConfig as EDA4Config, run as eda4_run  # type: ignore
             except Exception:
                 eda4_run = None  # type: ignore
-                EDAConfig = None  # type: ignore
+                EDA4Config = None  # type: ignore
 
-        if eda4_run is None or EDAConfig is None:
+        if eda4_run is None or EDA4Config is None:
             logger.warning("EDA 4 no disponible (run/EDAConfig no encontrados).")
             manifest["steps"]["eda4"] = {"status": "skipped_or_failed"}
         else:
-            # Resolver rutas esperadas por el EDA 4
             episodes_index = processed_out_dir / "episodes_index.parquet"
             donor_quality = processed_out_dir / "gsc" / "donor_quality.parquet"
             meta_all = processed_out_dir / "meta" / "all_units.parquet"
             panel_features = processed_out_dir / "intermediate" / "panel_features.parquet"
             gsc_dir = processed_out_dir / "gsc"
 
-            eda4_cfg = EDAConfig(
+            eda4_cfg = EDA4Config(
                 processed_dir=str(processed_out_dir),
                 episodes_index=str(episodes_index) if episodes_index.exists() else None,
                 donor_quality=str(donor_quality) if donor_quality.exists() else None,
@@ -721,9 +1065,187 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
             )
             _safe_call(eda4_run, logger, cfg.fail_fast, "EDA 4", cfg=eda4_cfg)
             manifest["steps"]["eda4"] = {"status": "ok", "figures_dir": str(cfg.paths.figures_dir)}
+            if exp_tag:
+                stamp_pngs(cfg.paths.figures_dir, exp_tag, _short_cfg_summary(cfg.params))
     else:
         logger.info("EDA 4 deshabilitado por configuración.")
         manifest["steps"]["eda4"] = {"status": "disabled"}
+
+    # -------------------- Paso 5: Algoritmo GSC --------------------
+    if cfg.toggles.step5_gsc:
+        logger.info("Paso 5: Ejecución de GSC (synthetic control generalizado).")
+        episodes_index = processed_out_dir / "episodes_index.parquet"
+        gsc_in_dir = processed_out_dir / "gsc"
+        if not episodes_index.exists() or not gsc_in_dir.exists():
+            logger.warning("Insumos de GSC no disponibles (episodes_index/gsc_dir). Paso 5 omitido.")
+            manifest["steps"]["step5_gsc"] = {"status": "skipped_or_failed"}
+        else:
+            try:
+                from models.synthetic_control import RunConfig as GSCRunConfig, run_batch as gsc_run_batch  # type: ignore
+            except Exception:
+                try:
+                    from src.models.synthetic_control import RunConfig as GSCRunConfig, run_batch as gsc_run_batch  # type: ignore
+                except Exception:
+                    logger.exception("No se pudieron importar RunConfig/run_batch de synthetic_control.")
+                    GSCRunConfig, gsc_run_batch = None, None  # type: ignore
+
+            if GSCRunConfig is None or gsc_run_batch is None:
+                manifest["steps"]["step5_gsc"] = {"status": "skipped_or_failed"}
+            else:
+                _assert_scoped(gsc_in_dir, exp_tag, "step5.gsc_in_dir")
+                _assert_scoped(cfg.paths.gsc_out_dir, exp_tag, "step5.gsc_out_dir")
+                _touch_fingerprint(cfg.paths.gsc_out_dir, exp_tag)
+
+                gsc_cfg = GSCRunConfig(
+                    gsc_dir=Path(gsc_in_dir),
+                    donors_csv=Path(donors_path),
+                    episodes_index=Path(episodes_index),
+                    out_dir=Path(cfg.paths.gsc_out_dir),
+                    log_level=cfg.params.gsc_log_level,
+                    max_episodes=cfg.params.gsc_max_episodes,
+                    do_placebo_space=cfg.params.gsc_do_placebo_space,
+                    do_placebo_time=cfg.params.gsc_do_placebo_time,
+                    do_loo=cfg.params.gsc_do_loo,
+                    max_loo=cfg.params.gsc_max_loo,
+                    sens_samples=cfg.params.gsc_sens_samples,
+                    cv_folds=cfg.params.gsc_cv_folds,
+                    cv_holdout=cfg.params.gsc_cv_holdout,  # nombre correcto
+                    rank=cfg.params.gsc_rank,
+                    tau=cfg.params.gsc_tau,
+                    alpha=cfg.params.gsc_alpha,
+                )
+                _safe_call(gsc_run_batch, logger, cfg.fail_fast, "5. GSC run_batch", cfg=gsc_cfg)
+                out_metrics = cfg.paths.gsc_out_dir / "gsc_metrics.parquet"
+                _assert_exists(out_metrics, "step5.gsc_metrics")
+                manifest["steps"]["step5_gsc"] = {
+                    "status": "ok" if out_metrics.exists() else "skipped_or_failed",
+                    "outputs": {
+                        "gsc_metrics": str(out_metrics),
+                        "gsc_cf_series_dir": str(cfg.paths.gsc_out_dir / "cf_series"),
+                    },
+                }
+    else:
+        logger.info("Paso 5 (GSC) deshabilitado por configuración.")
+        manifest["steps"]["step5_gsc"] = {"status": "disabled"}
+
+    # -------------------- Paso 6: Algoritmos Meta-learners --------------------
+    if cfg.toggles.step6_meta:
+        logger.info("Paso 6: Ejecución de Meta‑learners (T/S/X).")
+        meta_parquet = processed_out_dir / "meta" / "all_units.parquet"
+        episodes_index = processed_out_dir / "episodes_index.parquet"
+        if not meta_parquet.exists() or not episodes_index.exists():
+            logger.warning("Insumos Meta no disponibles (meta/all_units o episodes_index). Paso 6 omitido.")
+            manifest["steps"]["step6_meta"] = {"status": "skipped_or_failed"}
+        else:
+            try:
+                from models.meta_learners import RunCfg as MetaRunCfg, run_batch as meta_run_batch  # type: ignore
+            except Exception:
+                try:
+                    from src.models.meta_learners import RunCfg as MetaRunCfg, run_batch as meta_run_batch  # type: ignore
+                except Exception:
+                    logger.exception("No se pudieron importar RunCfg/run_batch de meta_learners.")
+                    MetaRunCfg, meta_run_batch = None, None  # type: ignore
+
+            if MetaRunCfg is None or meta_run_batch is None:
+                manifest["steps"]["step6_meta"] = {"status": "skipped_or_failed"}
+            else:
+                _assert_scoped(cfg.paths.meta_out_root, exp_tag, "step6.meta_out_root")
+                _touch_fingerprint(cfg.paths.meta_out_root, exp_tag)
+
+                learners_to_run: List[str] = list(cfg.params.meta_learners)
+                outputs = {}
+                for lr in learners_to_run:
+                    out_dir = cfg.paths.meta_out_root / lr
+                    ensure_dir(out_dir)
+                    mcfg = MetaRunCfg(
+                        learner=lr,
+                        meta_parquet=Path(meta_parquet),
+                        episodes_index=Path(episodes_index),
+                        donors_csv=Path(donors_path),
+                        out_dir=Path(out_dir),
+                        log_level=cfg.log_level,
+                        max_episodes=cfg.params.meta_max_episodes,
+                        cv_folds=cfg.params.meta_cv_folds,
+                        cv_holdout_days=cfg.params.meta_cv_holdout,
+                        min_train_samples=cfg.params.meta_min_train_samples,
+                        model=cfg.params.meta_model,
+                        prop_model=cfg.params.meta_prop_model,
+                        random_state=cfg.params.meta_random_state,
+                        max_depth=cfg.params.meta_max_depth,
+                        learning_rate=cfg.params.meta_learning_rate,
+                        max_iter=cfg.params.meta_max_iter,
+                        min_samples_leaf=cfg.params.meta_min_samples_leaf,
+                        l2=cfg.params.meta_l2,
+                        do_placebo_space=cfg.params.meta_do_placebo_space,
+                        do_placebo_time=cfg.params.meta_do_placebo_time,
+                        do_loo=cfg.params.meta_do_loo,
+                        max_loo=cfg.params.meta_max_loo,
+                        sens_samples=cfg.params.meta_sens_samples,
+                        treat_col_s=cfg.params.treat_col_s,
+                        s_ref=cfg.params.s_ref,
+                        treat_col_b=cfg.params.treat_col_b,
+                        bin_threshold=cfg.params.bin_threshold,
+                    )
+                    _safe_call(meta_run_batch, logger, cfg.fail_fast, f"6.{lr.upper()} Meta run_batch", cfg=mcfg)
+                    outputs[lr] = {
+                        "meta_metrics": str(out_dir / f"meta_metrics_{lr}.parquet"),
+                        "cf_series_dir": str(out_dir / "cf_series"),
+                    }
+                    _assert_exists(out_dir / f"meta_metrics_{lr}.parquet", f"step6.meta_metrics[{lr}]")
+                manifest["steps"]["step6_meta"] = {"status": "ok", "outputs": outputs}
+    else:
+        logger.info("Paso 6 (Meta) deshabilitado por configuración.")
+        manifest["steps"]["step6_meta"] = {"status": "disabled"}
+
+    # -------------------- EDA FINAL: Algoritmos (series y resúmenes) --------------------
+    if cfg.toggles.eda_algorithms:
+        logger.info("EDA final de algoritmos: render de láminas por episodio y comparativas.")
+        try:
+            from EDA_algorithms import EDAConfig as EDAAlgConfig, run as eda_alg_run  # type: ignore
+        except Exception:
+            try:
+                from EDA.EDA_algorithms import EDAConfig as EDAAlgConfig, run as eda_alg_run  # type: ignore
+            except Exception:
+                eda_alg_run = None  # type: ignore
+                EDAAlgConfig = None  # type: ignore
+
+        episodes_index_path = processed_out_dir / "episodes_index.parquet"
+
+        if eda_alg_run is None or EDAAlgConfig is None:
+            logger.warning("EDA_algorithms no disponible (run/EDAConfig no encontrados).")
+            manifest["steps"]["eda_algorithms"] = {"status": "skipped_or_failed"}
+        elif not episodes_index_path.exists():
+            logger.warning("EDA_algorithms omitido: episodes_index no existe en %s. Revisa Step 4.", str(episodes_index_path))
+            manifest["steps"]["eda_algorithms"] = {
+                "status": "skipped_or_failed",
+                "reason": f"missing episodes_index at {episodes_index_path}"
+            }
+        else:
+            learners_for_eda = tuple(cfg.params.eda_alg_learners) if cfg.params.eda_alg_learners else tuple(cfg.params.meta_learners)
+            eda_cfg = EDAAlgConfig(
+                episodes_index=Path(episodes_index_path),
+                gsc_out_dir=Path(cfg.paths.gsc_out_dir),
+                meta_out_root=Path(cfg.paths.meta_out_root),
+                meta_learners=learners_for_eda,
+                figures_dir=Path(cfg.paths.figures_dir),
+                orientation=cfg.params.eda_alg_orientation,
+                dpi=cfg.params.eda_alg_dpi,
+                style="academic",
+                font_size=10,
+                grid=True,
+                max_episodes_gsc=cfg.params.eda_alg_max_episodes_gsc,
+                max_episodes_meta=cfg.params.eda_alg_max_episodes_meta,
+                export_pdf=cfg.params.eda_alg_export_pdf,
+            )
+            _safe_call(eda_alg_run, logger, cfg.fail_fast, "EDA Algorithms", cfg=eda_cfg)
+            _assert_scoped(cfg.paths.figures_dir, exp_tag, "EDA.figures_dir")
+            _touch_fingerprint(cfg.paths.figures_dir, exp_tag)
+            manifest["steps"]["eda_algorithms"] = {"status": "ok", "figures_dir": str(cfg.paths.figures_dir)}
+            if exp_tag:
+                stamp_pngs(cfg.paths.figures_dir, exp_tag, _short_cfg_summary(cfg.params))
+    else:
+        logger.info("EDA Algorithms deshabilitado por configuración.")
+        manifest["steps"]["eda_algorithms"] = {"status": "disabled"}
 
     # Guardar manifest de ejecución
     manifest["end_time"] = datetime.now().isoformat()

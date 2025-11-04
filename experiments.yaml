@@ -1,0 +1,75 @@
+base_config: "pipeline_config.yaml"
+
+experiments:
+  - id: "A_base"
+    desc: "Baseline"
+    overrides:
+      params:
+        top_k_donors: 12
+        donor_kind: "same_item"
+        lags_days: [7, 14, 28, 56]
+        fourier_k: 3
+        use_stl: true
+        gsc_rank: 5
+        gsc_tau: 0.0001
+        gsc_alpha: 0.0
+        meta_learners: ["x"]
+        treat_col_s: "H_disc"
+        h_bin_threshold: 0.02
+        gsc_cv_folds: 3
+        gsc_cv_holdout: 21
+        meta_cv_folds: 3
+        meta_cv_holdout: 21
+
+  - id: "B_donors20"
+    desc: "More donors"
+    overrides:
+      params:
+        top_k_donors: 20
+
+  - id: "C_donors5_hiqual"
+    desc: "Fewer/high-quality donors"
+    overrides:
+      params:
+        top_k_donors: 5
+        max_donor_promo_share: 0.01
+        min_availability_share: 0.95
+
+  - id: "D_seasonal_rich"
+    desc: "Richer seasonality"
+    overrides:
+      params:
+        fourier_k: 6
+        lags_days: [7, 14, 28, 56, 84]
+
+  - id: "E_no_stl"
+    desc: "No STL"
+    overrides:
+      params:
+        use_stl: false
+        fourier_k: 6
+
+  - id: "F_treat_prop"
+    desc: "Continuous treatment for Meta"
+    overrides:
+      params:
+        meta_learners: ["x","s"]
+        treat_col_b: "H_prop"
+        bin_threshold: 0.0
+
+  - id: "G_cv_long"
+    desc: "Longer holdout / more folds"
+    overrides:
+      params:
+        gsc_cv_folds: 5
+        gsc_cv_holdout: 35
+        meta_cv_folds: 5
+        meta_cv_holdout: 35
+
+  - id: "H_gsc_rank8_tau1e5"
+    desc: "GSC spec sensitivity"
+    overrides:
+      params:
+        gsc_rank: 8
+        gsc_tau: 0.00001
+        gsc_alpha: 0.001

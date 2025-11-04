@@ -1,13 +1,6 @@
-# pipeline_config.yaml
-# Configuración para 00_run_pipeline.py
-# Ajusta rutas y parámetros a tu entorno/proyecto.
-
 project_name: "cannibalization_retail"
-seed: 2025
-log_level: "INFO"           # DEBUG | INFO | WARNING | ERROR
-log_to_file: true
-fail_fast: false            # Si true, el pipeline se detiene en la primera falla.
-use_filtered_from_step1: true
+log_level: "INFO"
+fail_fast: false
 
 toggles:
   step1: true
@@ -18,80 +11,79 @@ toggles:
   eda2: true
   eda3: true
   eda4: true
+  step5_gsc: true
+  step6_meta: true
+  eda_algorithms: true
 
 paths:
-  # Directorios base
   raw_dir: ".data/raw_data"
+  train_csv: ".data/processed_data/train_filtered.csv"     # si Step 1 produce estos, puedes apuntar directo
+  transactions_csv: ".data/processed_data/transactions_filtered.csv"
+  items_csv: ".data/raw_data/items.csv"
+  stores_csv: ".data/raw_data/stores.csv"
   processed_dir: ".data/processed_data"
   preprocessed_dir: ".data/processed_data"
-  figures_dir: "figures/favorita_analysis"
-
-  # Entradas (ajusta a tus nombres reales de archivos)
-  train_csv: ".data/raw_data/train.csv"
-  transactions_csv: ".data/raw_data/transactions.csv"    # opcional
-  items_csv: ".data/raw_data/items.csv"                  # opcional
-  stores_csv: ".data/raw_data/stores.csv"                # opcional
-
-  # Salidas intermedias
+  figures_dir: "figures"
   exposure_csv: ".data/processed_data/competitive_exposure.csv"
-  step1_out_dir: ".data/processed_data"  # donde se guardarán train_filtered.csv, etc.
+  gsc_out_dir: ".data/processed_data/gsc_outputs"
+  meta_out_root: ".data/processed_data/meta_outputs"
 
 params:
-  # ---------------- Paso 1: Data Quality ----------------
-  min_date: "2016-01-01"
-  date_col: "date"
-  store_col: "store_nbr"
-  item_col: "item_nbr"
-  promo_col: "onpromotion"
-  sales_col: "unit_sales"
-  tx_col: "transactions"
-  h_bin_threshold: 0.02
-  # save_report_json: ".data/processed_data/data_quality_report.json"  # opcional
-
-  # ---------------- Paso 2: Competitive Exposure --------
-  neighborhood_col: "class"   # si no existe, la función puede ignorarlo
-  save_format: null                  # infiere por extensión; usa CSV por compatibilidad
-
-  # ---------------- Paso 3: Select Pairs & Donors -------
-  outdir_pairs_donors: ".data/processed_data"
-
-  # ---------------- Paso 4: Pre-Algorithm Prep ----------
+  gsc_eval_n: 10
+  gsc_eval_selection: "head"
+  # Step 4 (pre_algorithm)
+  
   top_k_donors: 10
-  donor_kind: "same_item"        # "same_item" | "same_family" | etc. (según implementación)
+  donor_kind: "same_item"
   lags_days: [7, 14, 28, 56]
   fourier_k: 3
   max_donor_promo_share: 0.02
   min_availability_share: 0.90
-  save_intermediate: true
-  use_stl: true
-  drop_city: true
-  dry_run: false
-  max_episodes: null
-  prep_log_level: "INFO"
-  fail_fast: false
+  max_episodes: 50
 
-  # ---------------- EDA 2: exposición -------------------
-  eda2_orientation: "portrait"
-  eda2_dpi: 300
-  eda2_bins: 50
-  eda2_top_stores: 30
-  eda2_min_store_obs: 5
-  eda2_heatmap_stores: null
-  eda2_chunksize: 1000000
-  eda2_log_level: "INFO"
+  # Algoritmo GSC
+  gsc_log_level: "INFO"
+  gsc_max_episodes: 50
+  gsc_cv_folds: 3
+  gsc_cv_holdout: 21
+  gsc_do_placebo_space: true
+  gsc_do_placebo_time: true
+  gsc_do_loo: false
+  gsc_max_loo: 5
+  gsc_sens_samples: 0
+  gsc_rank: 5
+  gsc_tau: 0.0001
+  gsc_alpha: 0.0
 
-  # ---------------- EDA 3: episodios --------------------
-  eda3_n: 5
-  eda3_strategy: "stratified"     # "stratified" | "top_delta" | "recent" | "random"
-  eda3_seed: 2025
-  eda3_orientation: "portrait"
-  eda3_dpi: 300
+  # Meta‑learners
+  meta_learners: ["x"]      # o ["t","s","x"]
+  meta_model: "hgbt"
+  meta_prop_model: "logit"
+  meta_random_state: 42
+  meta_cv_folds: 3
+  meta_cv_holdout: 21
+  meta_min_train_samples: 50
+  meta_max_episodes: 50
+  meta_do_placebo_space: true
+  meta_do_placebo_time: true
+  meta_do_loo: false
+  meta_max_loo: 5
+  meta_sens_samples: 0
+  meta_max_depth: 6
+  meta_learning_rate: 0.05
+  meta_max_iter: 500
+  meta_min_samples_leaf: 20
+  meta_l2: 0.0
+  treat_col_s: "H_disc"
+  s_ref: 0.0
+  treat_col_b: "H_prop"
+  bin_threshold: 0.0
 
-  # ---------------- EDA 4: final ------------------------
-  eda4_promo_thresh: 0.02
-  eda4_avail_thresh: 0.90
-  eda4_limit_episodes: 1
-  eda4_example_episode_id: null
-  eda4_orientation: "portrait"
-  eda4_dpi: 300
-  eda4_log_level: "INFO"
+  # EDA final de algoritmos
+  eda_alg_orientation: "landscape"
+  eda_alg_dpi: 300
+  eda_alg_learners: ["t", "s", "x"]   # cuáles comparar/visualizar
+  eda_alg_export_pdf: true
+  eda_alg_max_episodes_gsc: 40
+  eda_alg_max_episodes_meta: 40
+

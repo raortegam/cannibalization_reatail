@@ -1,91 +1,54 @@
 {
-  "project_name": "cannibalization_retail",
-  "start_time": "2025-10-20T16:05:09.820604",
-  "log_file": "D:\\repos\\cannibalization_reatail\\diagnostics\\pipeline_20251020_160509.log",
+  "project_name": "cannibalization_retail__A_base",
+  "start_time": "2025-11-03T17:42:20.277427",
+  "log_file": "D:\\repos\\cannibalization_reatail\\diagnostics\\pipeline_A_base_20251103_174220.log",
   "steps": {
-    "step1": {
-      "status": "ok",
-      "outputs": {
-        "train_summary": {
-          "rows": 59038132,
-          "date_range": [
-            "2016-01-01",
-            "2017-08-15"
-          ],
-          "n_stores": 54,
-          "n_items": 4036,
-          "promo_rate": 0.10610486456448182,
-          "sales_nonnull_rate": 1.0,
-          "sales_negative_rate": 6.570329833606523e-05,
-          "stores_rows_min_max": [
-            290581,
-            1599702
-          ]
-        },
-        "transactions_summary": {
-          "rows": 31096,
-          "date_range": [
-            "2016-01-02",
-            "2017-08-15"
-          ],
-          "n_stores": 54,
-          "transactions_nonneg_rate": 1.0
-        },
-        "paths": {
-          "train_filtered": ".data\\processed_data\\train_filtered.csv",
-          "transactions_filtered": ".data\\processed_data\\transactions_filtered.csv"
-        },
-        "min_date": "2016-01-01",
-        "keys_train": [
-          "date",
-          "store_nbr",
-          "item_nbr"
-        ],
-        "keys_transactions": [
-          "date",
-          "store_nbr"
-        ]
-      }
-    },
-    "step2": {
-      "status": "ok",
-      "outputs": {
-        "exposure_csv": ".data\\processed_data\\competitive_exposure.csv"
-      }
-    },
-    "eda1": {
-      "status": "ok",
-      "figures_dir": "figures\\favorita_analysis"
-    },
-    "eda2": {
-      "status": "ok",
-      "figures_dir": "figures\\favorita_analysis"
-    },
     "step3": {
       "status": "ok",
       "outputs": {
-        "pairs_path": ".data\\processed_data\\pairs_windows.csv",
-        "donors_path": ".data\\processed_data\\donors_per_victim.csv"
+        "pairs_path": ".data\\processed_data\\A_base\\pairs_windows.csv",
+        "donors_path": ".data\\processed_data\\A_base\\donors_per_victim.csv"
       }
     },
     "eda3": {
       "status": "ok",
-      "figures_dir": "figures\\favorita_analysis"
+      "figures_dir": "figures\\A_base"
     },
     "step4": {
       "status": "ok",
       "outputs": {
-        "episodes_index": ".data\\processed_data\\episodes_index.parquet",
-        "gsc_dir": ".data\\processed_data\\gsc",
-        "meta_all": ".data\\processed_data\\meta\\all_units.parquet",
-        "panel_features": ".data\\processed_data\\intermediate\\panel_features.parquet",
-        "donor_quality": ".data\\processed_data\\gsc\\donor_quality.parquet"
+        "episodes_index": ".data\\processed_data\\A_base\\episodes_index.parquet",
+        "gsc_dir": ".data\\processed_data\\A_base\\gsc",
+        "meta_all": ".data\\processed_data\\A_base\\meta\\all_units.parquet",
+        "panel_features": ".data\\processed_data\\A_base\\intermediate\\panel_features.parquet",
+        "donor_quality": ".data\\processed_data\\A_base\\gsc\\donor_quality.parquet"
       }
     },
     "eda4": {
       "status": "ok",
-      "figures_dir": "figures\\favorita_analysis"
+      "figures_dir": "figures\\A_base"
+    },
+    "step5_gsc": {
+      "status": "ok",
+      "outputs": {
+        "gsc_metrics": ".data\\processed_data\\gsc_outputs\\A_base\\gsc_metrics.parquet",
+        "gsc_cf_series_dir": ".data\\processed_data\\gsc_outputs\\A_base\\cf_series"
+      }
+    },
+    "step6_meta": {
+      "status": "ok",
+      "outputs": {
+        "x": {
+          "meta_metrics": ".data\\processed_data\\meta_outputs\\A_base\\x\\meta_metrics_x.parquet",
+          "cf_series_dir": ".data\\processed_data\\meta_outputs\\A_base\\x\\cf_series"
+        }
+      }
+    },
+    "eda_algorithms": {
+      "status": "ok",
+      "figures_dir": "figures\\A_base"
     }
   },
-  "end_time": "2025-10-20T16:23:06.367878"
+  "exp_tag": "A_base",
+  "end_time": "2025-11-03T18:42:34.856985"
 }
