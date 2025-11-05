@@ -255,6 +255,28 @@ def _ridge_fit(X: np.ndarray, y: np.ndarray, alpha: float = 1.0) -> np.ndarray:
         w = np.linalg.pinv(XtX_reg) @ Xty
     return w.astype(float)
 
+# ---- NUEVO: utilidades anti-duplicados / merges seguros ----
+
+def _assert_unique(df: pd.DataFrame, keys: Sequence[str], name: str) -> None:
+    """Lanza si df no es único por keys; muestra algunos casos para depurar."""
+    dup_mask = df.duplicated(keys, keep=False)
+    if dup_mask.any():
+        ex = (df.loc[dup_mask, list(keys)]
+                .value_counts()
+                .head(10))
+        raise AssertionError(f"{name} no es único por {list(keys)}. Ejemplos (top):\n{ex}")
+
+def _safe_merge(left: pd.DataFrame,
+                right: Optional[pd.DataFrame],
+                on: Union[str, List[str], Tuple[str, ...]],
+                how: str = "left",
+                validate: str = "many_to_one",
+                name: str = "") -> pd.DataFrame:
+    """Wrapper de merge con validate= para evitar many-to-many silenciosos."""
+    if right is None:
+        return left
+    return left.merge(right, on=on, how=how, validate=validate)
+
 
 # -------------------------------
 # Lectura de datos
@@ -297,7 +319,9 @@ def load_panel(raw_dir: Path) -> pd.DataFrame:
     items = _downcast_numeric(items, float_cols=[], int_cols=["item_nbr", "class", "perishable"])
     items = _as_categorical(items, ["family_name"])
 
-    df = df.merge(items, on="item_nbr", how="left")
+    # merge seguro (items debe ser único por item_nbr)
+    df = _safe_merge(df, items, on="item_nbr", how="left", validate="many_to_one", name="panel×items")
+
     df = _downcast_numeric(df, float_cols=["sales", "onpromotion"], int_cols=["store_nbr", "item_nbr", "class", "perishable"])
     logging.info(f"Panel cargado: {df.shape[0]:,} filas")
     return df
@@ -307,6 +331,8 @@ def load_stores(raw_dir: Path) -> pd.DataFrame:
     stores_path = _first_existing(raw_dir, ["stores.csv"])
     stores = pd.read_csv(stores_path)
     _ensure_cols(stores, ["store_nbr", "city", "state", "type", "cluster"], "stores")
+    # garantizar unicidad por store_nbr
+    _assert_unique(stores, ["store_nbr"], "stores.csv")
     stores = _as_categorical(stores, ["city", "state", "type", "cluster"])
     logging.info(f"Tiendas cargadas: {stores.shape[0]}")
     return stores
@@ -372,22 +398,27 @@ def build_holiday_controls(hol: pd.DataFrame, stores: pd.DataFrame) -> Tuple[pd.
     nat_flag = nat[["date", "type"]].copy()
     nat_flag["HNat"] = 1.0
     nat_flag = nat_flag.groupby("date", as_index=False)["HNat"].max()
+    _assert_unique(nat_flag, ["date"], "holidays_nat")
 
     reg = reg.rename(columns={"locale_name": "state"})
     reg_flag = reg[["date", "state", "type"]].copy()
     reg_flag["HReg"] = 1.0
     reg_flag = reg_flag.groupby(["date", "state"], as_index=False)["HReg"].max()
+    _assert_unique(reg_flag, ["date", "state"], "holidays_reg")
 
     loc = loc.rename(columns={"locale_name": "city"})
     loc_flag = loc[["date", "city", "type"]].copy()
     loc_flag["HLoc"] = 1.0
     loc_flag = loc_flag.groupby(["date", "city"], as_index=False)["HLoc"].max()
+    _assert_unique(loc_flag, ["date", "city"], "holidays_loc")
 
     type_by_date = hol[["date", "type"]].copy()
     type_by_date["is_bridge"] = type_by_date["type"].astype(str).str.lower().eq("bridge").astype(float)
     type_by_date["is_additional"] = type_by_date["type"].astype(str).str.lower().eq("additional").astype(float)
     type_by_date["is_work_day"] = type_by_date["type"].astype(str).str.lower().eq("work day").astype(float)
     type_flags = type_by_date.groupby("date", as_index=False)[["is_bridge", "is_additional", "is_work_day"]].max()
+    _assert_unique(type_flags, ["date"], "holidays_types")
+
     return nat_flag, reg_flag, loc_flag, type_flags
 
 
@@ -404,6 +435,7 @@ def build_weekly_proxies(transactions: pd.DataFrame, oil: pd.DataFrame) -> Tuple
     trw = tr.groupby(["year_week", "store_nbr"], as_index=False)["transactions"].sum()
     trw["Fsw_log1p"] = np.log1p(trw["transactions"].clip(lower=0.0))
     trw = trw[["year_week", "store_nbr", "Fsw_log1p"]]
+    _assert_unique(trw, ["year_week", "store_nbr"], "weekly_store_proxy")
 
     oi = oil.copy()
     oi["year"] = oi["date"].dt.isocalendar().year.astype(int)
@@ -411,23 +443,70 @@ def build_weekly_proxies(transactions: pd.DataFrame, oil: pd.DataFrame) -> Tuple
     oi["year_week"] = oi["year"].astype(str) + "-" + oi["week"].astype(str).str.zfill(2)
     oiw = oi.groupby("year_week", as_index=False)["oil_price"].mean()
     oiw = oiw.rename(columns={"oil_price": "Ow"})
+    _assert_unique(oiw, ["year_week"], "weekly_oil_proxy")
+
     return trw, oiw
 
 
-def build_regional_proxies(transactions: pd.DataFrame, stores: pd.DataFrame) -> pd.DataFrame:
-    tr = transactions.merge(stores[["store_nbr", "state"]], on="store_nbr", how="left").copy()
-    tr["year"] = tr["date"].dt.isocalendar().year.astype(int)
-    tr["week"] = tr["date"].dt.isocalendar().week.astype(int)
-    tr["year_week"] = tr["year"].astype(str) + "-" + tr["week"].astype(str).str.zfill(2)
+def build_regional_proxies(transactions: pd.DataFrame,
+                           stores: pd.DataFrame) -> pd.DataFrame:
+    """
+    Devuelve un DataFrame con columnas:
+      ['year_week', 'store_nbr', 'regional_proxy']
+    donde regional_proxy = transacciones_semana_tienda / transacciones_semana_estado.
+    Garantiza unicidad por (year_week, store_nbr).
+    """
+    tr = transactions.copy()
 
-    reg_w = tr.groupby(["year_week", "state"], as_index=False)["transactions"].sum()\
-              .rename(columns={"transactions": "F_state"})
-    store_w = tr.groupby(["year_week", "store_nbr", "state"], as_index=False)["transactions"].sum()
+    # Normalización temporal
+    if "date" in tr.columns:
+        tr["date"] = pd.to_datetime(tr["date"], errors="coerce").dt.tz_localize(None)
+    if "year_week" not in tr.columns:
+        iw = tr["date"].dt.isocalendar()
+        tr["year_week"] = iw["year"].astype(str) + "-" + iw["week"].astype(str).str.zfill(2)
 
-    out = store_w.merge(reg_w, on=["year_week", "state"], how="left")
-    out["F_state_excl_store"] = (out["F_state"] - out["transactions"]).clip(lower=0.0)
-    out["F_state_excl_store_log1p"] = np.log1p(out["F_state_excl_store"])
-    return out[["year_week", "store_nbr", "F_state_excl_store_log1p"]]
+    # Mapa tienda -> estado (limpio y 1:1)
+    st_map = (stores[["store_nbr", "state"]]
+              .copy()
+              .assign(state=lambda d: d["state"].astype(str).str.strip()))
+    # Si por alguna razón hubiera repeticiones con estados distintos, avisar y colapsar.
+    multi_state = (st_map.groupby("store_nbr")["state"].nunique() > 1)
+    if multi_state.any():
+        bad = multi_state[multi_state].index.tolist()
+        logging.warning("Stores con múltiples 'state' detectados (se tomará la 1ª aparición): %s", bad)
+        st_map = (st_map.sort_values(["store_nbr", "state"])
+                         .drop_duplicates("store_nbr", keep="first"))
+
+    _assert_unique(st_map, ["store_nbr"], "stores_map (store->state)")
+
+    # Unir estado a transacciones por tienda
+    tr = tr.merge(st_map, on="store_nbr", how="left", validate="m:1")
+
+    # Agregaciones semanales
+    reg_w = (tr.groupby(["year_week", "state"], observed=False, as_index=False)["transactions"]
+               .sum()
+               .rename(columns={"transactions": "trans_state"}))
+    store_w = (tr.groupby(["year_week", "store_nbr", "state"], observed=False, as_index=False)["transactions"]
+                 .sum()
+                 .rename(columns={"transactions": "trans_store"}))
+
+    _assert_unique(reg_w, ["year_week", "state"], "reg_w (semana-estado)")
+    _assert_unique(store_w, ["year_week", "store_nbr", "state"], "store_w (semana-tienda-estado)")
+
+    # Join correcto: (semana, estado)
+    out = store_w.merge(reg_w, on=["year_week", "state"], how="left", validate="m:1")
+
+    # Proxy: cuota de la tienda dentro del estado esa semana
+    out["regional_proxy"] = np.where(out["trans_state"] > 0,
+                                     out["trans_store"] / out["trans_state"], np.nan)
+
+    out = (out[["year_week", "store_nbr", "regional_proxy"]]
+             .sort_values(["year_week", "store_nbr"])
+             .reset_index(drop=True))
+
+    # Debe ser único por (semana, tienda)
+    _assert_unique(out, ["year_week", "store_nbr"], "regional_proxy")
+    return out
 
 
 # -------------------------------
@@ -504,7 +583,7 @@ def add_availability_and_store_trend(panel: pd.DataFrame, use_stl: bool) -> pd.D
         store_trend_parts.append(part)
     store_trend = pd.concat(store_trend_parts, ignore_index=True)
 
-    df = df.merge(store_trend, on=["store_nbr", "date"], how="left")
+    df = _safe_merge(df, store_trend, on=["store_nbr", "date"], how="left", validate="many_to_one", name="panel×store_trend")
     df["Q_store_trend_l1"] = df.groupby("store_nbr", observed=False)["Q_store_trend"].shift(1)
     return df
 
@@ -553,12 +632,13 @@ def add_intermitency_features(panel: pd.DataFrame) -> pd.DataFrame:
         agg_rows.append({"store_nbr": s, "item_nbr": it, "ADI": ADI, "CV2": CV2})
     agg = pd.DataFrame(agg_rows)
 
-    df = df.merge(agg, on=["store_nbr", "item_nbr"], how="left")
+    df = _safe_merge(df, agg, on=["store_nbr", "item_nbr"], how="left", validate="many_to_one", name="panel×ADI_CV2")
     return df
 
 
 def add_store_metadata(panel: pd.DataFrame, stores: pd.DataFrame) -> pd.DataFrame:
-    df = panel.merge(stores[["store_nbr", "type", "cluster", "state", "city"]], on="store_nbr", how="left")
+    df = _safe_merge(panel, stores[["store_nbr", "type", "cluster", "state", "city"]],
+                     on="store_nbr", how="left", validate="many_to_one", name="panel×stores")
     for col in ["type", "cluster", "state"]:
         if col in df.columns:
             dummies = pd.get_dummies(df[col], prefix=col, dummy_na=False)
@@ -612,6 +692,10 @@ def universe_from_episodes_and_donors(episodes: pd.DataFrame,
                       .head(top_k))
         donors_top = donors_top.rename(columns={"donor_store": "store_nbr", "donor_item": "item_nbr"})
         donors_top = donors_top[["store_nbr", "item_nbr", "j_store", "j_item", "rank"]]
+        # Anti‑trivial: impedir que víctima/caníbal aparezcan como donantes
+        di = set(map(tuple, episodes[["i_store","i_item"]].itertuples(index=False, name=None)))
+        dj = set(map(tuple, episodes[["j_store","j_item"]].itertuples(index=False, name=None)))
+        donors_top = donors_top[~donors_top[["store_nbr","item_nbr"]].apply(tuple, axis=1).isin(di|dj)]
     return victims, donors_top, cannibals
 
 
@@ -643,7 +727,7 @@ def filter_panel_to_universe(panel: pd.DataFrame,
 
     p = panel.loc[panel["date"].between(date_min, date_max)].copy()
     if not key_units.empty:
-        p = p.merge(key_units.assign(_keep=1), on=["store_nbr", "item_nbr"], how="inner").drop(columns=["_keep"], errors="ignore")
+        p = p.merge(key_units.assign(_keep=1), on=["store_nbr", "item_nbr"], how="inner", validate="many_to_one").drop(columns=["_keep"], errors="ignore")
 
     p = _downcast_numeric(p, float_cols=["sales", "onpromotion"], int_cols=["store_nbr", "item_nbr"])
     logging.info(f"Panel filtrado (universo): {p.shape[0]:,} filas, {key_units.shape[0] if not key_units.empty else 0} unidades")
@@ -661,15 +745,18 @@ def promo_pressure_from_panel(panel_all: pd.DataFrame) -> pd.DataFrame:
            .agg(n_items=("item_nbr", "nunique"),
                 n_on=("onpromotion", "sum")))
     g["promo_share_sc"] = (g["n_on"] / g["n_items"]).astype("float32")
+    _assert_unique(g, ["store_nbr","class","date"], "promo_pressure")
     return g[["store_nbr", "class", "date", "n_items", "n_on", "promo_share_sc"]]
 
 
 def class_index_excluding_item(panel_all: pd.DataFrame) -> pd.DataFrame:
     tot = (panel_all.groupby(["store_nbr", "class", "date"], as_index=False)["sales"]
                    .sum().rename(columns={"sales": "class_sales"}))
-    p = panel_all.merge(tot, on=["store_nbr", "class", "date"], how="left")
+    p = panel_all.merge(tot, on=["store_nbr", "class", "date"], how="left", validate="many_to_one")
     p["class_index_excl"] = (p["class_sales"] - p["sales"]).clip(lower=0.0)
-    return p[["store_nbr", "item_nbr", "date", "class_index_excl"]]
+    out = p[["store_nbr", "item_nbr", "date", "class_index_excl"]]
+    _assert_unique(out, ["store_nbr","item_nbr","date"], "class_index_excluding_item")
+    return out
 
 
 def attach_controls(panel: pd.DataFrame,
@@ -693,28 +780,28 @@ def attach_controls(panel: pd.DataFrame,
     df["week"] = df["date"].dt.isocalendar().week.astype(int)
     df["year_week"] = df["year"].astype(str) + "-" + df["week"].astype(str).str.zfill(2)
 
-    df = df.merge(holidays_nat, on="date", how="left")
-    df = df.merge(stores[["store_nbr", "state", "city"]], on="store_nbr", how="left")
-    df = df.merge(holidays_reg, on=["date", "state"], how="left")
-    df = df.merge(holidays_loc, on=["date", "city"], how="left")
-    df = df.merge(holidays_types, on="date", how="left")
+    df = _safe_merge(df, holidays_nat, on="date", how="left", validate="many_to_one", name="panel×hol_nat")
+    df = _safe_merge(df, stores[["store_nbr", "state", "city"]], on="store_nbr", how="left", validate="many_to_one", name="panel×stores_state_city")
+    df = _safe_merge(df, holidays_reg, on=["date", "state"], how="left", validate="many_to_one", name="panel×hol_reg")
+    df = _safe_merge(df, holidays_loc, on=["date", "city"], how="left", validate="many_to_one", name="panel×hol_loc")
+    df = _safe_merge(df, holidays_types, on="date", how="left", validate="many_to_one", name="panel×hol_types")
     for c in ["HNat", "HReg", "HLoc", "is_bridge", "is_additional", "is_work_day"]:
         if c in df.columns:
             df[c] = df[c].fillna(0.0)
 
     if weekly_store_proxy is not None:
-        df = df.merge(weekly_store_proxy, on=["year_week", "store_nbr"], how="left")
+        df = _safe_merge(df, weekly_store_proxy, on=["year_week", "store_nbr"], how="left", validate="many_to_one", name="panel×weekly_store_proxy")
         df["Fsw_log1p"] = df["Fsw_log1p"].fillna(method="ffill").fillna(0.0)
     if weekly_oil_proxy is not None:
-        df = df.merge(weekly_oil_proxy, on="year_week", how="left")
+        df = _safe_merge(df, weekly_oil_proxy, on="year_week", how="left", validate="many_to_one", name="panel×weekly_oil_proxy")
         df["Ow"] = df["Ow"].fillna(method="ffill").fillna(0.0)
 
     if cfg.use_regional_proxy and regional_proxy is not None:
-        df = df.merge(regional_proxy, on=["year_week", "store_nbr"], how="left")
+        df = _safe_merge(df, regional_proxy, on=["year_week", "store_nbr"], how="left", validate="many_to_one", name="panel×regional_proxy")
         df["F_state_excl_store_log1p"] = df["F_state_excl_store_log1p"].fillna(method="ffill").fillna(0.0)
 
     if cfg.add_promo_pressure and promo_ctx is not None:
-        df = df.merge(promo_ctx, on=["store_nbr", "class", "date"], how="left")
+        df = _safe_merge(df, promo_ctx, on=["store_nbr", "class", "date"], how="left", validate="many_to_one", name="panel×promo_pressure")
         df[["n_items", "n_on", "promo_share_sc"]] = df[["n_items", "n_on", "promo_share_sc"]].fillna(0.0)
         denom = np.maximum(df["n_items"] - 1.0, 1.0)
         df["promo_share_sc_excl"] = ((df["n_on"] - (df["onpromotion"] > 0).astype(float)) / denom).clip(lower=0.0)
@@ -725,7 +812,7 @@ def attach_controls(panel: pd.DataFrame,
         df["promo_share_sc_excl_l14"] = df.groupby(["store_nbr", "class"])["promo_share_sc_excl"].shift(14)
 
     if cfg.add_class_index_excl and class_index is not None:
-        df = df.merge(class_index, on=["store_nbr", "item_nbr", "date"], how="left")
+        df = _safe_merge(df, class_index, on=["store_nbr", "item_nbr", "date"], how="left", validate="many_to_one", name="panel×class_index_excl")
         df = df.sort_values(["store_nbr", "item_nbr", "date"])
         df["class_index_excl_l7"]  = df.groupby(["store_nbr", "item_nbr"])["class_index_excl"].shift(7)
         df["class_index_excl_l14"] = df.groupby(["store_nbr", "item_nbr"])["class_index_excl"].shift(14)
@@ -758,6 +845,13 @@ def _make_cluster_id(i_store: int, i_item: int, j_store: int, j_item: int, treat
     """
     return f"{i_store}_{i_item}_{j_store}_{j_item}_{pd.to_datetime(treat_start).date()}"
 
+def _write_observed_series(out_dir: Path, episode_id: str, df_victim: pd.DataFrame) -> None:
+    """Exporta serie observada (víctima) para facilitar que la EDA la encuentre con clave robusta."""
+    obs_dir = out_dir / "gsc" / "observed_series"
+    obs_dir.mkdir(parents=True, exist_ok=True)
+    (df_victim[["date", "sales"]]
+        .sort_values("date")
+        .to_parquet(obs_dir / f"{episode_id}__observed.parquet", index=False))
 
 def build_meta_for_episode_fast(ep_row: pd.Series,
                                 base_panel: pd.DataFrame) -> pd.DataFrame:
@@ -765,7 +859,6 @@ def build_meta_for_episode_fast(ep_row: pd.Series,
     Versión liviana para Meta:
       - Sólo víctima j
       - Etiquetas de ventana y tratamiento (sin donantes)
-      - Sin donor-blend
       - Añade y_raw y y_log1p para trazado/modelo explícito
     """
     i_store, i_item = int(ep_row["i_store"]), int(ep_row["i_item"])
@@ -780,6 +873,9 @@ def build_meta_for_episode_fast(ep_row: pd.Series,
         (base_panel["item_nbr"] == j_item)
     ].copy()
 
+    # Garantizar unicidad por fecha (víctima)
+    _assert_unique(sub, ["store_nbr","item_nbr","date"], f"subpanel víctima {episode_id}")
+
     sub["unit_id"] = sub["store_nbr"].astype(str) + ":" + sub["item_nbr"].astype(str)
     sub["treated_unit"] = 1
     sub["treated_time"] = (sub["date"] >= treat_start).astype(int)
@@ -792,9 +888,10 @@ def build_meta_for_episode_fast(ep_row: pd.Series,
     sub["y_raw"] = sub["sales"].astype(float)
     sub["y_log1p"] = np.log1p(sub["y_raw"].clip(lower=0.0))
 
-    # Marcadores de entrenamiento
+    # Máscaras (entrenamiento temporal: PRE estricto)
     sub["is_pre"] = (sub["date"] < treat_start).astype(int)
-    sub["train_mask"] = ((sub["treated_unit"] == 0) | (sub["is_pre"] == 1)).astype(int)
+    sub["train_mask_time"] = sub["is_pre"].astype(int)
+    sub["train_mask"] = sub["train_mask_time"]  # compat
 
     return sub
 
@@ -819,16 +916,20 @@ def build_gsc_and_meta_for_episode(ep_row: pd.Series,
     # Donantes del episodio
     dons = donors_map.loc[(donors_map["j_store"] == j_store) & (donors_map["j_item"] == j_item)].copy()
     dons = dons.sort_values("rank").drop_duplicates(subset=["store_nbr", "item_nbr"]).head(cfg.top_k_donors)
-    # Nunca permitir que la víctima sea donante de sí misma
+    # Nunca permitir que la víctima o el caníbal sean donantes
     dons = dons[~((dons["store_nbr"] == j_store) & (dons["item_nbr"] == j_item))]
+    dons = dons[~((dons["store_nbr"] == i_store) & (dons["item_nbr"] == i_item))]
     donors_units = list(map(tuple, dons[["store_nbr", "item_nbr"]].to_numpy()))
     units = [(j_store, j_item)] + donors_units
 
-    # Subpanel
+    # Subpanel (víctima + donantes)
     sub = base_panel.loc[
         base_panel["date"].between(pre_start, post_end) &
         base_panel.set_index(["store_nbr", "item_nbr"]).index.isin(units)
     ].copy()
+
+    # Garantizar unicidad por (unidad, fecha)
+    _assert_unique(sub, ["store_nbr","item_nbr","date"], f"subpanel episodio {episode_id}")
 
     # Calidad donantes
     g_list = []
@@ -884,7 +985,9 @@ def build_gsc_and_meta_for_episode(ep_row: pd.Series,
                     sc_hat = (Xall * W.reindex(Xall.columns).fillna(0.0)).sum(axis=1)
                     sc_hat = sc_hat.reindex(subf["date"].unique(), fill_value=np.nan)
                     scdf = pd.DataFrame({"date": sc_hat.index, "sc_hat": sc_hat.values})
-                    subf = subf.merge(scdf, on="date", how="left")
+                    subf = subf.merge(scdf, on="date", how="left", validate="many_to_one")
+                    # NUEVO: no propagar sc_hat a donantes (claridad para EDA)
+                    subf.loc[subf["treated_unit"] == 0, "sc_hat"] = np.nan
                 else:
                     subf["sc_hat"] = np.nan
             else:
@@ -906,11 +1009,13 @@ def build_gsc_and_meta_for_episode(ep_row: pd.Series,
     meta_panel["y_raw"] = meta_panel["sales"].astype(float)
     meta_panel["y_log1p"] = np.log1p(meta_panel["y_raw"].clip(lower=0.0))
 
-    # Marcadores de entrenamiento
+    # Máscaras (entrenamiento temporal: PRE estricto)
     subf["is_pre"] = (subf["date"] < treat_start).astype(int)
-    subf["train_mask"] = ((subf["treated_unit"] == 0) | (subf["is_pre"] == 1)).astype(int)
+    subf["train_mask_time"] = subf["is_pre"].astype(int)
+    subf["train_mask"] = subf["train_mask_time"]  # compat
     meta_panel["is_pre"] = (meta_panel["date"] < treat_start).astype(int)
-    meta_panel["train_mask"] = ((meta_panel["treated_unit"] == 0) | (meta_panel["is_pre"] == 1)).astype(int)
+    meta_panel["train_mask_time"] = meta_panel["is_pre"].astype(int)
+    meta_panel["train_mask"] = meta_panel["train_mask_time"]
 
     n_donors_kept = int(meta_panel.loc[meta_panel["treated_unit"] == 0, ["store_nbr", "item_nbr"]]
                         .drop_duplicates().shape[0])
@@ -928,10 +1033,12 @@ def build_gsc_and_meta_for_episode(ep_row: pd.Series,
         "quality": donor_quality
     }
 
-    # Chequeo de consistencia observado entre GSC y Meta (víctima)
-    victim_gsc = gsc_panel[gsc_panel["treated_unit"] == 1][["date", "sales", "trend_T", "lag_7d"]]
-    victim_meta = meta_panel[meta_panel["treated_unit"] == 1][["date", "sales", "trend_T", "lag_7d"]]
-    assert victim_gsc.equals(victim_meta), f"Mismatch en {episode_id}"
+    # Chequeo de consistencia observado entre GSC y Meta (víctima) **SIN trend_T**
+    victim_gsc = (gsc_panel[gsc_panel["treated_unit"] == 1][["date", "sales"]]
+                  .sort_values("date").reset_index(drop=True))
+    victim_meta = (meta_panel[meta_panel["treated_unit"] == 1][["date", "sales"]]
+                   .sort_values("date").reset_index(drop=True))
+    assert victim_gsc.equals(victim_meta), f"Mismatch en observado víctima entre GSC y Meta para {episode_id}"
 
     # Smoke test: sc_hat idéntico al observado
     try:
@@ -942,6 +1049,12 @@ def build_gsc_and_meta_for_episode(ep_row: pd.Series,
                 logging.warning(f"[{episode_id}] sc_hat == sales (posible fuga/autodonante).")
     except Exception:
         pass
+
+    # Exportar observado para EDA (evita 'sin observado')
+    try:
+        _write_observed_series(cfg.out_dir, episode_id, victim_gsc)
+    except Exception as e:
+        logging.warning(f"[{episode_id}] No se pudo exportar observed.parquet: {e}")
 
     return gsc_panel, meta_panel, meta_info
 
@@ -1001,6 +1114,7 @@ def prepare_datasets(cfg: PrepConfig) -> None:
     # Rutas
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     (cfg.out_dir / "gsc").mkdir(parents=True, exist_ok=True)
+    (cfg.out_dir / "gsc" / "observed_series").mkdir(parents=True, exist_ok=True)  # para EDA
     (cfg.out_dir / "meta").mkdir(parents=True, exist_ok=True)
     cfg.out_meta_dir.mkdir(parents=True, exist_ok=True)
     (cfg.out_dir / "intermediate").mkdir(parents=True, exist_ok=True)
@@ -1060,12 +1174,9 @@ def prepare_datasets(cfg: PrepConfig) -> None:
     class_idx = class_index_excluding_item(panel_all) if cfg.add_class_index_excl else None
 
     # 5) Filtrar al universo requerido por modo
-    # ---------------------------------------------------------
-    # CAMBIO: incluir donantes cuando habrá GSC, sin depender de meta_units
     need_gsc = ((not cfg.meta_only) or (eval_ids is not None and len(eval_ids) > 0))
     donors_for_filter = donors_top if need_gsc or (cfg.meta_units == "victims_plus_donors") else None
     panel = filter_panel_to_universe(panel_all, victims, donors_for_filter, cannibals, date_min, date_max)
-    # ---------------------------------------------------------
 
     # 6) Adjuntar controles + features
     logging.info("Construyendo controles y features...")
@@ -1082,7 +1193,7 @@ def prepare_datasets(cfg: PrepConfig) -> None:
     panel = add_temporal_features(panel, lags_days=cfg.lags_days, fourier_k=cfg.fourier_k,
                                   add_dow=cfg.add_dow, add_paydays=cfg.add_paydays)
     # Forzamos cálculo causal y usaremos SOLO rezagos de tendencias
-    panel = add_availability_and_store_trend(panel, use_stl=False)
+    panel = add_availability_and_store_trend(panel, use_stl=cfg.use_stl)
     if cfg.add_intermitency_feats:
         panel = add_intermitency_features(panel)
     panel = add_store_metadata(panel, stores)
@@ -1090,6 +1201,9 @@ def prepare_datasets(cfg: PrepConfig) -> None:
         panel = panel.drop(columns=["city"], errors="ignore")
     # Evitar fuga por contemporáneos de tendencia
     panel = panel.drop(columns=[c for c in ["trend_T", "Q_store_trend"] if c in panel.columns], errors="ignore")
+
+    # ---- NUEVO: garantizar unicidad del panel por (store,item,date)
+    _assert_unique(panel, ["store_nbr","item_nbr","date"], "panel con features")
 
     if cfg.save_intermediate:
         inter_path = cfg.out_dir / "intermediate" / "panel_features.parquet"
@@ -1174,7 +1288,7 @@ def prepare_datasets(cfg: PrepConfig) -> None:
 
         # --- NUEVO: separación explícita X/Y y blacklist anti-fuga ---
         id_cols = ["episode_id","unit_id","date","store_nbr","item_nbr",
-                   "treated_unit","treated_time","D","is_pre","train_mask","cluster_id"]
+                   "treated_unit","treated_time","D","is_pre","train_mask","train_mask_time","cluster_id"]
         leak_cols = {"sales","y_raw","y_log1p","trend_T","Q_store_trend","sc_hat"}
         X_cols = [c for c in meta_all.columns if c not in leak_cols and c not in id_cols]
         X_safe = meta_all[id_cols + X_cols]

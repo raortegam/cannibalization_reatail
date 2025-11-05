@@ -52,6 +52,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 SRC_DIR = REPO_ROOT / "src"
 EDA_DIR = REPO_ROOT / "EDA"
 DIAG_DIR = REPO_ROOT / "diagnostics"
+RMSPE_EPS = 1e-6  # umbral para detectar "calce perfecto" sospechoso
 
 
 # -------------------- Utilidades generales --------------------
@@ -216,19 +217,29 @@ def _touch_fingerprint(dirpath: Path, exp_tag: Optional[str]) -> None:
         pass
 
 
-def _assert_scoped(path: Path, exp_tag: Optional[str], label: str) -> None:
-    """Advierte si 'path' NO está bajo una carpeta cuyo nombre termina en exp_tag."""
+def _assert_scoped(path: Path, exp_tag: Optional[str], label: str, hard: bool = False) -> None:
+    """Advierte o lanza si 'path' NO está bajo una carpeta cuyo nombre termina en exp_tag."""
     if not exp_tag:
         return
     p = Path(path).resolve()
     ok = any(part == exp_tag for part in p.parts)
     if not ok:
-        logging.warning("[SCOPE] %s NO está bajo exp_tag='%s' -> %s", label, exp_tag, str(p))
+        msg = f"[SCOPE] {label} NO está bajo exp_tag='{exp_tag}' -> {str(p)}"
+        if hard:
+            raise RuntimeError(msg)
+        logging.warning(msg)
 
 
 def _assert_exists(path: Path, label: str) -> None:
     if not Path(path).exists():
         logging.warning("[MISSING] %s no existe -> %s", label, str(path))
+
+
+def _purge_dir_if_needed(p: Path) -> None:
+    """Borra y recrea un directorio (corrida limpia)."""
+    if p.exists():
+        shutil.rmtree(p, ignore_errors=True)
+    p.mkdir(parents=True, exist_ok=True)
 
 
 # -------------------- Configuración --------------------
@@ -268,8 +279,8 @@ class PathsConfig:
     step1_out_dir: Optional[Path] = None
 
     # NUEVO: rutas de salida de algoritmos
-    gsc_out_dir: Path = Path(".data/processed_data/gsc_outputs")
-    meta_out_root: Path = Path(".data/processed_data/meta_outputs")
+    gsc_out_dir: Path = Path(".data/processed_data")
+    meta_out_root: Path = Path(".data/processed_data")
 
 
 @dataclass
@@ -400,6 +411,8 @@ class OrchestratorConfig:
     fail_fast: bool = False
     use_filtered_from_step1: bool = True
     exp_tag: Optional[str] = None
+    clean_outputs: bool = True
+    hard_scope: bool = True
     toggles: StepToggles = field(default_factory=StepToggles)
     paths: PathsConfig = field(default=None)   # type: ignore[assignment]
     params: ParamsConfig = field(default_factory=ParamsConfig)
@@ -423,7 +436,7 @@ def load_yaml_config(path: Path) -> OrchestratorConfig:
         figures_dir=Path(paths_raw.get("figures_dir", "figures/favorita_analysis")),
         exposure_csv=Path(paths_raw.get("exposure_csv", ".data/processed_data/competitive_exposure.csv")),
         step1_out_dir=Path(paths_raw["step1_out_dir"]) if paths_raw.get("step1_out_dir") else None,
-        gsc_out_dir=Path(paths_raw.get("gsc_out_dir", ".data/processed_data/gsc_outputs")),
+        gsc_out_dir=Path(paths_raw.get("gsc_out_dir", ".data/processed_data")),
         meta_out_root=Path(paths_raw.get("meta_out_root", ".data/processed_data/meta_outputs")),
     )
 
@@ -437,6 +450,8 @@ def load_yaml_config(path: Path) -> OrchestratorConfig:
         fail_fast=cfg.get("fail_fast", False),
         use_filtered_from_step1=cfg.get("use_filtered_from_step1", True),
         exp_tag=cfg.get("exp_tag"),
+        clean_outputs=cfg.get("clean_outputs", True),
+        hard_scope=cfg.get("hard_scope", True),
         toggles=toggles,
         paths=paths,
         params=params,
@@ -637,13 +652,13 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     if exp_tag:
         cfg.project_name = f"{cfg.project_name}__{exp_tag}"
 
-    # --- Validación de scoping por experimento (antes de crear nada) ---
+    # # --- Validación de scoping por experimento (antes de crear nada) ---
     for name in ["processed_dir", "preprocessed_dir", "figures_dir", "gsc_out_dir", "meta_out_root"]:
-        _assert_scoped(getattr(cfg.paths, name), exp_tag, name)
+        _assert_scoped(getattr(cfg.paths, name), exp_tag, name, hard=cfg.hard_scope)
         _touch_fingerprint(getattr(cfg.paths, name), exp_tag)
-    _assert_scoped(cfg.paths.exposure_csv.parent, exp_tag, "exposure_csv.parent")
+    _assert_scoped(cfg.paths.exposure_csv.parent, exp_tag, "exposure_csv.parent", hard=cfg.hard_scope)
 
-    # Logging y seeds
+    # # Logging y seeds
     log_path = setup_logging(cfg.log_level, cfg.log_to_file, exp_tag=exp_tag)
     logger = logging.getLogger("pipeline")
     seed_everything(cfg.seed)
@@ -651,13 +666,16 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     logger.info("Proyecto: %s", cfg.project_name)
     logger.info("Configuración cargada desde: %s", config_path)
 
-    # Asegurar rutas base
+    # Asegurar/limpiar rutas base
     ensure_dir(cfg.paths.raw_dir)
-    ensure_dir(cfg.paths.processed_dir)
-    ensure_dir(cfg.paths.preprocessed_dir)
-    ensure_dir(cfg.paths.figures_dir)
-    ensure_dir(cfg.paths.gsc_out_dir)
-    ensure_dir(cfg.paths.meta_out_root)
+    if cfg.clean_outputs:
+        for p in [cfg.paths.processed_dir, cfg.paths.preprocessed_dir, cfg.paths.figures_dir,
+                  cfg.paths.gsc_out_dir, cfg.paths.meta_out_root]:
+            _purge_dir_if_needed(p)
+    else:
+        for p in [cfg.paths.processed_dir, cfg.paths.preprocessed_dir, cfg.paths.figures_dir,
+                  cfg.paths.gsc_out_dir, cfg.paths.meta_out_root]:
+            ensure_dir(p)
 
     # Ajustar sys.path para 'src' y 'EDA'
     sys.path.insert(0, str(SRC_DIR))
@@ -679,13 +697,13 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         },
     }
 
-    # -------------------- Paso 1: Data Quality --------------------
+    # # -------------------- Paso 1: Data Quality --------------------
     step1_outputs = {}
     if cfg.toggles.step1:
         logger.info("Paso 1: Control de calidad y filtrado de datos 'train' y 'transactions'.")
 
         # assert de scoping de salida
-        _assert_scoped(cfg.paths.processed_dir, exp_tag, "step1.out_dir(processed_dir)")
+        _assert_scoped(cfg.paths.processed_dir, exp_tag, "step1.out_dir(processed_dir)", hard=cfg.hard_scope)
 
         try:
             dq_path = SRC_DIR / "preprocess_data" / "1. data_quality.py"
@@ -731,7 +749,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         logger.info("Paso 1 deshabilitado por configuración.")
         manifest["steps"]["step1"] = {"status": "disabled"}
 
-    # Resolver rutas de train/transactions a usar a partir del Step 1 si corresponde
+    # # Resolver rutas de train/transactions a usar a partir del Step 1 si corresponde
     train_for_next = cfg.paths.train_csv
     transactions_for_next = cfg.paths.transactions_csv
     if cfg.toggles.step1 and cfg.use_filtered_from_step1 and step1_outputs:
@@ -745,11 +763,11 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         except Exception:
             logger.warning("No se pudo extraer rutas filtradas del Paso 1; se usarán las originales.")
 
-    # -------------------- Paso 2: Competitive Exposure + EDA 1 y 2 --------------------
+    # # -------------------- Paso 2: Competitive Exposure + EDA 1 y 2 --------------------
     exposure_path = cfg.paths.exposure_csv
     if cfg.toggles.step2:
         logger.info("Paso 2: Cálculo de exposición competitiva (H).")
-        _assert_scoped(cfg.paths.exposure_csv.parent, exp_tag, "step2.exposure_dir")
+        _assert_scoped(cfg.paths.exposure_csv.parent, exp_tag, "step2.exposure_dir", hard=cfg.hard_scope)
         _touch_fingerprint(cfg.paths.exposure_csv.parent, exp_tag)
 
         try:
@@ -808,7 +826,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("No pude validar columnas de exposure (%s): %s", exposure_path, e)
 
-    # -------------------- Paso 3: select_pairs_and_donors + EDA 3 --------------------
+    # # -------------------- Paso 3: select_pairs_and_donors + EDA 3 --------------------
     pairs_path = cfg.paths.preprocessed_dir / "pairs_windows.csv"
     donors_path = cfg.paths.preprocessed_dir / "donors_per_victim.csv"
 
@@ -816,7 +834,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         exp_tag_local = cfg.exp_tag if hasattr(cfg, 'exp_tag') and cfg.exp_tag else (exp_tag or "default")
         outdir_exp = cfg.params.outdir_pairs_donors / exp_tag_local
         ensure_dir(outdir_exp)
-        _assert_scoped(outdir_exp, exp_tag_local, "step3.outdir_exp")
+        _assert_scoped(outdir_exp, exp_tag_local, "step3.outdir_exp", hard=cfg.hard_scope)
         _touch_fingerprint(outdir_exp, exp_tag_local)
 
         logger.info(f"📁 Guardando pairs/donors en: {outdir_exp}")
@@ -889,8 +907,8 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
 
         _assert_exists(pairs_path, "step3.pairs_path")
         _assert_exists(donors_path, "step3.donors_path")
-        _assert_scoped(pairs_path.parent, exp_tag_local, "step3.pairs_dir")
-        _assert_scoped(donors_path.parent, exp_tag_local, "step3.donors_dir")
+        _assert_scoped(pairs_path.parent, exp_tag_local, "step3.pairs_dir", hard=cfg.hard_scope)
+        _assert_scoped(donors_path.parent, exp_tag_local, "step3.donors_dir", hard=cfg.hard_scope)
 
         manifest["steps"]["step3"] = {
             "status": "ok" if pairs_path.exists() and donors_path.exists() else "skipped_or_failed",
@@ -905,7 +923,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     cfg.params.donors_path = donors_path
     cfg.params.outdir_pairs_donors = pairs_path.parent
 
-    # -------------------- EDA 3 --------------------
+    # # -------------------- EDA 3 --------------------
     if cfg.toggles.eda3:
         logger.info("EDA 3: Muestreo de episodios y diagnóstico de calidad.")
         try:
@@ -943,7 +961,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         logger.info("EDA 3 deshabilitado por configuración.")
         manifest["steps"]["eda3"] = {"status": "disabled"}
 
-    # -------------------- Paso 4: pre_algorithm + EDA 4 --------------------
+    # # -------------------- Paso 4: pre_algorithm + EDA 4 --------------------
     processed_out_dir = cfg.paths.processed_dir
     episodes_path_for_step4 = cfg.params.episodes_path
     donors_path_for_step4 = cfg.params.donors_path
@@ -953,7 +971,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         logger.info(f"Usando episodios desde: {episodes_path_for_step4}")
         logger.info(f"Usando donantes desde: {donors_path_for_step4}")
 
-        _assert_scoped(processed_out_dir, exp_tag, "step4.processed_out_dir")
+        _assert_scoped(processed_out_dir, exp_tag, "step4.processed_out_dir", hard=cfg.hard_scope)
         _assert_exists(episodes_path_for_step4, "step4.episodes_path")
         _assert_exists(donors_path_for_step4, "step4.donors_path")
 
@@ -1005,7 +1023,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
 
             # Esperables del prep
             for must_dir in [processed_out_dir / "gsc", processed_out_dir / "intermediate", processed_out_dir / "meta"]:
-                _assert_scoped(must_dir, exp_tag, f"step4.out_dir::{must_dir.name}")
+                _assert_scoped(must_dir, exp_tag, f"step4.out_dir::{must_dir.name}", hard=cfg.hard_scope)
                 _touch_fingerprint(must_dir, exp_tag)
 
             manifest["steps"]["step4"] = {
@@ -1018,6 +1036,18 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                     "donor_quality": str(processed_out_dir / "gsc" / "donor_quality.parquet"),
                 },
             }
+            # --- Sanidad básica: donantes no pueden incluir víctima/caníbal ---
+            try:
+                epi_idx = pd.read_parquet(processed_out_dir / "episodes_index.parquet")
+                donors_df = pd.read_csv(donors_path_for_step4)
+                vict_cols = [c for c in donors_df.columns if any(k in c.lower() for k in ["victim","target_item","j_id","victim_id"])]
+                donor_unit_cols = [c for c in donors_df.columns if any(k in c.lower() for k in ["donor","donor_item","k_id","unit_id"])]
+                if vict_cols and donor_unit_cols:
+                    bad = donors_df[donors_df[vict_cols[0]] == donors_df[donor_unit_cols[0]]]
+                    if len(bad) > 0:
+                        raise RuntimeError(f"Donantes incluyen a la víctima/caníbal ({len(bad)} filas). Corrige selección de donantes antes de Step 5.")
+            except Exception as e:
+                logger.warning("Chequeo de donantes/víctima no concluyente: %s", e)
         else:
             logger.warning("Paso 4 omitido (funciones no disponibles).")
             manifest["steps"]["step4"] = {"status": "skipped_or_failed"}
@@ -1025,7 +1055,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         logger.info("Paso 4 deshabilitado por configuración.")
         manifest["steps"]["step4"] = {"status": "disabled"}
 
-    # -------------------- EDA 4 --------------------
+    # # -------------------- EDA 4 --------------------
     if cfg.toggles.eda4:
         logger.info("EDA 4: Reporte de datasets procesados.")
         try:
@@ -1092,8 +1122,8 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
             if GSCRunConfig is None or gsc_run_batch is None:
                 manifest["steps"]["step5_gsc"] = {"status": "skipped_or_failed"}
             else:
-                _assert_scoped(gsc_in_dir, exp_tag, "step5.gsc_in_dir")
-                _assert_scoped(cfg.paths.gsc_out_dir, exp_tag, "step5.gsc_out_dir")
+                _assert_scoped(gsc_in_dir, exp_tag, "step5.gsc_in_dir", hard=cfg.hard_scope)
+                _assert_scoped(cfg.paths.gsc_out_dir, exp_tag, "step5.gsc_out_dir", hard=cfg.hard_scope)
                 _touch_fingerprint(cfg.paths.gsc_out_dir, exp_tag)
 
                 gsc_cfg = GSCRunConfig(
@@ -1117,11 +1147,38 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 _safe_call(gsc_run_batch, logger, cfg.fail_fast, "5. GSC run_batch", cfg=gsc_cfg)
                 out_metrics = cfg.paths.gsc_out_dir / "gsc_metrics.parquet"
                 _assert_exists(out_metrics, "step5.gsc_metrics")
+
+                # --- Sanidad GSC: no-RMSPE_pre≈0 y observado presente ---
+                try:
+                    if out_metrics.exists():
+                        mets = pd.read_parquet(out_metrics)
+                        cond = pd.Series(False, index=mets.index)
+                        if "rmspe_pre" in mets.columns:
+                            cond = cond | (mets["rmspe_pre"] <= RMSPE_EPS)
+                        if "has_observed" in mets.columns:
+                            cond = cond | (mets["has_observed"] == 0)
+                        bad = mets[cond]
+                        if len(bad) > 0:
+                            raise RuntimeError(f"GSC: {len(bad)} episodios con rmspe_pre≈0 o sin observado. Revisa EDA/inputs.")
+                except Exception as e:
+                    logger.warning("Chequeo de GSC (rmspe_pre/observado) no concluyente: %s", e)
+
+                # Episodios procesados
+                episodes_done_gsc: List[Any] = []
+                try:
+                    if out_metrics.exists():
+                        mets = pd.read_parquet(out_metrics)
+                        if "episode_id" in mets.columns:
+                            episodes_done_gsc = sorted(mets["episode_id"].dropna().unique().tolist())
+                except Exception:
+                    pass
+
                 manifest["steps"]["step5_gsc"] = {
                     "status": "ok" if out_metrics.exists() else "skipped_or_failed",
                     "outputs": {
                         "gsc_metrics": str(out_metrics),
                         "gsc_cf_series_dir": str(cfg.paths.gsc_out_dir / "cf_series"),
+                        "episodes_done": episodes_done_gsc,
                     },
                 }
     else:
@@ -1149,7 +1206,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
             if MetaRunCfg is None or meta_run_batch is None:
                 manifest["steps"]["step6_meta"] = {"status": "skipped_or_failed"}
             else:
-                _assert_scoped(cfg.paths.meta_out_root, exp_tag, "step6.meta_out_root")
+                _assert_scoped(cfg.paths.meta_out_root, exp_tag, "step6.meta_out_root", hard=cfg.hard_scope)
                 _touch_fingerprint(cfg.paths.meta_out_root, exp_tag)
 
                 learners_to_run: List[str] = list(cfg.params.meta_learners)
@@ -1192,6 +1249,31 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                         "cf_series_dir": str(out_dir / "cf_series"),
                     }
                     _assert_exists(out_dir / f"meta_metrics_{lr}.parquet", f"step6.meta_metrics[{lr}]")
+
+                    # --- Sanidad Meta: no-RMSPE_pre≈0 ---
+                    try:
+                        mp = out_dir / f"meta_metrics_{lr}.parquet"
+                        if mp.exists():
+                            mm = pd.read_parquet(mp)
+                            if "rmspe_pre" in mm.columns:
+                                bad = mm[mm["rmspe_pre"] <= RMSPE_EPS]
+                                if len(bad) > 0:
+                                    raise RuntimeError(f"Meta-{lr.upper()}: {len(bad)} episodios con rmspe_pre≈0. Revisa unión de observado.")
+                    except Exception as e:
+                        logger.warning("Chequeo Meta (%s) no concluyente: %s", lr, e)
+
+                    # Episodios procesados por learner
+                    episodes_done_meta: List[Any] = []
+                    try:
+                        mp = out_dir / f"meta_metrics_{lr}.parquet"
+                        if mp.exists():
+                            mm = pd.read_parquet(mp)
+                            if "episode_id" in mm.columns:
+                                episodes_done_meta = sorted(mm["episode_id"].dropna().unique().tolist())
+                    except Exception:
+                        pass
+                    outputs[lr]["episodes_done"] = episodes_done_meta
+
                 manifest["steps"]["step6_meta"] = {"status": "ok", "outputs": outputs}
     else:
         logger.info("Paso 6 (Meta) deshabilitado por configuración.")
@@ -1221,6 +1303,44 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 "reason": f"missing episodes_index at {episodes_index_path}"
             }
         else:
+            # Cobertura de episodios (diagnóstico previo a EDA)
+            coverage: Dict[str, Any] = {}
+            try:
+                expected = set(pd.read_parquet(episodes_index_path)["episode_id"].unique().tolist())
+            except Exception:
+                expected = set()
+            gsc_mets = cfg.paths.gsc_out_dir / "gsc_metrics.parquet"
+            eps_gsc = set()
+            if gsc_mets.exists():
+                try:
+                    gm = pd.read_parquet(gsc_mets)
+                    if "episode_id" in gm.columns:
+                        eps_gsc = set(gm["episode_id"].unique().tolist())
+                except Exception:
+                    pass
+            eps_meta_union: set = set()
+            if "step6_meta" in manifest["steps"] and manifest["steps"]["step6_meta"].get("outputs"):
+                for lr, out in manifest["steps"]["step6_meta"]["outputs"].items():
+                    mp = Path(out["meta_metrics"])
+                    if mp.exists():
+                        try:
+                            mm = pd.read_parquet(mp)
+                            if "episode_id" in mm.columns:
+                                eps_meta_union |= set(mm["episode_id"].unique().tolist())
+                        except Exception:
+                            pass
+            available = eps_gsc | eps_meta_union
+            missing = expected - available if expected else set()
+
+            coverage = {
+                "expected": len(expected),
+                "gsc": len(eps_gsc),
+                "meta_union": len(eps_meta_union),
+                "available": len(available),
+                "missing": len(missing),
+            }
+            logger.info("Cobertura de episodios para EDA_algorithms: %s", coverage)
+
             learners_for_eda = tuple(cfg.params.eda_alg_learners) if cfg.params.eda_alg_learners else tuple(cfg.params.meta_learners)
             eda_cfg = EDAAlgConfig(
                 episodes_index=Path(episodes_index_path),
@@ -1238,9 +1358,13 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 export_pdf=cfg.params.eda_alg_export_pdf,
             )
             _safe_call(eda_alg_run, logger, cfg.fail_fast, "EDA Algorithms", cfg=eda_cfg)
-            _assert_scoped(cfg.paths.figures_dir, exp_tag, "EDA.figures_dir")
+            _assert_scoped(cfg.paths.figures_dir, exp_tag, "EDA.figures_dir", hard=cfg.hard_scope)
             _touch_fingerprint(cfg.paths.figures_dir, exp_tag)
-            manifest["steps"]["eda_algorithms"] = {"status": "ok", "figures_dir": str(cfg.paths.figures_dir)}
+            manifest["steps"]["eda_algorithms"] = {
+                "status": "ok",
+                "figures_dir": str(cfg.paths.figures_dir),
+                "coverage": coverage,
+            }
             if exp_tag:
                 stamp_pngs(cfg.paths.figures_dir, exp_tag, _short_cfg_summary(cfg.params))
     else:

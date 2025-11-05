@@ -42,6 +42,74 @@ def _env_str(name: str, default: str) -> str:
     except Exception:
         return default
 
+def _mk_episodes_index_from_pairs(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Construye un índice canónico de episodios desde un DataFrame de pairs:
+    agrega episode_id, unit_id de i y j, y longitudes de ventanas.
+    """
+    if df is None or df.empty:
+        cols = ["episode_id","i_store","i_item","j_store","j_item",
+                "i_unit","j_unit","class","pre_start","treat_start","post_start","post_end",
+                "pre_days","post_days"]
+        return pd.DataFrame(columns=cols)
+
+    out = df.copy()
+    out["treat_start"] = pd.to_datetime(out["treat_start"]).dt.normalize()
+    out["pre_start"]   = pd.to_datetime(out["pre_start"]).dt.normalize()
+    out["post_start"]  = pd.to_datetime(out["post_start"]).dt.normalize()
+    out["post_end"]    = pd.to_datetime(out["post_end"]).dt.normalize()
+
+    out["episode_id"] = out.apply(
+        lambda r: _episode_id(r["i_store"], r["i_item"], r["j_store"], r["j_item"], r["treat_start"]),
+        axis=1
+    )
+    out["i_unit"] = out["i_store"].astype(str) + ":" + out["i_item"].astype(str)
+    out["j_unit"] = out["j_store"].astype(str) + ":" + out["j_item"].astype(str)
+
+    # días efectivos (útiles para sanity checks)
+    pre_days  = (out["treat_start"] - out["pre_start"]).dt.days - int(PRE_GAP)
+    post_days = (out["post_end"] - out["post_start"]).dt.days + 1
+    out["pre_days"]  = pre_days.clip(lower=0)
+    out["post_days"] = post_days.clip(lower=0)
+
+    # canónico: 1 fila por episode_id
+    keep_cols = ["episode_id","i_store","i_item","j_store","j_item",
+                 "i_unit","j_unit","class","pre_start","treat_start","post_start","post_end",
+                 "pre_days","post_days"]
+    out = (out[keep_cols]
+             .drop_duplicates(subset=["episode_id"])
+             .sort_values(["treat_start","i_store","i_item","j_store","j_item"])
+             .reset_index(drop=True))
+    return out
+
+
+def _attach_episode_id_to_donors(donors_df: pd.DataFrame,
+                                 episodes_idx_gsc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Agrega episode_id a donors_per_victim replicando donantes por episodio del mismo j si hace falta.
+    Clave de cruce: (j_store, j_item) -> todas las apariciones en episodes_idx_gsc.
+    """
+    if donors_df is None or donors_df.empty:
+        return donors_df
+
+    base = donors_df.copy()
+    # Normalizar dtypes por seguridad
+    for c in ["j_store","j_item","donor_store","donor_item","rank"]:
+        if c in base.columns:
+            base[c] = pd.to_numeric(base[c], errors="coerce").astype("Int64")
+
+    # Join 1:N: cada (j_store,j_item) puede mapear a varios episode_id (distintas treat_start o distintos i)
+    idx = episodes_idx_gsc[["episode_id","j_store","j_item"]].copy()
+    idx["j_store"] = pd.to_numeric(idx["j_store"], errors="coerce").astype("Int64")
+    idx["j_item"]  = pd.to_numeric(idx["j_item"],  errors="coerce").astype("Int64")
+
+    out = base.merge(idx, on=["j_store","j_item"], how="left", validate="m:m")
+    # Orden estable y sin sorpresas
+    sort_cols = [c for c in ["episode_id","j_store","j_item","rank","donor_store","donor_item"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols).reset_index(drop=True)
+    return out
+
 
 # =============================================================================
 # Parámetros (idénticos + overrides por ENV)  ———  *[NEW] con flags de donantes paralelos*
@@ -1597,19 +1665,29 @@ def select_pairs_and_donors(H_csv: str, train_csv: str, items_csv: str, stores_c
     _progress_emit("write_pairs", 100.0, f"{GSC_PAIRS_FILENAME} listo ({len(pairs_df_gsc):,} filas).")
     _LOGGER.info(f"[GSC] Subconjunto para donantes: {len(pairs_df_gsc):,} filas -> {gsc_pairs_path}")
 
-# --- 4) Donantes SOLO para episodios en GSC (rápido + paralelo) ----------------
+    # Sanity check: duplicados de episodio
+    if not pairs_df_gsc.empty:
+        tmp_eids = _mk_episodes_index_from_pairs(pairs_df_gsc)
+        dups = tmp_eids.duplicated(subset=["episode_id"]).sum()
+        if dups:
+            _LOGGER.warning(f"[GSC] Episodios duplicados detectados en subset: {dups} duplicados por episode_id.")
+
+    # --- 4) Donantes SOLO para episodios en GSC (rápido + paralelo) ----------------
     donors_path = os.path.join(outdir, "donors_per_victim.csv")
+    donors_df: pd.DataFrame
 
     if SKIP_DONORS or pairs_df_gsc.empty:
         _LOGGER.warning("Saltando selección de donantes (SKIP_DONORS=1 o sin episodios GSC).")
-        donors_df = pd.DataFrame(columns=["j_store","j_item","donor_store","donor_item","donor_kind","distance","store_type","city","state","rank"])
+        donors_df = pd.DataFrame(columns=[
+            "episode_id","j_store","j_item","donor_store","donor_item",
+            "donor_kind","distance","store_type","city","state","rank"
+        ])
         _progress_emit("write_donors", 0.0, "Escribiendo donors_per_victim.csv (vacío) ...")
         donors_df.to_csv(donors_path, index=False)
         _progress_emit("write_donors", 100.0, f"donors_per_victim.csv listo (0 filas).")
     else:
         _progress_emit("select_donors", 0.0, "Seleccionando donantes por víctima (módulo externo) ...", force_log=True)
 
-        # NOTE: pasamos item_stats (perfiles), items/stores y el path de shards
         donors_df, donors_path = build_donors_for_pairs(
             H_use=H_use,
             pairs_df_gsc=pairs_df_gsc,
@@ -1622,7 +1700,32 @@ def select_pairs_and_donors(H_csv: str, train_csv: str, items_csv: str, stores_c
             progress_cb=lambda pct, msg: _progress_emit("select_donors", pct, msg)
         )
 
-        _progress_emit("write_donors", 100.0, f"donors_per_victim.csv listo ({len(donors_df):,} filas).")
+    # ------------------ NUEVO: materializar índices y enriquecer donantes ------------------
+    # Índices canónicos (Meta y GSC)
+    episodes_idx_meta = _mk_episodes_index_from_pairs(pairs_df_meta)
+    episodes_idx_gsc  = _mk_episodes_index_from_pairs(pairs_df_gsc)
+
+    epi_idx_meta_path = os.path.join(outdir, "episodes_index_meta.parquet")
+    epi_idx_gsc_path  = os.path.join(outdir, "episodes_index.parquet")  # <- usar este en TODOS los pipelines aguas abajo
+
+    try:
+        episodes_idx_meta.to_parquet(epi_idx_meta_path, index=False)
+        episodes_idx_gsc.to_parquet(epi_idx_gsc_path, index=False)
+    except Exception as e:
+        _LOGGER.warning(f"No se pudo escribir índices .parquet ({e}); guardo CSV como fallback.")
+        episodes_idx_meta.to_csv(epi_idx_meta_path.replace(".parquet", ".csv"), index=False)
+        episodes_idx_gsc.to_csv(epi_idx_gsc_path.replace(".parquet", ".csv"), index=False)
+
+    _LOGGER.info(f"[META] episodes_index_meta -> {epi_idx_meta_path} ({len(episodes_idx_meta):,} episodios)")
+    _LOGGER.info(f"[GSC ] episodes_index      -> {epi_idx_gsc_path} ({len(episodes_idx_gsc):,} episodios)")
+
+    # Agregar episode_id a donantes y re-escribirlos
+    try:
+        donors_df = _attach_episode_id_to_donors(donors_df, episodes_idx_gsc)
+        donors_df.to_csv(donors_path, index=False)
+        _LOGGER.info(f"donors_per_victim.csv enriquecido con episode_id -> {donors_path} ({len(donors_df):,} filas)")
+    except Exception as e:
+        _LOGGER.warning(f"No se pudo enriquecer donantes con episode_id: {e}")
 
     # limpieza temporal si se creó H+class
     if H_use.endswith("_with_class.tmp.csv"):

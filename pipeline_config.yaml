@@ -25,7 +25,7 @@ paths:
   preprocessed_dir: ".data/processed_data"
   figures_dir: "figures"
   exposure_csv: ".data/processed_data/competitive_exposure.csv"
-  gsc_out_dir: ".data/processed_data/gsc_outputs"
+  gsc_out_dir: ".data/processed_data"
   meta_out_root: ".data/processed_data/meta_outputs"
 
 params:

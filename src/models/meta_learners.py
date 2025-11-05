@@ -46,7 +46,6 @@ Salidas principales
   (RMSPE_pre, ATT_sum, ATT_mean, p‑value placebo en el espacio, etc.).
 - `meta_outputs/<learner>/meta_metrics_<learner>.parquet`: resumen por episodio.
 
-Autor: GPT‑5 Pro.
 """
 from __future__ import annotations
 
@@ -61,18 +60,21 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------
-# Utilidades generales y selección de features
+# Utilidades generales y selección de features (anti-fuga)
 # ---------------------------------------------------------------------
 
 EXCLUDE_BASE_COLS = {
     # Identificadores / etiquetas
     "id", "date", "year_week", "store_nbr", "item_nbr", "unit_id",
-    "family_name",
+    "family_name", "cluster_id", "w_episode",
+
     # Objetivo y tratamiento
-    "sales", "treated_unit", "treated_time", "D",
+    "sales", "treated_unit", "treated_time", "D", "is_pre", "train_mask",
+
     # Info de episodio / calidad de donantes
     "episode_id", "is_victim", "promo_share", "avail_share", "keep", "reason",
-    # Mediadores inmediatos
+
+    # Mediadores inmediatos (no usar como confounders)
     "onpromotion",
 }
 
@@ -85,12 +87,7 @@ _MIN_TRAIN_FOLD = 30     # mínimo “blando” por grupo antes de caer al model
 def select_feature_cols(df: pd.DataFrame, extra_exclude: Sequence[str] | None = None) -> List[str]:
     """
     Selecciona columnas numéricas 'seguras' como covariables X.
-    Incluye automáticamente los confounders generados en pre_algorithm.py:
-      - lags_*d, fourier_*, DOW/paydays, Fsw_log1p, F_state_excl_store_log1p, Ow,
-      - HNat/HReg/HLoc, is_bridge/is_additional/is_work_day,
-      - trend_T, available_A, Q_store_trend, month, dummies type_/cluster_/state_,
-      - promo_share_sc_* lags, promo_share_sc_excl_* lags, class_index_excl_* lags,
-      - ADI, CV2, zero_streak, sc_hat (donor‑blend PRE).
+    Incluye automáticamente confounders generados en pre (lags, Fourier, dummies, proxies, etc.).
     Excluye explícitamente etiquetas/mediadores y columnas extra solicitadas.
     """
     ex = set(EXCLUDE_BASE_COLS)
@@ -104,35 +101,36 @@ def select_feature_cols(df: pd.DataFrame, extra_exclude: Sequence[str] | None = 
             continue
         feats.append(c)
 
-    # Curar un poco el set (mantener solo columnas típicas de confounders/feats)
-    keep_prefix = (
-        c.startswith(("fourier_", "lag_", "dow_"))
-        or c in {
-            "Fsw_log1p", "F_state_excl_store_log1p", "Ow",
-            "HNat", "HReg", "HLoc", "is_bridge", "is_additional", "is_work_day",
-            "trend_T", "available_A", "Q_store_trend", "month",
-            "ADI", "CV2", "zero_streak", "sc_hat",
-            "promo_share_sc_l7", "promo_share_sc_l14",
-            "promo_share_sc_excl_l7", "promo_share_sc_excl_l14",
-            "class_index_excl_l7", "class_index_excl_l14",
-        }
-        or c.startswith(("type_", "cluster_", "state_"))
-    )
-    feats = [c for c in feats if (c.startswith(("fourier_", "lag_", "dow_", "type_", "cluster_", "state_"))
-                                  or c in {
-                                      "Fsw_log1p", "F_state_excl_store_log1p", "Ow",
-                                      "HNat", "HReg", "HLoc", "is_bridge", "is_additional", "is_work_day",
-                                      "trend_T", "available_A", "Q_store_trend", "month",
-                                      "ADI", "CV2", "zero_streak", "sc_hat",
-                                      "promo_share_sc_l7", "promo_share_sc_l14",
-                                      "promo_share_sc_excl_l7", "promo_share_sc_excl_l14",
-                                      "class_index_excl_l7", "class_index_excl_l14",
-                                  })]
+    # Mantener columnas típicas de confounders/feats
+    keep = set([
+        "Fsw_log1p", "F_state_excl_store_log1p", "Ow",
+        "HNat", "HReg", "HLoc", "is_bridge", "is_additional", "is_work_day",
+        "available_A", "month", "ADI", "CV2", "zero_streak", "sc_hat",
+        "promo_share_sc_l7", "promo_share_sc_l14",
+        "promo_share_sc_excl_l7", "promo_share_sc_excl_l14",
+        "class_index_excl_l7", "class_index_excl_l14",
+    ])
+    feats = [c for c in feats if (c.startswith(("fourier_", "lag_", "dow_", "type_", "cluster_", "state_")) or c in keep)]
     feats = sorted(list(dict.fromkeys(feats)))
     if not feats:
         raise ValueError("No se encontraron features válidos. Revisa las columnas del parquet meta.")
     return feats
 
+from dataclasses import field  # si el archivo define dataclasses con default_factory
+def _data_root() -> Path:
+    """
+    Prefiere ./.data; si no existe, intenta ./data; y por último crea ./.data.
+    """
+    for cand in (Path("./.data"), Path("./data")):
+        try:
+            if cand.exists():
+                return cand
+        except Exception:
+            pass
+    return Path("./.data")
+
+def _fig_root() -> Path:
+    return Path("./figures")
 
 def _as_datetime(s: pd.Series) -> pd.Series:
     if np.issubdtype(s.dtype, np.datetime64):
@@ -414,7 +412,7 @@ def _build_augmented_matrices(df: pd.DataFrame,
 
     return X_tr_aug, X_va_aug, y_tr, y_va, sample_weight_tr, is_count
 
-    # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # HPO con Optuna (global, antes del cross-fitting) usando CV purgada
 # ---------------------------------------------------------------------
 
@@ -445,7 +443,7 @@ def _time_cv_score(meta_df: pd.DataFrame,
         # Objetivo según la naturaleza del target
         model_params = dict(model_kwargs)
         if "objective" not in model_params and "loss" not in model_params:
-            if build_model_fn.__name__.endswith("make_regressor") or True:
+            if build_model_fn.__name__.endswith("make_regressor"):
                 if is_count:
                     model_params.update({"objective": "poisson", "loss": "poisson"})
         model = build_model_fn(**model_params)
@@ -459,7 +457,6 @@ def _time_cv_score(meta_df: pd.DataFrame,
             scores.append(1e3)  # penaliza
 
     return float(np.mean(scores)) if scores else np.inf
-
 
 def tune_hyperparams(meta_df: pd.DataFrame, feats: List[str], cfg_model: str,
                      random_state: int, cv_folds: int, cv_holdout_days: int,
@@ -552,10 +549,11 @@ class TrainCfg:
     # sensibilidad
     sens_samples: int = 0
     # --- Tratamientos configurables ---
-    treat_col_s: str = "D"            # S-learner: por defecto usa D (si tienes H_disc, pásalo por CLI)
+    treat_col_s: str = "D"            # S-learner: por defecto usa D
     s_ref: float = 0.0                # baseline de referencia para S-learner
-    treat_col_b: str = "D"            # T/X: por defecto usa D (si tienes H_prop, pásalo por CLI)
+    treat_col_b: str = "D"            # T/X: por defecto usa D
     bin_threshold: float = 0.0        # umbral para binarizar treat_col_b si no es 0/1
+    cover_all_time: bool = True  # NUEVO
 
 
 def _build_X(df: pd.DataFrame, feats: List[str]) -> np.ndarray:
@@ -563,6 +561,20 @@ def _build_X(df: pd.DataFrame, feats: List[str]) -> np.ndarray:
     X[np.isnan(X)] = 0.0
     return X
 
+def make_time_folds(dates: pd.Series, holdout_days: int, folds: int, cover_all: bool = False) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    d_unique = _sorted_unique(_as_datetime(dates))
+    if not d_unique: return []
+    H = int(max(1, holdout_days))
+    if not cover_all:
+        total = H * int(max(1, folds))
+        start_idx = max(0, len(d_unique) - total)
+        return [(d_unique[start_idx + k*H], d_unique[min(len(d_unique)-1, start_idx + (k+1)*H - 1)])
+                for k in range(int(max(1, folds)))]
+    windows = []
+    for s in range(0, max(1, len(d_unique) - H + 1), H):
+        e = min(len(d_unique) - 1, s + H - 1)
+        windows.append((d_unique[s], d_unique[e]))
+    return windows
 
 def crossfit_predictions(df: pd.DataFrame, feats: List[str], cfg: TrainCfg) -> Dict[str, np.ndarray]:
     """
@@ -592,7 +604,7 @@ def crossfit_predictions(df: pd.DataFrame, feats: List[str], cfg: TrainCfg) -> D
     mu1_cf = np.full_like(y, np.nan, dtype=float)
     tau_cf = np.full_like(y, np.nan, dtype=float)
 
-    windows = make_time_folds(dates, cfg.cv_holdout_days, cfg.cv_folds)
+    windows = make_time_folds(dates, cfg.cv_holdout_days, cfg.cv_folds, cover_all=cfg.cover_all_time)
     if not windows:
         logging.warning("No se pudieron construir ventanas de CV temporal; se harán refits completos sin cross-fitting.")
         windows = []
@@ -739,7 +751,6 @@ def crossfit_predictions(df: pd.DataFrame, feats: List[str], cfg: TrainCfg) -> D
 
     # -------- Refit completo (operativo) --------
     # Construcción de features enriquecidas a nivel global (sin gap)
-    # (Solo para completar huecos; las métricas usan las CF)
     X_full = _build_X(df, feats)
     X_full[np.isnan(X_full)] = 0.0
     y_full = y
@@ -1040,7 +1051,6 @@ def loo_retrain_if_requested(meta_df: pd.DataFrame,
 
     return pd.DataFrame(rows)
 
-
 def sensitivity_sweep(meta_df: pd.DataFrame,
                       feats: List[str],
                       cfg: TrainCfg,
@@ -1082,11 +1092,11 @@ def sensitivity_sweep(meta_df: pd.DataFrame,
 class RunCfg:
     learner: str = "x"  # 't'|'s'|'x'
     # Entrena SIEMPRE con este parquet grande:
-    meta_parquet: Path = Path("./data/processed/meta/all_units.parquet")
+    meta_parquet: Path = field(default_factory=_data_root) / "meta/all_units.parquet"
     # Evalúa SOLO sobre los episodios de este índice (pequeños, usados por GSC):
-    episodes_index: Path = Path("./data/processed/episodes_index.parquet")
-    donors_csv: Path = Path("./data/processed_data/donors_per_victim.csv")
-    out_dir: Path = Path("./data/processed/meta_outputs/x")
+    episodes_index: Path = field(default_factory=_data_root) / "episodes_index.parquet"
+    donors_csv: Path = field(default_factory=_data_root) / "donors_per_victim.csv"
+    out_dir: Optional[Path] = None
     log_level: str = "INFO"
     max_episodes: Optional[int] = None
 
@@ -1095,7 +1105,7 @@ class RunCfg:
     cv_holdout_days: int = 21
     min_train_samples: int = 50
 
-    # modelo base (default actualizado a 'lgbm')
+    # modelo base (default 'lgbm')
     model: str = "lgbm"
     prop_model: str = "logit"
     random_state: int = 42
@@ -1126,7 +1136,25 @@ class RunCfg:
     s_ref: float = 0.0
     treat_col_b: str = "D"   # T/X (binario)
     bin_threshold: float = 0.0
+    exp_tag: Optional[str] = None
+    fig_root: Path = field(default_factory=_fig_root)
 
+
+from dataclasses import field  # si el archivo define dataclasses con default_factory
+def _data_root() -> Path:
+    """
+    Prefiere ./.data; si no existe, intenta ./data; y por último crea ./.data.
+    """
+    for cand in (Path("./.data"), Path("./data")):
+        try:
+            if cand.exists():
+                return cand
+        except Exception:
+            pass
+    return Path("./.data")
+
+def _fig_root() -> Path:
+    return Path("./figures")
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
@@ -1140,6 +1168,20 @@ def _load_meta_df(p: Path) -> pd.DataFrame:
         df["D"] = pd.to_numeric(df["D"], errors="coerce").fillna(0).astype(int)
     if "unit_id" not in df.columns:
         df["unit_id"] = df["store_nbr"].astype(str) + ":" + df["item_nbr"].astype(str)
+
+    # Unicidad por (unit_id,date)
+    before = df.shape[0]
+    df = df.sort_values(["unit_id", "date"]).drop_duplicates(["unit_id", "date"], keep="last")
+    after = df.shape[0]
+    if after < before:
+        logging.warning("Se detectaron y limpiaron %d duplicados por (unit_id,date).", before - after)
+
+    # NUEVO: rezago seguro de disponibilidad
+    if "available_A" in df.columns and "available_A_l1" not in df.columns:
+        df["available_A_l1"] = (
+            df.groupby("unit_id", observed=False)["available_A"].shift(1).astype("float32")
+        )
+
     return df
 
 
@@ -1180,12 +1222,22 @@ def run_episode(meta_df: pd.DataFrame,
     """
     Ejecuta el learner elegido y genera artefactos/métricas por episodio.
     Usa pred_cache si ya existe (para no recalcular cross-fitting global).
+
+    --- FIX CRÍTICO ---
+    Filtramos PRIMERO por episode_id y alineamos las predicciones usando el MISMO índice,
+    para evitar mezclar filas de otros episodios del mismo unit_id en las series del CF.
+    Este bug explicaba por qué la línea azul (observado) parecía "de otro episodio"
+    aunque el contrafactual se viera razonable; se observaba en los reportes Meta con
+    grandes valores de 'dup_dates_fixed' frente a GSC donde era 0.  :contentReference[oaicite:0]{index=0} :contentReference[oaicite:1]{index=1} :contentReference[oaicite:2]{index=2}
     """
+
+    # --- Identificadores del episodio / víctima ---
     j_store, j_item = int(ep_row["j_store"]), int(ep_row["j_item"])
     victim_uid = f"{j_store}:{j_item}"
     treat_start, post_end = ep_row["treat_start"], ep_row["post_end"]
+    ep_id = str(ep_row["episode_id"]) if "episode_id" in ep_row else f"{j_store}-{j_item}_{pd.to_datetime(treat_start).strftime('%Y%m%d')}"
 
-    # Config de entrenamiento (incluyendo columnas de tratamiento)
+    # --- Config de entrenamiento (incluyendo columnas de tratamiento) ---
     tcfg = TrainCfg(learner=cfg.learner, model=cfg.model, prop_model=cfg.prop_model,
                     random_state=cfg.random_state, cv_folds=cfg.cv_folds,
                     cv_holdout_days=cfg.cv_holdout_days, min_train_samples=cfg.min_train_samples,
@@ -1197,28 +1249,57 @@ def run_episode(meta_df: pd.DataFrame,
                     treat_col_s=cfg.treat_col_s, s_ref=cfg.s_ref,
                     treat_col_b=cfg.treat_col_b, bin_threshold=cfg.bin_threshold)
 
-    # Predicciones cross-fitted globales (una sola vez por corrida)
+    # --- Predicciones cross-fitted globales (una sola vez por corrida) ---
     if pred_cache is None or not pred_cache:
         pred_cache = crossfit_predictions(meta_df, feats, tcfg)
 
-    # Armar DF con predicciones
-    dfp = meta_df[["unit_id", "date", "sales", "D", "treated_unit", "treated_time"]].copy()
-    dfp["mu0_hat"] = pred_cache["mu0_cf"]
-    dfp["mu1_hat"] = pred_cache["mu1_cf"]
-    dfp["tau_hat"] = pred_cache["tau_cf"]
+    # --- NUEVO: recortar el parquet GRANDE AL EPISODIO ACTUAL y alinear predicciones por índice ---
+    if "episode_id" not in meta_df.columns:
+        logging.warning(f"[{ep_id}] meta_df no tiene 'episode_id'; se caerá a filtro legacy por unit_id+fechas (menos robusto).")
+        ep_mask = (meta_df["unit_id"] == victim_uid) & meta_df["date"].between(ep_row["pre_start"], post_end, inclusive="both")
+    else:
+        ep_mask = meta_df["episode_id"].astype(str).eq(ep_id)
 
-    # Serie contrafactual de la víctima
+    if not np.any(ep_mask):
+        raise ValueError(f"[{ep_id}] No hay filas en meta_df para este episode_id (revisa origen de windows.parquet).")
+
+    idx = meta_df.index[ep_mask]
+    dfp = meta_df.loc[idx, ["episode_id", "unit_id", "date", "sales", "D", "treated_unit", "treated_time"]].copy()
+
+    # Inyectar predicciones usando el MISMO índice del subset del episodio
+    dfp["mu0_hat"] = pred_cache["mu0_cf"][idx]
+    dfp["mu1_hat"] = pred_cache["mu1_cf"][idx]
+    dfp["tau_hat"] = pred_cache["tau_cf"][idx]
+
+    # --- Serie de la víctima dentro del episodio/ventana ---
     vmask = (dfp["unit_id"] == victim_uid) & dfp["date"].between(ep_row["pre_start"], post_end, inclusive="both")
     vpre = vmask & (dfp["date"] < treat_start)
     vpost = vmask & (dfp["date"] >= treat_start)
 
-    # --- calibración baseline en pre ---
+    # Guardia: unicidad por fecha (no debería haber duplicados tras filtrar por episodio)
+    dup_count = int(dfp.loc[vmask, ["date"]].duplicated().sum())
+    if dup_count > 0:
+        logging.warning(f"[{ep_id}] (unit {victim_uid}) fechas duplicadas dentro del episodio: {dup_count}. Se resolverán conservando la última por fecha.")
+        # Resolver por fecha
+        ord_cols = ["date", "treated_time", "D"]
+        keep_cols = [c for c in ["episode_id", "unit_id", "date", "sales", "D", "treated_unit", "treated_time",
+                                 "mu0_hat", "mu1_hat", "tau_hat"] if c in dfp.columns]
+        dfp = (dfp.sort_values(ord_cols)
+                  .groupby(["episode_id", "unit_id", "date"], as_index=False)[keep_cols].last())
+
+        # Recalcular máscaras tras el groupby
+        vmask = (dfp["unit_id"] == victim_uid) & dfp["date"].between(ep_row["pre_start"], post_end, inclusive="both")
+        vpre = vmask & (dfp["date"] < treat_start)
+        vpost = vmask & (dfp["date"] >= treat_start)
+
+    # --- Calibración baseline en PRE (OLS: y_obs ≈ a + b * mu0_hat) ---
     y_obs_pre = dfp.loc[vpre, "sales"].to_numpy(dtype=float)
     y_hat_pre = dfp.loc[vpre, "mu0_hat"].to_numpy(dtype=float)
     a_cal, b_cal = _ols_calibrate(y_obs_pre, y_hat_pre)
     dfp.loc[vmask, "mu0_hat"] = a_cal + b_cal * dfp.loc[vmask, "mu0_hat"]
 
-    y_obs_pre = dfp.loc[vpre, "sales"].to_numpy(dtype=float)  # recalcular métricas con baseline calibrada
+    # --- Métricas (con baseline calibrada) ---
+    y_obs_pre = dfp.loc[vpre, "sales"].to_numpy(dtype=float)
     y_hat_pre = dfp.loc[vpre, "mu0_hat"].to_numpy(dtype=float)
     y_obs_post = dfp.loc[vpost, "sales"].to_numpy(dtype=float)
     y_hat_post = dfp.loc[vpost, "mu0_hat"].to_numpy(dtype=float)
@@ -1230,21 +1311,29 @@ def run_episode(meta_df: pd.DataFrame,
     att_mean = float(np.nanmean(effect_post)) if effect_post.size else np.nan
     rel_att = _safe_pct(att_mean, float(np.nanmean(y_obs_pre)) if y_obs_pre.size else np.nan)
 
-    # Guardar serie cf
-    cf_dir = Path(cfg.out_dir) / "cf_series"; _ensure_dir(cf_dir)
-    cf = dfp.loc[vmask, ["date", "sales", "mu0_hat", "mu1_hat", "tau_hat", "D", "treated_time"]].copy()
+    # --- Guardar serie CF (víctima, con episode_id para trazabilidad) ---
+    cf_dir = Path(cfg.out_dir) / "cf_series"
+    _ensure_dir(cf_dir)
+
+    cf = dfp.loc[vmask, ["episode_id", "unit_id", "date", "sales", "mu0_hat", "mu1_hat", "tau_hat", "D", "treated_time"]].copy()
     cf = cf.sort_values("date")
+    # (por seguridad) unicidad por fecha dentro del episodio
+    if not cf["date"].is_unique:
+        cf = cf.groupby("date", as_index=False).last()
+
     cf["effect"] = cf["sales"] - cf["mu0_hat"]
     is_post = cf["date"] >= treat_start
     cf["cum_effect"] = (cf["effect"].where(is_post, 0.0)).cumsum()
-    ep_id = str(ep_row["episode_id"]) if "episode_id" in ep_row else f"{j_store}-{j_item}_{pd.to_datetime(treat_start).strftime('%Y%m%d')}"
+
     cf_path = cf_dir / f"{ep_id}_cf.parquet"
     cf.to_parquet(cf_path, index=False)
 
-    # Placebo en el espacio
-    plac_dir = Path(cfg.out_dir) / "placebos"; _ensure_dir(plac_dir)
+    # --- Placebo en el espacio (usando sólo filas del episodio recortado) ---
+    plac_dir = Path(cfg.out_dir) / "placebos"
+    _ensure_dir(plac_dir)
     pval_space = np.nan
     if cfg.do_placebo_space:
+        # ep_rows: todo el episodio (víctima + (opcional) donantes si están en meta_units)
         ep_rows = dfp.loc[dfp["date"].between(ep_row["pre_start"], post_end, inclusive="both")].copy()
         ps = placebo_space_meta(ep_rows, donors_df, (j_store, j_item), treat_start, post_end)
         ps["episode_id"] = ep_id
@@ -1255,7 +1344,7 @@ def run_episode(meta_df: pd.DataFrame,
     else:
         ps_path = None
 
-    # Placebo in-time
+    # --- Placebo in-time (sobre la víctima) ---
     if cfg.do_placebo_time:
         pt = placebo_time_victim(ep_rows if cfg.do_placebo_space else dfp, treat_start, post_end, victim_uid)
         pt["episode_id"] = ep_id
@@ -1264,9 +1353,11 @@ def run_episode(meta_df: pd.DataFrame,
     else:
         pt_path = None
 
-    # LOO (opcional y costoso)
-    loo_dir = Path(cfg.out_dir) / "loo"; _ensure_dir(loo_dir)
-    loo_sd = np.nan; loo_range = np.nan
+    # --- LOO (opcional y costoso) ---
+    loo_dir = Path(cfg.out_dir) / "loo"
+    _ensure_dir(loo_dir)
+    loo_sd = np.nan
+    loo_range = np.nan
     if cfg.do_loo:
         ep_f = pd.DataFrame([{"pre_start": ep_row["pre_start"], "treat_start": treat_start, "post_end": post_end}])
         tcfg_local = TrainCfg(**asdict(tcfg))
@@ -1282,8 +1373,9 @@ def run_episode(meta_df: pd.DataFrame,
     else:
         loo_path = None
 
-    # Sensibilidad (opcional)
-    sens_dir = Path(cfg.out_dir) / "sensitivity"; _ensure_dir(sens_dir)
+    # --- Sensibilidad (opcional) ---
+    sens_dir = Path(cfg.out_dir) / "sensitivity"
+    _ensure_dir(sens_dir)
     sens_sd = np.nan
     if int(cfg.sens_samples) > 0:
         sens = sensitivity_sweep(meta_df, feats, tcfg, victim_uid, treat_start, post_end, n_samples=int(cfg.sens_samples))
@@ -1297,8 +1389,9 @@ def run_episode(meta_df: pd.DataFrame,
     else:
         sens_path = None
 
-    # Reporte JSON
-    rep_dir = Path(cfg.out_dir) / "reports"; _ensure_dir(rep_dir)
+    # --- Reporte JSON por episodio ---
+    rep_dir = Path(cfg.out_dir) / "reports"
+    _ensure_dir(rep_dir)
     rep = {
         "episode_id": ep_id,
         "victim_unit": victim_uid,
@@ -1321,13 +1414,17 @@ def run_episode(meta_df: pd.DataFrame,
     with open(rep_dir / f"{ep_id}.json", "w", encoding="utf-8") as f:
         json.dump(rep, f, ensure_ascii=False, indent=2)
 
-    # Resumen para meta_metrics_<learner>.parquet
+    # --- Resumen para meta_metrics_<learner>.parquet ---
+    n_pre_days = int(pd.Series(dfp.loc[vpre, "date"]).nunique())
+    n_post_days = int(pd.Series(dfp.loc[vpost, "date"]).nunique())
+    # Si hubo groupby por duplicados, n_pre_days/n_post_days ya reflejan unicidad
+
     summary = {
         "episode_id": ep_id,
         "victim_unit": victim_uid,
         "learner": cfg.learner,
-        "n_pre_days": int(vpre.sum()),
-        "n_post_days": int(vpost.sum()),
+        "n_pre_days": n_pre_days,
+        "n_post_days": n_post_days,
         "rmspe_pre": rmspe_pre,
         "mae_pre": mae_pre,
         "att_mean": att_mean,
@@ -1345,13 +1442,23 @@ def run_batch(cfg: RunCfg) -> None:
     logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO),
                         format="%(asctime)s | %(levelname)s | %(message)s",
                         datefmt="%Y-%m-%d %H:%M:%S")
-
+    if cfg.out_dir is None:
+        cfg.out_dir = (cfg.meta_dir / cfg.exp_tag / "meta" / cfg.learner).resolve()
     # Cargar insumos
     meta_df = _load_meta_df(Path(cfg.meta_parquet))
     episodes = _load_episodes(Path(cfg.episodes_index))
-    donors = _load_donors(Path(cfg.donors_csv))
+    if (episodes is None or episodes.empty) and cfg.exp_tag:
+        alt_ep = Path("figures") / cfg.exp_tag / "tables" / "episodes_index.parquet"
+        if alt_ep.exists():
+            episodes = _load_episodes(alt_ep)
 
-    # Selección de features (excluye columnas de tratamiento para evitar leakage)
+    donors = _load_donors(Path(cfg.donors_csv))
+    if (donors is None or donors.empty) and cfg.exp_tag:
+        alt_dn = Path("figures") / cfg.exp_tag / "tables" / "donors_per_victim.csv"
+        if alt_dn.exists():
+            donors = _load_donors(alt_dn)
+
+    # Selección de features (excluye columnas de tratamiento/etiquetas para evitar leakage)
     feats = select_feature_cols(meta_df, extra_exclude=[cfg.treat_col_s, cfg.treat_col_b])
     logging.info(f"Features seleccionadas ({len(feats)}): {feats[:8]}{' ...' if len(feats) > 8 else ''}")
 
@@ -1422,7 +1529,6 @@ def run_batch(cfg: RunCfg) -> None:
 
     # Iterar episodios (SOLO los del set pequeño que usarás en GSC)
     summaries = []
-    # Después de cargar episodes
     order_cols = [c for c in ["treat_start", "j_store", "j_item"] if c in episodes.columns]
     if order_cols:
         episodes = episodes.sort_values(order_cols, kind="mergesort").reset_index(drop=True)
@@ -1460,10 +1566,10 @@ def parse_args() -> RunCfg:
     )
 
     p.add_argument("--learner", type=str, default="x", choices=["t", "s", "x"], help="Tipo de meta-learner.")
-    p.add_argument("--meta_parquet", type=str, default="./data/processed/meta/all_units.parquet", help="Parquet GRANDE de entrenamiento.")
-    p.add_argument("--episodes_index", type=str, default="./data/processed/episodes_index.parquet", help="Índice de episodios (pequeño, usado en GSC).")
-    p.add_argument("--donors_csv", type=str, default="./data/processed_data/donors_per_victim.csv", help="Donantes por víctima (coherente con episodes_index).")
-    p.add_argument("--out_dir", type=str, default="./data/processed/meta_outputs/x")
+    p.add_argument("--meta_parquet", type=str, default=str(_data_dir / "meta" / "all_units.parquet"))
+    p.add_argument("--episodes_index", type=str, default=str(_data_dir / "meta" / "episodes_index.parquet"))
+    p.add_argument("--donors_csv", type=str, default=str(_data_dir / "meta" / "donors_per_victim.csv"))
+    p.add_argument("--out_dir", type=str, default=None)
     p.add_argument("--log_level", type=str, default="INFO")
     p.add_argument("--max_episodes", type=int, default=None)
 
@@ -1503,6 +1609,7 @@ def parse_args() -> RunCfg:
     p.add_argument("--s_ref", type=float, default=0.0, help="Valor de referencia (baseline) para S-learner.")
     p.add_argument("--treat_col_b", type=str, default="D", help="Columna de tratamiento binario para T/X-learners (por defecto D).")
     p.add_argument("--bin_threshold", type=float, default=0.0, help="Umbral para binarizar treat_col_b si no es 0/1.")
+    p.add_argument("--exp_tag", type=str, default="A_base")
 
     a = p.parse_args()
     return RunCfg(
@@ -1510,7 +1617,7 @@ def parse_args() -> RunCfg:
         meta_parquet=Path(a.meta_parquet),
         episodes_index=Path(a.episodes_index),
         donors_csv=Path(a.donors_csv),
-        out_dir=Path(a.out_dir),
+        out_dir=out_dir,
         log_level=a.log_level,
         max_episodes=a.max_episodes,
         cv_folds=a.cv_folds,
@@ -1541,7 +1648,8 @@ def parse_args() -> RunCfg:
         treat_col_s=a.treat_col_s,
         s_ref=a.s_ref,
         treat_col_b=a.treat_col_b,
-        bin_threshold=a.bin_threshold
+        bin_threshold=a.bin_threshold,
+        exp_tag=a.exp_tag,
     )
 
 

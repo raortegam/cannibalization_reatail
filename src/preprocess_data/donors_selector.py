@@ -18,10 +18,10 @@ Módulo autónomo para seleccionar donantes por episodio (GSC), optimizado y par
 Entrada principal: `build_donors_for_pairs(...)`.
 
 """
+# models/donors_selector.py
 from __future__ import annotations
 import os
 import math
-import gzip
 import logging
 import time
 from typing import Dict, List, Optional, Tuple, Callable
@@ -50,20 +50,15 @@ def _env_bool(name: str, default: bool) -> bool:
     return bool(_env_int(name, 1 if default else 0))
 
 # ---------------------------------------------------------------------
-# Parámetros (mismos nombres de ENV que usas en el pipeline)
+# Parámetros
 # ---------------------------------------------------------------------
-# I/O
 CHUNK_H                = _env_int("SPD_CHUNK_H", 10_000_000)
-
-# Ventanas (solo usamos PRE_GAP para cerrar la PRE)
 PRE_GAP                = _env_int("SPD_PRE_GAP", 7)
 
-# Paralelismo (defaults pensados para tu máquina: 12 cores, 64GB)
 DONORS_PARALLEL        = _env_bool("SPD_DONORS_PARALLEL", True)
 DONORS_N_CORES         = max(1, min(_env_int("SPD_DONORS_N_CORES", 12), os.cpu_count() or 1))
 DONORS_CHUNKSIZE       = _env_int("SPD_DONORS_CHUNKSIZE", 1)
 
-# Selección y scoring
 N_DONORS_PER_J         = _env_int("SPD_N_DONORS_PER_J", 10)
 SPD_DONOR_PRESELECT_TOP_K  = _env_int("SPD_DONOR_PRESELECT_TOP_K", 120)
 SPD_DONOR_SAME_ITEM_RATIO  = _env_float("SPD_DONOR_SAME_ITEM_RATIO", 0.6)
@@ -75,7 +70,9 @@ SPD_DONOR_PRE_MIN_LEVEL    = _env_float("SPD_DONOR_PRE_MIN_LEVEL", 0.0)
 SPD_DONOR_LEVEL_BAND_PCT   = _env_float("SPD_DONOR_LEVEL_BAND_PCT", 0.5)
 SPD_DONOR_COMBO_ALPHA      = _env_float("SPD_DONOR_COMBO_ALPHA", 0.5)
 
-# Caché LRU de grupos (más alto reduce lecturas repetidas)
+# Evitar donantes en la tienda caníbal (misma CLASE) si está disponible esa info
+SPD_AVOID_CANNIBAL_STORE   = _env_bool("SPD_AVOID_CANNIBAL_STORE", True)
+
 SPD_MAX_HSC_CACHE      = _env_int("SPD_MAX_HSC_CACHE", 32)
 
 # ---------------------------------------------------------------------
@@ -85,7 +82,6 @@ _LOGGER = logging.getLogger("donors_selector"); _LOGGER.addHandler(logging.NullH
 def _log_setup_from_parent(logger: Optional[logging.Logger]) -> logging.Logger:
     if logger is not None:
         return logger
-    # fallback local si no viene logger del caller
     if not _LOGGER.handlers:
         sh = logging.StreamHandler()
         sh.setFormatter(logging.Formatter("[%(asctime)s][%(processName)s][%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
@@ -97,8 +93,7 @@ def _emit_progress(cb: Optional[Callable[[float, str], None]], pct: float, msg: 
     pct = max(0.0, min(100.0, float(pct)))
     if cb:
         try:
-            cb(pct, msg)
-            return
+            cb(pct, msg); return
         except Exception:
             pass
     logger.info(f"[DONORS] {pct:5.1f}%  {msg}")
@@ -136,7 +131,7 @@ def _lru_touch(key: Tuple[str,int,int]):
             _PROC_HSC_CACHE.pop(old, None)
 
 # ---------------------------------------------------------------------
-# Lecturas/grupo (solo lo necesario para donantes)
+# Lecturas/grupo
 # ---------------------------------------------------------------------
 def _read_H_store_df(h_use: str, store_nbr: int) -> pd.DataFrame:
     dtypesH = {"store_nbr":"int16","item_nbr":"int32","class":"int16","H_bin":"int8"}
@@ -195,12 +190,10 @@ def _get_H_group_cache(h_use: str, store_nbr: int, cls: int) -> Dict:
 # ---------------------------------------------------------------------
 def _pre_stats_batch(g: Dict, items_list: List[int],
                      pre_start: pd.Timestamp, treat_start: pd.Timestamp) -> pd.DataFrame:
-    """Vectoriza stats PRE para varios items en el mismo (store,class)."""
     if g["Hmat"].size == 0 or not items_list:
         return pd.DataFrame(columns=["item_nbr","pre_mean","pre_sd","pre_min","coverage"])
     dates_np = g["dates_np"]; H = g["Hmat"]; all_items = g["items"]
     pre_end = (pd.Timestamp(treat_start) - pd.Timedelta(days=PRE_GAP+1)).normalize()
-    # ventana PRE: [pre_start, treat_start - PRE_GAP - 1]
     s = np.datetime64(pd.Timestamp(pre_start).normalize())
     e = np.datetime64(pre_end)
     mask = np.zeros(len(dates_np), dtype=bool)
@@ -219,7 +212,7 @@ def _pre_stats_batch(g: Dict, items_list: List[int],
     items_arr = np.array(items_list, dtype=np.int32)[valid]
     col_idx = np.array([c for c in cols if c >= 0], dtype=int)
 
-    X = H[:, col_idx]  # T x K
+    X = H[:, col_idx]
     val = np.isfinite(X)
     pre_val = val & mask[:, None]
     n_in = int(mask.sum())
@@ -262,6 +255,8 @@ def _donors_for_episode_worker(ep: Dict) -> List[Dict]:
     s = int(ep["j_store"]); j = int(ep["j_item"]); c = int(ep["class"])
     pre_start = pd.Timestamp(ep["pre_start"])
     treat_start = pd.Timestamp(ep["treat_start"])
+    # opcionales (para evitar contaminación espacial)
+    i_store = int(ep["i_store"]) if "i_store" in ep and pd.notna(ep["i_store"]) else None
 
     rows: List[Dict] = []
 
@@ -273,7 +268,7 @@ def _donors_for_episode_worker(ep: Dict) -> List[Dict]:
     tgt = np.array([pj["h_mean"], pj["h_sd"], pj["p_any"]], dtype=float)
     w = np.array([0.5, 0.2, 0.3], dtype=float)
 
-    # Media PRE de la víctima (para calibrar nivel)
+    # Media PRE víctima (para nivel)
     g_j = _get_H_group_cache(H_use, s, c)
     st_victim = _pre_stats_batch(g_j, [j], pre_start, treat_start)
     j_pre_mean = None if st_victim.empty else float(st_victim["pre_mean"].iloc[0])
@@ -281,6 +276,8 @@ def _donors_for_episode_worker(ep: Dict) -> List[Dict]:
     # SAME_ITEM (mismo SKU en otras tiendas)
     cand_si = profiles[profiles["item_nbr"]==j].merge(stores, on="store_nbr", how="left")
     cand_si = cand_si[cand_si["store_nbr"] != s]
+    if SPD_AVOID_CANNIBAL_STORE and i_store is not None:
+        cand_si = cand_si[cand_si["store_nbr"] != int(i_store)]
     same_item_selected = pd.DataFrame()
 
     if not cand_si.empty:
@@ -343,11 +340,13 @@ def _donors_for_episode_worker(ep: Dict) -> List[Dict]:
             })
             rank += 1
 
-    # SAME_CLASS (misma clase, otras tiendas)
+    # SAME_CLASS (misma clase, otras tiendas; además evitamos la TIENDA CANÍBAL si se conoce)
     remaining = max(0, N_DONORS_PER_J - (rank - 1))
     if remaining > 0:
         prof_sc = profiles[(profiles["class"]==c) & (profiles["store_nbr"]!=s) & (profiles["item_nbr"]!=j)] \
                     .merge(_GLOBALS["STORES"], on="store_nbr", how="left")  # type: ignore
+        if SPD_AVOID_CANNIBAL_STORE and i_store is not None:
+            prof_sc = prof_sc[prof_sc["store_nbr"] != int(i_store)]
         if not prof_sc.empty:
             Xc = prof_sc[["h_mean","h_sd","p_any"]].to_numpy(dtype=float, copy=False)
             dc = np.sqrt(((Xc - tgt) ** 2 * w).sum(axis=1))
@@ -414,15 +413,20 @@ def build_donors_for_pairs(*,
                            items_df: pd.DataFrame,
                            stores_df: pd.DataFrame,
                            item_stats_df: pd.DataFrame,
-                           outdir: str,
+                           outdir: Optional[str] = None,
                            shard_dir: Optional[str] = None,
                            logger: Optional[logging.Logger] = None,
-                           progress_cb: Optional[Callable[[float, str], None]] = None
+                           progress_cb: Optional[Callable[[float, str], None]] = None,
+                           exp_tag: Optional[str] = None,
                            ) -> Tuple[pd.DataFrame, str]:
     """
     Devuelve (donors_df, donors_csv_path) y escribe donors_per_victim.csv
     para los episodios contenidos en pairs_df_gsc.
     """
+    if exp_tag:
+        outdir = os.path.join("figures", str(exp_tag), "tables")
+    outdir = outdir or os.path.join("figures", "default", "tables")
+    os.makedirs(outdir, exist_ok=True)
     log = _log_setup_from_parent(logger)
     t0 = time.time()
 
@@ -431,12 +435,14 @@ def build_donors_for_pairs(*,
         items_df[["item_nbr","class"]], on="item_nbr", how="left"
     )
 
-    # Conformar episodios (dicts livianos para el pool)
-    eps = [
-        {k: (pd.Timestamp(v).date() if isinstance(v, (pd.Timestamp, pd._libs.tslibs.timestamps.Timestamp)) else v)
-         for k, v in row.to_dict().items()}
-        for _, row in pairs_df_gsc.iterrows()
-    ]
+    # Episodios como dicts (conservar i_store/i_item si están)
+    eps = []
+    for _, row in pairs_df_gsc.iterrows():
+        d = row.to_dict()
+        for k in ["pre_start","treat_start","post_start","post_end"]:
+            if k in d:
+                d[k] = pd.Timestamp(d[k]).date()
+        eps.append(d)
 
     donors_rows_all: List[List[Dict]] = []
 

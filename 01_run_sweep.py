@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -9,8 +10,21 @@ Uso (Windows):
 o
     python 01_run_sweep.py --experiments .\experiments.yaml --only A_base
 """
-from __future__ import annotations
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+01_run_sweep.py
+Ejecuta múltiples iteraciones del pipeline a partir de 'experiments.yaml'.
 
+Uso (Windows):
+    py -3 01_run_sweep.py --experiments .\experiments.yaml --only A_base
+o
+    python 01_run_sweep.py --experiments .\experiments.yaml --only A_base
+
+Sugerencias:
+    # correr limpio (borra salidas del exp_tag antes de cada iteración)
+    python 01_run_sweep.py --experiments experiments.yaml --clean
+"""
 import argparse
 import copy
 import json
@@ -77,6 +91,8 @@ def main():
                    help="Ruta al YAML con la suite de experimentos (e.g., experiments.yaml)")
     p.add_argument("--only", type=str, default=None,
                    help="Lista separada por coma de exp_id a correr (e.g., A_base,D_seasonal_rich)")
+    p.add_argument("--clean", action="store_true",
+                   help="Forzar limpieza de salidas por experimento (pasa clean_outputs=True al pipeline).")
     args = p.parse_args()
 
     experiments_path = Path(args.experiments).resolve()
@@ -109,6 +125,9 @@ def main():
 
         # Etiqueta de iteración (para rutas y sellado de EDA)
         exp_cfg["exp_tag"] = exp_id
+        # Nuevos switches de robustez en el pipeline
+        exp_cfg["clean_outputs"] = bool(args.clean)
+        exp_cfg["hard_scope"] = True
 
         # YAML temporal por experimento
         tmp_yaml = TMP_DIR / f"cfg_{exp_id}.yaml"

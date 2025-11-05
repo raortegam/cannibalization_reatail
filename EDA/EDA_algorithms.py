@@ -25,6 +25,8 @@ Salidas (por defecto en ./figures):
   - Comparación:
         figures/compare_att_sum_gsc_vs_meta_<learner>.png
 """
+# eda_algorithms.py
+# eda_algorithms.py
 from __future__ import annotations
 
 import argparse
@@ -47,14 +49,14 @@ import matplotlib.dates as mdates
 
 @dataclass
 class EDAConfig:
-    # Entradas
-    episodes_index: Path = Path("./.data/processed_data/episodes_index.parquet")
-    gsc_out_dir: Path = Path("./.data/processed_data/gsc_outputs")
-    meta_out_root: Path = Path("./.data/processed_data/meta_outputs")
+    # Entradas (alineadas a los módulos de preparación/ejecución)
+    episodes_index: Path = field(default_factory=_data_root / "meta" / "episodes_index.parquet")
+    gsc_out_dir: Path = field(default_factory=_data_root / "gsc")
+    meta_out_root: Path = field(default_factory=_data_root / "meta")
     meta_learners: Tuple[str, ...] = ("t", "s", "x")  # explorará las carpetas si existen
 
     # Salidas
-    figures_dir: Path = Path("./figures")
+    figures_dir: Path = field(default_factory=_fig_root)
 
     # Render
     orientation: str = "landscape"  # 'landscape' (11x8.5) | 'portrait' (8.5x11)
@@ -75,9 +77,28 @@ class EDAConfig:
     plot_smooth_kind: str = "ema"      # "ema" | "ma"
     plot_ema_span: float = 7.0
     plot_ma_window: int = 7
+    exp_tag: str = "A_base"
+
+    # Seguridad de integridad temporal
+    strict_unique_dates: bool = False  # si True, lanza si quedan duplicados tras canonizar
 
 
 # ---------------- helpers de config/paths ---------------- #
+from dataclasses import field  # si el archivo define dataclasses con default_factory
+def _data_root() -> Path:
+    """
+    Prefiere ./.data; si no existe, intenta ./data; y por último crea ./.data.
+    """
+    for cand in (Path("./.data"), Path("./data")):
+        try:
+            if cand.exists():
+                return cand
+        except Exception:
+            pass
+    return Path("./.data")
+
+def _fig_root() -> Path:
+    return Path("./figures")
 
 def _to_path(p) -> Path:
     return p if isinstance(p, Path) else Path(p)
@@ -142,6 +163,8 @@ def _ensure_datetime(df: pd.DataFrame, col: str = "date") -> pd.DataFrame:
     if col in df.columns:
         if not np.issubdtype(df[col].dtype, np.datetime64):
             df[col] = pd.to_datetime(df[col], errors="coerce").dt.tz_localize(None)
+        else:
+            df[col] = df[col].dt.tz_localize(None)
     return df
 
 def _format_time_axis(ax: mpl.axes.Axes):
@@ -170,39 +193,40 @@ def _read_episodes_index(cfg: EDAConfig) -> pd.DataFrame:
     for c in ["pre_start", "treat_start", "post_start", "post_end"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce").dt.tz_localize(None)
-    # robustez: asegurar string
     if "episode_id" in df.columns:
         df["episode_id"] = df["episode_id"].astype(str)
     return df
 
 def _read_gsc_metrics(cfg: EDAConfig) -> Optional[pd.DataFrame]:
-    p = cfg.gsc_out_dir / "gsc_metrics.parquet"
-    df = _try_read_parquet(p, "gsc_metrics")
+    # 1) figures/<exp_tag>/gsc/gsc_metrics.parquet
+    p1 = cfg.gsc_out_dir / "gsc_metrics.parquet"
+    df = _try_read_parquet(p1, "gsc_metrics")
+    if (df is None or df.empty):
+        # 2) fallback a .data/processed_data/gsc_outputs
+        p2 = _data_root() / "processed_data" / "gsc_outputs" / "gsc_metrics.parquet"
+        df = _try_read_parquet(p2, "gsc_metrics (.data fallback)")
     if df is None or df.empty:
         return None
     df = df.copy()
     df["episode_id"] = df["episode_id"].astype(str)
-    if "att_sum" in df.columns:
-        df["abs_att_sum"] = np.abs(df["att_sum"].astype(float))
-    else:
-        df["abs_att_sum"] = np.nan
+    df["abs_att_sum"] = np.abs(df.get("att_sum", np.nan)).astype(float)
     return df
 
 def _read_meta_metrics(cfg: EDAConfig) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
     for lr in cfg.meta_learners:
-        p = cfg.meta_out_root / lr / f"meta_metrics_{lr}.parquet"
-        if not _exists(p):
-            continue
-        df = _try_read_parquet(p, f"meta_metrics_{lr}")
+        # 1) figures/<exp_tag>/meta/<lr>/meta_metrics_<lr>.parquet
+        p1 = cfg.meta_out_root / lr / f"meta_metrics_{lr}.parquet"
+        df = _try_read_parquet(p1, f"meta_metrics_{lr}")
+        if df is None or df.empty:
+            # 2) fallback a .data/processed/meta_outputs/<lr>/
+            p2 = _data_root() / "processed" / "meta_outputs" / lr / f"meta_metrics_{lr}.parquet"
+            df = _try_read_parquet(p2, f"meta_metrics_{lr} (.data fallback)")
         if df is None or df.empty:
             continue
         df = df.copy()
         df["episode_id"] = df["episode_id"].astype(str)
-        if "att_sum" in df.columns:
-            df["abs_att_sum"] = np.abs(df["att_sum"].astype(float))
-        else:
-            df["abs_att_sum"] = np.nan
+        df["abs_att_sum"] = np.abs(df.get("att_sum", np.nan)).astype(float)
         out[lr] = df
     return out
 
@@ -214,7 +238,7 @@ def _meta_cf_path(cfg: EDAConfig, learner: str, episode_id: str) -> Path:
 
 
 # ---------------------------------------------------------------------
-# Smoothing y series para plot
+# Smoothing, canonización y series para plot
 # ---------------------------------------------------------------------
 
 def _smooth_series(y: pd.Series, kind: str = "ema",
@@ -226,17 +250,100 @@ def _smooth_series(y: pd.Series, kind: str = "ema",
     alpha = 2.0 / (float(ema_span) + 1.0)
     return y.ewm(alpha=alpha, adjust=False).mean()
 
+def _victim_uid(ep_row: Optional[pd.Series]) -> Optional[str]:
+    if isinstance(ep_row, pd.Series):
+        try:
+            return f"{int(ep_row.get('j_store'))}:{int(ep_row.get('j_item'))}"
+        except Exception:
+            return None
+    return None
+
+def _canonize_cf(cf: pd.DataFrame,
+                 ep_row: Optional[pd.Series],
+                 cfg: EDAConfig,
+                 algo_tag: str) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """
+    Garantiza 1 fila por fecha para la víctima.
+    Estrategia:
+      1) Normaliza 'date' y orden.
+      2) Si existe treated_unit -> quedarnos con treated_unit==1.
+      3) Si no, y existe unit_id + episodio -> filtrar por víctima j_store:j_item.
+      4) Si persisten duplicados de fecha -> colapsar por mediana (num) / primero (no num).
+    Devuelve (cf_canon, info_dedup).
+    """
+    cf = cf.copy()
+    cf = _ensure_datetime(cf, "date")
+    cf = cf.sort_values(["date", "unit_id"] if "unit_id" in cf.columns else ["date"]).reset_index(drop=True)
+
+    before_rows = int(cf.shape[0])
+
+    # Paso 1: preferir la víctima (treated_unit == 1)
+    if "treated_unit" in cf.columns:
+        tu = pd.to_numeric(cf["treated_unit"], errors="coerce").fillna(0).astype(int)
+        if (tu == 1).any():
+            cf = cf.loc[tu == 1].copy()
+
+    # Paso 2: si hay unit_id y ep_row, filtrar a víctima
+    if "unit_id" in cf.columns and isinstance(ep_row, pd.Series):
+        vuid = _victim_uid(ep_row)
+        if vuid is not None and (cf["unit_id"].astype(str) == vuid).any():
+            cf = cf.loc[cf["unit_id"].astype(str) == vuid].copy()
+
+    # Paso 3: nombres flexibles para columnas objetivo/contrafactual
+    if "y_hat" not in cf.columns:
+        if "mu0_hat" in cf.columns:
+            cf["y_hat"] = cf["mu0_hat"]
+        elif "y0_hat" in cf.columns:
+            cf["y_hat"] = cf["y0_hat"]
+    if "y_obs" not in cf.columns and "sales" in cf.columns:
+        cf["y_obs"] = cf["sales"]
+
+    # Paso 4: colapsar duplicados por fecha si existen
+    dup_dates = int(cf["date"].duplicated(keep=False).sum()) if "date" in cf.columns else 0
+    if dup_dates > 0:
+        logging.warning(f"[{algo_tag}] Fechas duplicadas detectadas (n={dup_dates}). Se colapsará por fecha (mediana/primero).")
+        num_cols = cf.select_dtypes(include=[np.number]).columns.tolist()
+        # conservar explícitamente señales de plot si existen
+        special_cols = [c for c in ["y_hat", "y_obs", "effect_plot", "y_obs_plot", "cum_effect_obs", "obs_mask"] if c in cf.columns]
+        for c in special_cols:
+            if c not in num_cols and c in cf.columns:
+                # intentar convertir a float si procede
+                try:
+                    cf[c] = pd.to_numeric(cf[c], errors="ignore")
+                except Exception:
+                    pass
+        num_cols = cf.select_dtypes(include=[np.number]).columns.tolist()
+        non_num_cols = [c for c in cf.columns if c not in num_cols + ["date"]]
+
+        agg_spec = {c: "median" for c in num_cols}
+        agg_first = {c: "first" for c in non_num_cols}
+        cf = (cf.groupby("date", as_index=False)
+                .agg({**agg_spec, **agg_first})
+                .sort_values("date")
+                .reset_index(drop=True))
+
+    # Chequeo final de unicidad temporal
+    still_dups = int(cf["date"].duplicated(keep=False).sum())
+    if still_dups > 0 and cfg.strict_unique_dates:
+        raise AssertionError(f"[{algo_tag}] Persisten {still_dups} fechas duplicadas tras canonizar.")
+
+    info = {
+        "n_rows_before": before_rows,
+        "n_rows_after": int(cf.shape[0]),
+        "dup_dates_fixed": int(max(0, dup_dates - still_dups)),
+        "dup_dates_remaining": int(still_dups),
+    }
+    return cf, info
+
 def _series_for_plot(cf: pd.DataFrame,
-                     cfg: EDAConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray, np.ndarray]:
+                     cfg: EDAConfig,
+                     ep_row: Optional[pd.Series],
+                     algo_tag: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray, np.ndarray, Dict[str,int]]:
     """
     Devuelve:
-      dates, y_obs_plot, y_hat, effect_plot, effect (analítico), cum_effect_for_plot
-    Preferencias de columnas (si existen):
-      - y_obs_plot, obs_mask, effect_plot, cum_effect_obs
-    Fallbacks:
-      - y_obs_plot se arma interpolando y_obs (o sales) y se suaviza para plot si cfg.plot_sales_smooth=True
-      - y_hat = 'y_hat' o 'mu0_hat'
+      dates, y_obs_plot, y_hat, effect_plot, effect (analítico), cum_effect_for_plot, dedup_info
     """
+    cf, dedup_info = _canonize_cf(cf, ep_row, cfg, algo_tag)
     cf = cf.copy()
     cf = _ensure_datetime(cf, "date").sort_values("date").reset_index(drop=True)
 
@@ -279,7 +386,6 @@ def _series_for_plot(cf: pd.DataFrame,
         else:
             y_obs_plot = y_interp.to_numpy()
 
-        # si todo NaN, poner 0 para evitar figura vacía
         if not np.any(np.isfinite(y_obs_plot)):
             y_obs_plot = np.zeros_like(y_obs, dtype=float)
 
@@ -291,14 +397,16 @@ def _series_for_plot(cf: pd.DataFrame,
         effect_plot = y_obs_plot - y_hat
 
     # cum_effect plot‑ready
-    cum_effect_for_plot: Optional[np.ndarray]
     if "cum_effect_obs" in cf.columns:
         cum_effect_for_plot = cf["cum_effect_obs"].to_numpy(float)
     else:
         eff_no_nan = np.where(np.isfinite(effect), effect, 0.0)
         cum_effect_for_plot = np.cumsum(eff_no_nan)
 
-    return dates, y_obs_plot, y_hat, effect_plot, effect, cum_effect_for_plot
+    # guardar obs_mask en dedup_info para sombreado
+    dedup_info["has_obs_mask"] = int(obs_mask.any())
+    cf["_obs_mask_tmp_"] = obs_mask.astype(int)
+    return dates, y_obs_plot, y_hat, effect_plot, effect, cum_effect_for_plot, dedup_info
 
 
 # ---------------------------------------------------------------------
@@ -409,7 +517,7 @@ def fig_episode_page(cf: pd.DataFrame,
       - Panel 1: Observado (suavizado plot‑ready) vs Contrafactual
       - Panel 2: Efecto y efecto acumulado
     """
-    dates, y_obs_plot, y_hat, effect_plot, effect_base, cum_eff = _series_for_plot(cf, cfg)
+    dates, y_obs_plot, y_hat, effect_plot, effect_base, cum_eff, dedup = _series_for_plot(cf, cfg, ep_row, algorithm_label)
 
     # Ventana del episodio (si existe ep_row)
     treat_start = None
@@ -442,14 +550,24 @@ def fig_episode_page(cf: pd.DataFrame,
     ax2 = fig.add_subplot(gs[1, 0])
 
     # obs_mask (si existe en cf)
-    obs_mask = cf["obs_mask"].astype(int).to_numpy() == 1 if "obs_mask" in cf.columns else None
+    if "obs_mask" in cf.columns:
+        obs_mask = cf["obs_mask"].astype(int).to_numpy() == 1
+    else:
+        # si no está, aproximar con finitud del observado
+        obs_col = "y_obs" if "y_obs" in cf.columns else "sales"
+        obs_mask = np.isfinite(pd.to_numeric(cf[obs_col], errors="coerce").to_numpy(float))
 
     _draw_episode_timeseries(ax1, dates, y_obs_plot, y_hat, treat_start, post_end,
                              title, subtitle, grid=cfg.grid, obs_mask=obs_mask)
     _draw_episode_effect(ax2, dates, effect_plot, cum_eff, grid=cfg.grid)
 
-    if metrics_hint:
-        _annot_metrics_box(ax1, metrics_hint)
+    if metrics_hint is None:
+        metrics_hint = {}
+    # añadir info de deduplicación a la caja
+    metrics_hint = dict(metrics_hint)
+    metrics_hint.setdefault("dup_dates_fixed", float(dedup.get("dup_dates_fixed", 0)))
+    metrics_hint.setdefault("dup_dates_remaining", float(dedup.get("dup_dates_remaining", 0)))
+    _annot_metrics_box(ax1, metrics_hint)
 
     if subtitle:
         fig.text(0.01, 0.98, subtitle, ha="left", va="top", fontsize=9)
@@ -468,7 +586,7 @@ def _canonical_episode_list(cfg: EDAConfig,
     Devuelve una lista ORDENADA de episode_id a usar por TODOS los métodos, con la misma longitud y orden.
     - Si hay GSC: ranking = |ATT_sum| de GSC desc.
     - Si no hay GSC: usa el primer meta disponible como ranking.
-    - Domenio: intersección de episodios presentes en TODOS los métodos encontrados (para comparabilidad).
+    - Dominio: intersección de episodios presentes en TODOS los métodos encontrados (para comparabilidad).
       Si la intersección es vacía, cae a la unión y mantiene el ranking del método de referencia.
     - Aplica límites max_episodes_* (toma el mínimo de ambos si ambos existen).
     """
@@ -493,14 +611,12 @@ def _canonical_episode_list(cfg: EDAConfig,
     if gsc_metrics is not None and not gsc_metrics.empty:
         ref_df = gsc_metrics[["episode_id", "abs_att_sum"]].copy()
     else:
-        # toma el primer meta con datos
         for _, df in meta_metrics.items():
             if df is not None and not df.empty:
                 ref_df = df[["episode_id", "abs_att_sum"]].copy()
                 break
 
     if ref_df is None or ref_df.empty:
-        # orden alfabético si no hay ranking
         ordered = sorted(list(use_set))
     else:
         ref_df = ref_df.copy()
@@ -509,7 +625,6 @@ def _canonical_episode_list(cfg: EDAConfig,
         ref_df = ref_df[ref_df["episode_id"].isin(use_set)]
         ordered = ref_df.sort_values("abs_att_sum", ascending=False)["episode_id"].tolist()
 
-    # Límite común (si ambos definidos, tomar el mínimo)
     limits = []
     if cfg.max_episodes_gsc is not None:
         limits.append(int(cfg.max_episodes_gsc))
@@ -539,7 +654,7 @@ def _render_gsc(cfg: EDAConfig,
     # Orden por canónico (si aplica) o por |ATT_sum| desc
     if canonical_ids:
         gsc_metrics = gsc_metrics[gsc_metrics["episode_id"].isin(canonical_ids)].copy()
-        gsc_metrics["__ord__"] = gsc_metrics["episode_id"].map({e:i for i, e in enumerate(canonical_ids)})
+        gsc_metrics["__ord__"] = gsc_metrics["episode_id"].map({e: i for i, e in enumerate(canonical_ids)})
         gsc_metrics = gsc_metrics.sort_values("__ord__").drop(columns="__ord__")
     else:
         gsc_metrics = gsc_metrics.sort_values("abs_att_sum", ascending=False)
@@ -575,18 +690,18 @@ def _render_gsc(cfg: EDAConfig,
         }
 
         out_png = cfg.figures_dir / f"gsc_episode_{ep_id}_timeseries.png"
-        # Generar figura
-        dates, y_obs_plot, y_hat, effect_plot, effect_base, cum_eff = _series_for_plot(cf, cfg)
-        treat_start = ep_row.get("treat_start", None) if isinstance(ep_row, pd.Series) else None
-        post_end = ep_row.get("post_end", None) if isinstance(ep_row, pd.Series) else None
 
+        # Generar figura con canonización/validación temporal
         if cfg.style == "academic":
             _academic_style(cfg.font_size)
         fig = plt.figure()
         fig.set_size_inches(*_fig_letter_size(cfg.orientation), forward=True)
         gs = fig.add_gridspec(nrows=2, ncols=1, height_ratios=[2.0, 1.2], hspace=0.25)
         ax1 = fig.add_subplot(gs[0, 0]); ax2 = fig.add_subplot(gs[1, 0])
+
+        dates, y_obs_plot, y_hat, effect_plot, effect_base, cum_eff, dedup = _series_for_plot(cf, cfg, ep_row, "GSC")
         obs_mask = cf["obs_mask"].astype(int).to_numpy() == 1 if "obs_mask" in cf.columns else None
+
         title = f"GSC — Episodio {ep_id}"
         if isinstance(ep_row, pd.Series):
             try:
@@ -595,20 +710,27 @@ def _render_gsc(cfg: EDAConfig,
             except Exception:
                 pass
         subtitle = ""
-        if isinstance(ep_row, pd.Series) and (ep_row.get("pre_start") is not None) and (post_end is not None):
-            subtitle = f"Ventana: {pd.to_datetime(ep_row.get('pre_start')).date()} → {pd.to_datetime(post_end).date()}"
+        if isinstance(ep_row, pd.Series) and (ep_row.get("pre_start") is not None) and (ep_row.get("post_end") is not None):
+            subtitle = f"Ventana: {pd.to_datetime(ep_row.get('pre_start')).date()} → {pd.to_datetime(ep_row.get('post_end')).date()}"
 
-        _draw_episode_timeseries(ax1, dates, y_obs_plot, y_hat, treat_start, post_end,
+        _draw_episode_timeseries(ax1, dates, y_obs_plot, y_hat,
+                                 ep_row.get("treat_start", None) if isinstance(ep_row, pd.Series) else None,
+                                 ep_row.get("post_end", None) if isinstance(ep_row, pd.Series) else None,
                                  title, subtitle, grid=cfg.grid, obs_mask=obs_mask)
         _draw_episode_effect(ax2, dates, effect_plot, cum_eff, grid=cfg.grid)
-        _annot_metrics_box(ax1, metrics_hint)
+
+        # métricas + info de duplicados arreglados
+        metrics_hint2 = dict(metrics_hint)
+        metrics_hint2["dup_dates_fixed"] = float(dedup.get("dup_dates_fixed", 0))
+        metrics_hint2["dup_dates_remaining"] = float(dedup.get("dup_dates_remaining", 0))
+        _annot_metrics_box(ax1, metrics_hint2)
+
         if subtitle:
             fig.text(0.01, 0.98, subtitle, ha="left", va="top", fontsize=9)
 
         # Guardados
         _save_letter(fig, out_png, cfg.orientation, cfg.dpi)
         if pdf_writer is not None:
-            # Reproducir la lámina dentro del PDF (evitar replot: incrustar PNG)
             fig_pdf, ax_pdf = plt.subplots()
             fig_pdf.set_size_inches(*_fig_letter_size(cfg.orientation), forward=True)
             ax_pdf.axis("off")
@@ -652,7 +774,7 @@ def _render_meta_for(cfg: EDAConfig,
     # Orden canónico
     if canonical_ids:
         mdf = mdf[mdf["episode_id"].isin(canonical_ids)].copy()
-        mdf["__ord__"] = mdf["episode_id"].map({e:i for i, e in enumerate(canonical_ids)})
+        mdf["__ord__"] = mdf["episode_id"].map({e: i for i, e in enumerate(canonical_ids)})
         mdf = mdf.sort_values("__ord__").drop(columns="__ord__")
     else:
         mdf = mdf.sort_values("abs_att_sum", ascending=False)
@@ -687,17 +809,16 @@ def _render_meta_for(cfg: EDAConfig,
 
         out_png = cfg.figures_dir / f"meta_{learner}_episode_{ep_id}_timeseries.png"
 
-        dates, y_obs_plot, y_hat, effect_plot, effect_base, cum_eff = _series_for_plot(cf, cfg)
-        treat_start = ep_row.get("treat_start", None) if isinstance(ep_row, pd.Series) else None
-        post_end = ep_row.get("post_end", None) if isinstance(ep_row, pd.Series) else None
-
         if cfg.style == "academic":
             _academic_style(cfg.font_size)
         fig = plt.figure()
         fig.set_size_inches(*_fig_letter_size(cfg.orientation), forward=True)
         gs = fig.add_gridspec(nrows=2, ncols=1, height_ratios=[2.0, 1.2], hspace=0.25)
         ax1 = fig.add_subplot(gs[0, 0]); ax2 = fig.add_subplot(gs[1, 0])
+
+        dates, y_obs_plot, y_hat, effect_plot, effect_base, cum_eff, dedup = _series_for_plot(cf, cfg, ep_row, f"Meta-{learner.upper()}")
         obs_mask = cf["obs_mask"].astype(int).to_numpy() == 1 if "obs_mask" in cf.columns else None
+
         title = f"Meta‑{learner.upper()} — Episodio {ep_id}"
         if isinstance(ep_row, pd.Series):
             try:
@@ -706,13 +827,20 @@ def _render_meta_for(cfg: EDAConfig,
             except Exception:
                 pass
         subtitle = ""
-        if isinstance(ep_row, pd.Series) and (ep_row.get("pre_start") is not None) and (post_end is not None):
-            subtitle = f"Ventana: {pd.to_datetime(ep_row.get('pre_start')).date()} → {pd.to_datetime(post_end).date()}"
+        if isinstance(ep_row, pd.Series) and (ep_row.get("pre_start") is not None) and (ep_row.get("post_end") is not None):
+            subtitle = f"Ventana: {pd.to_datetime(ep_row.get('pre_start')).date()} → {pd.to_datetime(ep_row.get('post_end')).date()}"
 
-        _draw_episode_timeseries(ax1, dates, y_obs_plot, y_hat, treat_start, post_end,
+        _draw_episode_timeseries(ax1, dates, y_obs_plot, y_hat,
+                                 ep_row.get("treat_start", None) if isinstance(ep_row, pd.Series) else None,
+                                 ep_row.get("post_end", None) if isinstance(ep_row, pd.Series) else None,
                                  title, subtitle, grid=cfg.grid, obs_mask=obs_mask)
         _draw_episode_effect(ax2, dates, effect_plot, cum_eff, grid=cfg.grid)
-        _annot_metrics_box(ax1, metrics_hint)
+
+        metrics_hint2 = dict(metrics_hint)
+        metrics_hint2["dup_dates_fixed"] = float(dedup.get("dup_dates_fixed", 0))
+        metrics_hint2["dup_dates_remaining"] = float(dedup.get("dup_dates_remaining", 0))
+        _annot_metrics_box(ax1, metrics_hint2)
+
         if subtitle:
             fig.text(0.01, 0.98, subtitle, ha="left", va="top", fontsize=9)
 
@@ -745,7 +873,7 @@ def _overview_figs(metrics: pd.DataFrame,
                    out_prefix: Path,
                    cfg: EDAConfig):
     """
-    Tres láminas de resumen (cada una tamaño carta):
+    Láminas de resumen (tamaño carta):
       1) Distribución de RMSPE_pre
       2) Distribución de ATT_sum
       3) Dispersión |ATT_sum| vs RMSPE_pre
@@ -852,8 +980,12 @@ def _render_cross_method_comparison(cfg: EDAConfig,
 
 def run(cfg: EDAConfig):
     cfg = _coerce_all_paths(cfg)
+
     _setup_logging("INFO")
+    cfg.figures_dir = (cfg.figures_dir / cfg.exp_tag).resolve()
     _ensure_outdir(cfg.figures_dir)
+    cfg.gsc_out_dir = (cfg.figures_dir / "gsc").resolve()
+    cfg.meta_out_root = (cfg.figures_dir / "meta").resolve()
     if cfg.style == "academic":
         _academic_style(cfg.font_size)
 
@@ -893,12 +1025,12 @@ def run(cfg: EDAConfig):
 # ---------------------------------------------------------------------
 
 def parse_args() -> EDAConfig:
-    p = argparse.ArgumentParser(description="EDA de resultados (GSC y Meta‑learners) con láminas tamaño carta.")
-    p.add_argument("--episodes_index", type=str, default=str(EDAConfig.episodes_index))
-    p.add_argument("--gsc_out_dir", type=str, default=str(EDAConfig.gsc_out_dir))
-    p.add_argument("--meta_out_root", type=str, default=str(EDAConfig.meta_out_root))
+    p = argparse.ArgumentParser(description="EDA de resultados (GSC y Meta‑learners) con láminas tamaño carta y canonización por fecha.")
+    p.add_argument("--episodes_index", type=str, default=str(_data_root() / "processed" / "episodes_index.parquet"))
+    p.add_argument("--gsc_out_dir", type=str, default=None)
+    p.add_argument("--meta_out_root", type=str, default=None)
     p.add_argument("--learners", type=str, default="t,s,x", help="Lista separada por coma de learners meta a renderizar.")
-    p.add_argument("--figures_dir", type=str, default=str(EDAConfig.figures_dir))
+    p.add_argument("--figures_dir", type=str, default=str(fig_root()))
     p.add_argument("--orientation", type=str, default="landscape", choices=["landscape", "portrait"])
     p.add_argument("--dpi", type=int, default=300)
     p.add_argument("--font_size", type=int, default=10)
@@ -910,13 +1042,15 @@ def parse_args() -> EDAConfig:
     p.add_argument("--plot_smooth_kind", type=str, default="ema", choices=["ema", "ma"])
     p.add_argument("--plot_ema_span", type=float, default=7.0)
     p.add_argument("--plot_ma_window", type=int, default=7)
+    p.add_argument("--strict_unique_dates", action="store_true", help="Falla si persisten duplicados de fecha tras canonizar.")
+    p.add_argument("--exp_tag", type=str, default="A_base")
 
     a = p.parse_args()
     learners = tuple([s.strip() for s in a.learners.split(",") if s.strip()])
     cfg = EDAConfig(
         episodes_index=Path(a.episodes_index),
-        gsc_out_dir=Path(a.gsc_out_dir),
-        meta_out_root=Path(a.meta_out_root),
+        gsc_out_dir=Path(a.gsc_out_dir) if a.gsc_out_dir else (_fig_root() / a.exp_tag / "gsc"),
+        meta_out_root=Path(a.meta_out_root) if a.meta_out_root else (_fig_root() / a.exp_tag / "meta"),
         meta_learners=learners,
         figures_dir=Path(a.figures_dir),
         orientation=a.orientation,
@@ -931,6 +1065,8 @@ def parse_args() -> EDAConfig:
         plot_smooth_kind=a.plot_smooth_kind,
         plot_ema_span=float(a.plot_ema_span),
         plot_ma_window=int(a.plot_ma_window),
+        strict_unique_dates=a.strict_unique_dates,
+        exp_tag=a.exp_tag,
     )
     return cfg
 

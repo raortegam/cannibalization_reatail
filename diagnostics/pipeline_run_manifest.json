@@ -1,8 +1,58 @@
 {
   "project_name": "cannibalization_retail__A_base",
-  "start_time": "2025-11-03T17:42:20.277427",
-  "log_file": "D:\\repos\\cannibalization_reatail\\diagnostics\\pipeline_A_base_20251103_174220.log",
+  "start_time": "2025-11-05T14:05:28.926907",
+  "log_file": "D:\\repos\\cannibalization_reatail\\diagnostics\\pipeline_A_base_20251105_140528.log",
   "steps": {
+    "step1": {
+      "status": "ok",
+      "outputs": {
+        "train_summary": {
+          "rows": 59038132,
+          "date_range": [
+            "2016-01-01",
+            "2017-08-15"
+          ],
+          "n_stores": 54,
+          "n_items": 4036,
+          "promo_rate": 0.10610486456448182,
+          "sales_nonnull_rate": 1.0,
+          "sales_negative_rate": 6.570329833606523e-05,
+          "stores_rows_min_max": [
+            290581,
+            1599702
+          ]
+        },
+        "transactions_summary": {
+          "rows": 31096,
+          "date_range": [
+            "2016-01-02",
+            "2017-08-15"
+          ],
+          "n_stores": 54,
+          "transactions_nonneg_rate": 1.0
+        },
+        "paths": {
+          "train_filtered": ".data\\processed_data\\A_base\\train_filtered.csv",
+          "transactions_filtered": ".data\\processed_data\\A_base\\transactions_filtered.csv"
+        },
+        "min_date": "2016-01-01",
+        "keys_train": [
+          "date",
+          "store_nbr",
+          "item_nbr"
+        ],
+        "keys_transactions": [
+          "date",
+          "store_nbr"
+        ]
+      }
+    },
+    "step2": {
+      "status": "ok",
+      "outputs": {
+        "exposure_csv": ".data\\processed_data\\A_base\\competitive_exposure.csv"
+      }
+    },
     "step3": {
       "status": "ok",
       "outputs": {
@@ -29,26 +79,36 @@
       "figures_dir": "figures\\A_base"
     },
     "step5_gsc": {
-      "status": "ok",
+      "status": "skipped_or_failed",
       "outputs": {
         "gsc_metrics": ".data\\processed_data\\gsc_outputs\\A_base\\gsc_metrics.parquet",
-        "gsc_cf_series_dir": ".data\\processed_data\\gsc_outputs\\A_base\\cf_series"
+        "gsc_cf_series_dir": ".data\\processed_data\\gsc_outputs\\A_base\\cf_series",
+        "episodes_done": []
       }
     },
     "step6_meta": {
-      "status": "ok",
-      "outputs": {
-        "x": {
-          "meta_metrics": ".data\\processed_data\\meta_outputs\\A_base\\x\\meta_metrics_x.parquet",
-          "cf_series_dir": ".data\\processed_data\\meta_outputs\\A_base\\x\\cf_series"
-        }
-      }
+      "status": "skipped_or_failed"
     },
     "eda_algorithms": {
       "status": "ok",
-      "figures_dir": "figures\\A_base"
+      "figures_dir": "figures\\A_base",
+      "coverage": {
+        "expected": 10,
+        "gsc": 0,
+        "meta_union": 0,
+        "available": 0,
+        "missing": 10
+      }
     }
   },
   "exp_tag": "A_base",
-  "end_time": "2025-11-03T18:42:34.856985"
+  "paths_effective": {
+    "processed_dir": ".data\\processed_data\\A_base",
+    "preprocessed_dir": ".data\\processed_data\\A_base",
+    "figures_dir": "figures\\A_base",
+    "gsc_out_dir": ".data\\processed_data\\gsc_outputs\\A_base",
+    "meta_out_root": ".data\\processed_data\\meta_outputs\\A_base",
+    "exposure_csv": ".data\\processed_data\\A_base\\competitive_exposure.csv"
+  },
+  "end_time": "2025-11-05T15:02:37.920566"
 }

@@ -72,6 +72,8 @@ def _ema_alpha(span: Optional[float] = None,
     return float(2.0 / (float(span) + 1.0))
 
 
+
+
 def _smooth_grouped(
     series: pd.Series,
     group_keys: List[str],

@@ -46,6 +46,7 @@ La API de alto nivel se mantiene (misma estructura de funciones/clases y CLI),
 por lo que el *pipeline* existente no se rompe.
 
 """
+# models/synthetic_control.py
 from __future__ import annotations
 
 import argparse
@@ -150,14 +151,13 @@ class _Link:
     def forward(self, Y: np.ndarray) -> np.ndarray:
         if self.name == "identity":
             return Y
-        # log1p requiere Y >= -1; asumimos ventas >=0, pero por seguridad clip a [-1+eps, +inf)
+        # ventas >= 0; por seguridad, clip mínimo para log1p
         return np.log1p(np.maximum(Y, -1.0 + self.eps))
 
     def inverse(self, Z: np.ndarray) -> np.ndarray:
         if self.name == "identity":
             return Z
         out = np.expm1(Z)
-        # por robustez numérica, clip muy pequeño a 0
         out[out < 0] = 0.0
         return out
 
@@ -166,37 +166,19 @@ class _Link:
 # Selección de covariables y armado de matrices wide (anti‑fuga)
 # ---------------------------------------------------------------------
 
-# ---- Blacklist explícita (no pueden ser features) ----
 BLACKLIST_COLS = {
-    # objetivo y derivados
     "sales", "y_raw", "y_log1p",
-    # estimadores o señales construidas con Yt contemporáneo
     "sc_hat", "trend_T", "Q_store_trend", "available_A",
-    # contemporáneos no exógenos (usar solo sus lags)
     "class_index_excl", "promo_share_sc", "promo_share_sc_excl",
-    # etiquetas y metadatos
     "treated_unit", "treated_time", "D", "episode_id", "unit_id",
     "store_nbr", "item_nbr", "year_week", "id", "family_name",
     "is_victim", "promo_share", "avail_share", "keep", "reason",
 }
-
-# ---- Whitelist: prefijos y columnas permitidas ----
-SAFE_PREFIXES = (
-    "fourier_",
-    "lag_",                      # lags de ventas
-    "promo_share_sc_l",         # lags de presión promocional
-    "promo_share_sc_excl_l",
-    "class_index_excl_l",       # lags de índice de clase excluyente
-    "type_", "cluster_", "state_"
-)
-SAFE_SINGLE_COLS = {
-    # Proxies/holidays/metadata seguros
-    "Fsw_log1p", "Ow",
-    "HNat", "HReg", "HLoc",
-    "is_bridge", "is_additional", "is_work_day",
-    "trend_T_l1", "Q_store_trend_l1",  # solo rezagados
-    "month",
-}
+SAFE_PREFIXES = ("fourier_", "lag_", "promo_share_sc_l", "promo_share_sc_excl_l",
+                 "class_index_excl_l", "type_", "cluster_", "state_")
+SAFE_SINGLE_COLS = {"Fsw_log1p", "Ow", "HNat", "HReg", "HLoc",
+                    "is_bridge", "is_additional", "is_work_day",
+                    "trend_T_l1", "Q_store_trend_l1", "month"}
 
 def _is_safe_feature(col: str) -> bool:
     if col in BLACKLIST_COLS:
@@ -209,12 +191,9 @@ def _is_safe_feature(col: str) -> bool:
     return False
 
 def select_feature_cols(df: pd.DataFrame) -> List[str]:
-    """Elige columnas numéricas 'seguras' como X_it (whitelist + blacklist explícita)."""
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     feats = [c for c in numeric_cols if _is_safe_feature(c)]
     feats = sorted(list(dict.fromkeys(feats)))
-
-    # Auditoría: avisar si hay columnas potencialmente peligrosas presentes
     present_black = sorted([c for c in BLACKLIST_COLS if c in df.columns])
     if present_black:
         logging.warning(f"[FEATS] Blacklist presente y EXCLUIDA de X: {present_black}")
@@ -226,22 +205,22 @@ def select_feature_cols(df: pd.DataFrame) -> List[str]:
 
 @dataclass
 class EpisodeWide:
-    Y: np.ndarray                # (U,T) ventas
-    M: np.ndarray                # (U,T) máscara de entrenamiento (True si usado en ajuste)
-    X: Optional[np.ndarray]      # (U,T,P) covariables (o None)
-    units: List[str]             # unit_id
-    dates: List[pd.Timestamp]    # fechas
-    treated_row: int             # índice de la víctima
-    treated_post_mask: np.ndarray# (T,) bool post
-    pre_mask: np.ndarray         # (T,) bool pre
-    feats: List[str]             # nombres de features
-    meta: Dict                   # metadatos
+    Y: np.ndarray
+    M: np.ndarray
+    X: Optional[np.ndarray]
+    units: List[str]
+    dates: List[pd.Timestamp]
+    treated_row: int
+    treated_post_mask: np.ndarray
+    pre_mask: np.ndarray
+    feats: List[str]
+    meta: Dict
 
 
 def long_to_wide_for_episode(df: pd.DataFrame, include_covariates: bool = True) -> EpisodeWide:
     """
-    Convierte panel largo del episodio a matrices wide (unidades x fecha).
-    Aplica *train_mask* si está presente; si no, oculta la víctima en POST.
+    Convierte panel largo del episodio a matrices wide (unidades x fecha) y
+    aplica una máscara **a prueba de fugas**: la víctima en POST siempre queda oculta.
     """
     d = df.copy()
     d["date"] = _as_datetime(d["date"])
@@ -253,26 +232,24 @@ def long_to_wide_for_episode(df: pd.DataFrame, include_covariates: bool = True) 
     dates = _sorted_unique(d["date"])
     U, T = len(units), len(dates)
 
-    # Mapeos
     unit2idx = {u: i for i, u in enumerate(units)}
     date2idx = {dt: j for j, dt in enumerate(dates)}
 
-    # Preparar contenedores
     Y = np.full((U, T), np.nan, dtype=float)
-    TM = np.ones((U, T), dtype=bool)  # train_mask wide (por defecto True)
+    TM = np.ones((U, T), dtype=bool)
     treated_time_vec = np.zeros(T, dtype=bool)
 
     feats = select_feature_cols(d) if include_covariates else []
     P = len(feats)
     X = np.zeros((U, T, P), dtype=float) if include_covariates and P > 0 else None
 
-    # Poblar Y, X y TM
     has_train_mask = "train_mask" in d.columns
+    # poblar matrices
     for _, r in d.iterrows():
         i = unit2idx[r["unit_id"]]
         j = date2idx[r["date"]]
         Y[i, j] = float(r["sales"])
-        if int(r["treated_unit"]) == 1 and int(r["treated_time"]) == 1:
+        if int(r["treated_unit"]) == 1 and int(r.get("treated_time", 0)) == 1:
             treated_time_vec[j] = True
         if include_covariates and P > 0:
             for k, c in enumerate(feats):
@@ -281,31 +258,41 @@ def long_to_wide_for_episode(df: pd.DataFrame, include_covariates: bool = True) 
         if has_train_mask:
             TM[i, j] = bool(int(r["train_mask"]))
 
-    # Fila víctima / máscaras temporales
+    # fila víctima y reconstrucción robusta de POST si hiciera falta
     victim_unit = d.loc[d["treated_unit"] == 1, "unit_id"].iloc[0]
     treated_row = units.index(victim_unit)
+    if not treated_time_vec.any():
+        # fallback: usa D para la víctima
+        try:
+            d_v = d[d["treated_unit"] == 1].sort_values("date")
+            idx_first_one = d_v.index[d_v["D"].astype(int).to_numpy() == 1]
+            if len(idx_first_one) > 0:
+                first_date = d_v.loc[idx_first_one[0], "date"]
+                j0 = date2idx[first_date]
+                treated_time_vec[j0:] = True
+                logging.warning("[MASK] 'treated_time' vacío; POST reconstruido desde 'D' para la víctima.")
+        except Exception:
+            pass
+
     pre_mask = ~treated_time_vec
 
-    # Máscara de entrenamiento M
-    if has_train_mask:
-        M = TM
-    else:
-        # Si no hay train_mask, usamos regla estándar: ocultar víctima en POST
-        M = np.isfinite(Y)
-        M[treated_row, treated_time_vec] = False
-
-    # Sanity: asegurar que víctima-POST está oculto
-    if np.all(M[treated_row, treated_time_vec]):
-        logging.warning("[MASK] Víctima en POST aparece visible en M; se fuerza ocultamiento.")
-        M[treated_row, treated_time_vec] = False
+    # máscara final M
+    M = TM if has_train_mask else np.isfinite(Y)
+    # Forzar SIEMPRE ocultamiento de víctima en POST
+    n_post_before = int(np.sum(M[treated_row, treated_time_vec]))
+    M[treated_row, treated_time_vec] = False
+    n_post_after = int(np.sum(M[treated_row, treated_time_vec]))
+    if n_post_before > 0:
+        logging.warning(f"[MASK] Víctima tenía {n_post_before} celdas POST visibles; ahora {n_post_after}.")
 
     meta = {
-        "n_units": U,
-        "n_time": T,
+        "n_units": U, "n_time": T,
         "victim_unit": units[treated_row],
         "n_controls": U - 1,
         "n_pre": int(pre_mask.sum()),
         "n_post": int(treated_time_vec.sum()),
+        "n_train_victim_post_before": n_post_before,
+        "n_train_victim_post_after": n_post_after,
     }
     return EpisodeWide(Y=Y, M=M, X=X, units=units, dates=dates,
                        treated_row=treated_row,
@@ -323,19 +310,19 @@ def long_to_wide_for_episode(df: pd.DataFrame, include_covariates: bool = True) 
 class GSCConfig:
     rank: int = 2
     tau: float = 1.0
-    alpha: float = 0.01         # ridge para β
-    max_inner: int = 120        # iteraciones SoftImpute
-    max_outer: int = 10         # alternancias (L <-> β)
+    alpha: float = 0.01
+    max_inner: int = 120
+    max_outer: int = 10
     tol: float = 1e-4
     include_covariates: bool = True
     random_state: int = 42
-    standardize_y: bool = True  # estabiliza la escala de Y
-    # --- robustez y no-negatividad ---
-    link: str = "identity"      # 'identity' | 'log1p'
-    link_eps: float = 0.0       # eps para log1p cuando hay ceros
-    pred_clip_min: Optional[float] = 0.0   # None => sin clip; 0.0 recomendado para ventas
+    standardize_y: bool = True
+    # robustez y no‑negatividad
+    link: str = "identity"
+    link_eps: float = 0.0
+    pred_clip_min: Optional[float] = 0.0
     calibrate_victim: str = "level"        # 'none' | 'level' | 'level_and_trend'
-    post_smooth_window: int = 1            # tamaño ventana móvil para y_hat víctima (>=1 => sin suavizado)
+    post_smooth_window: int = 1            # 1 => sin suavizado
 
 class SoftImpute:
     """SoftImpute con SVD denso y máscara M (True si observado/entrenable)."""
@@ -348,7 +335,7 @@ class SoftImpute:
 
     def fit(self, W: np.ndarray, M: np.ndarray) -> np.ndarray:
         """
-        min_L 0.5||M*(W - L)||_F^2 + tau * ||L||_*  por *soft-thresholding*.
+        min_L 0.5||M*(W - L)||_F^2 + tau * ||L||_*  por soft-thresholding.
         """
         L = np.nan_to_num(W, nan=0.0).copy()
         prev_missing = L.copy()
@@ -375,7 +362,7 @@ class SoftImpute:
                 break
             prev_missing = L.copy()
 
-        # Reconstrucción final (sin "pegar" observados)
+        # Reconstrucción final
         U, s, Vt = np.linalg.svd(L, full_matrices=False)
         s_shrunk = np.maximum(s - self.tau, 0.0)
         r = int(min(self.rank, max(1, np.sum(s_shrunk > 0))))
@@ -409,14 +396,11 @@ class GSCModel:
         return Xn, means, stds
 
     def fit(self, Y: np.ndarray, M: np.ndarray, X: Optional[np.ndarray] = None) -> "GSCModel":
-        rng = np.random.default_rng(self.cfg.random_state)
         include_X = self.cfg.include_covariates and X is not None and X.ndim == 3 and X.shape[2] > 0
         P = 0 if not include_X else X.shape[2]
 
-        # --- Transformación (link) antes de estandarizar ---
+        # Transformación + estandarización de Y (sólo celdas M=True)
         Yt = self._link.forward(Y)
-
-        # Estandarizar Yt solo con celdas M=True
         if self.cfg.standardize_y:
             obs_vals = Yt[M]
             self._y_mean = float(np.mean(obs_vals))
@@ -426,7 +410,7 @@ class GSCModel:
             self._y_mean, self._y_std = 0.0, 1.0
             Ys = Yt.copy()
 
-        # Normalizar X (si aplica) usando solo M=True
+        # Normalizar X (si aplica)
         if include_X:
             Xn, xm, xs = self._normalize_X_on_mask(X, M)
             self._x_means, self._x_std = xm, xs
@@ -481,12 +465,11 @@ class GSCModel:
         else:
             Yhat_std = self.L_
 
-        # Volver a la escala del link (desestandarizado)
+        # desestandarizar + inversa del link
         Yhat_t = Yhat_std * self._y_std + self._y_mean
-        # Inversa del link => escala original de Y
         Yhat = self._link.inverse(Yhat_t)
 
-        # Clip mínimo global (última salvaguarda)
+        # Clip mínimo (última salvaguarda)
         if self.cfg.pred_clip_min is not None:
             Yhat = np.maximum(Yhat, float(self.cfg.pred_clip_min))
 
@@ -494,7 +477,7 @@ class GSCModel:
 
 
 # ---------------------------------------------------------------------
-# CV temporal: búsqueda en grilla y Optuna con purga/embargo
+# CV temporal y utilidades
 # ---------------------------------------------------------------------
 
 @dataclass
@@ -507,7 +490,7 @@ class CVCfg:
     grid_alpha: Tuple[float, ...] = (0.001, 0.01, 0.1)
 
 def _svd_scale_pre(ep: EpisodeWide) -> float:
-    """Regresa una escala típica para tau basada en el mayor singular del pre."""
+    """Escala típica para tau basada en el mayor singular del PRE."""
     Ypre = ep.Y[:, ep.pre_mask]
     Mpre = ep.M[:, ep.pre_mask]
     Ytmp = np.where(Mpre, Ypre, 0.0)
@@ -520,7 +503,6 @@ def _svd_scale_pre(ep: EpisodeWide) -> float:
     return s0
 
 def _sanitize_grids(ep: EpisodeWide, cv: CVCfg) -> Tuple[Tuple[int, ...], Tuple[float, ...], Tuple[float, ...], Dict]:
-    """Limpia/clippea grillas para asegurar dominio válido y estable."""
     U, T = ep.Y.shape
     max_rank = max(1, min(U - 1, T - 1))
     ranks = sorted(set(int(np.clip(r, 1, max_rank)) for r in cv.grid_ranks))
@@ -529,24 +511,13 @@ def _sanitize_grids(ep: EpisodeWide, cv: CVCfg) -> Tuple[Tuple[int, ...], Tuple[
 
     s0 = _svd_scale_pre(ep)
     tau_lo = max(1e-3, 0.05 * s0)
-    tau_hi = max(tau_lo * 1.25, 0.8 * s0)  # [~5% s0, ~80% s0]
-    taus_raw = list(cv.grid_tau)
-    taus = []
-    for t in taus_raw:
-        if not np.isfinite(t) or t <= 0:
-            continue
-        taus.append(float(np.clip(t, tau_lo, tau_hi)))
+    tau_hi = max(tau_lo * 1.25, 0.8 * s0)
+    taus = [float(np.clip(t, tau_lo, tau_hi)) for t in cv.grid_tau if np.isfinite(t) and t > 0]
     if not taus:
         taus = list(np.geomspace(tau_lo, tau_hi, num=5))
     taus = tuple(sorted(set(taus)))
 
-    # alpha >= 1e-5 para estabilidad; top 1e-1
-    alphas_raw = list(cv.grid_alpha)
-    alphas = []
-    for a in alphas_raw:
-        if not np.isfinite(a):
-            continue
-        alphas.append(float(np.clip(a, 1e-5, 1e-1)))
+    alphas = [float(np.clip(a, 1e-5, 1e-1)) for a in cv.grid_alpha if np.isfinite(a)]
     if not alphas:
         alphas = list(np.geomspace(1e-4, 1e-2, num=5))
     alphas = tuple(sorted(set(alphas)))
@@ -556,25 +527,16 @@ def _sanitize_grids(ep: EpisodeWide, cv: CVCfg) -> Tuple[Tuple[int, ...], Tuple[
     return tuple(ranks), tuple(taus), tuple(alphas), info
 
 def _cv_folds_pre_indices(ep: EpisodeWide, holdout_days: int, gap_days: int, k_folds: int) -> List[Tuple[np.ndarray, np.ndarray]]:
-    """
-    Genera folds sobre el **pre**:
-    - holdout: ventana de H días al final de cada bloque
-    - gap: embargo antes del holdout
-    Retorna lista de (idx_gap, idx_holdout), ambos arrays de columnas (j) del panel.
-    """
     pre_idx = np.where(ep.pre_mask)[0]
     if len(pre_idx) == 0:
         return []
     H = int(max(1, holdout_days))
     G = int(max(0, gap_days))
-
-    # Límite superior para el final del holdout en el pre, aplicando el embargo
     end_max = pre_idx[-1] - G
     if end_max < pre_idx[0] + H - 1:
         return []
 
     folds = []
-    # Rolling desde el final del pre hacia atrás
     for f in range(k_folds):
         hold_end = end_max - f * H
         hold_start = hold_end - H + 1
@@ -587,7 +549,6 @@ def _cv_folds_pre_indices(ep: EpisodeWide, holdout_days: int, gap_days: int, k_f
     return folds
 
 def _apply_time_mask(M: np.ndarray, gap_idx: np.ndarray, hold_idx: np.ndarray) -> np.ndarray:
-    """Devuelve una copia de M con gap+holdout ocultos para **todas** las unidades."""
     M_train = M.copy()
     if hold_idx.size > 0:
         M_train[:, hold_idx] = False
@@ -596,7 +557,6 @@ def _apply_time_mask(M: np.ndarray, gap_idx: np.ndarray, hold_idx: np.ndarray) -
     return M_train
 
 def time_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig) -> Tuple[GSCConfig, Dict]:
-    """Búsqueda en grilla con CV temporal purgada/embargada usando solo el pre."""
     folds = _cv_folds_pre_indices(ep, cv.holdout_days, cv.gap_days, cv.folds)
     if not folds:
         logging.info("CV temporal omitida (pre insuficiente); se usa configuración base.")
@@ -642,7 +602,6 @@ def time_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig) -> Tuple[GSC
                          post_smooth_window=base_cfg.post_smooth_window)
     logging.info(f"[GRID-GSC] best_score(RMSPE)={best['score']:.6f} | best_params="
                  f"rank={best['rank']}, tau={best['tau']}, alpha={best['alpha']}")
-    # Hints frontera
     try:
         if len(grid_ranks) > 0 and best["rank"] in (min(grid_ranks), max(grid_ranks)):
             which = "mínimo" if best["rank"] == min(grid_ranks) else "máximo"
@@ -661,7 +620,6 @@ def time_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig) -> Tuple[GSC
 
 def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
                      trials: int = 300, seed: int = 42) -> Tuple[GSCConfig, Dict]:
-    """Selección de hiperparámetros con Optuna (rank, tau, alpha, include_covariates, max_inner)."""
     try:
         import optuna  # type: ignore
         optuna.logging.set_verbosity(optuna.logging.CRITICAL)
@@ -678,38 +636,22 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
     U, T = ep.Y.shape
     max_rank = int(max(1, min(U - 1, T - 1, 10)))
 
-    # Rangos adaptativos y estables
     s0 = _svd_scale_pre(ep)
     tau_lo = float(max(1e-3, 0.05 * s0))
     tau_hi = float(max(tau_lo * 1.25, 0.8 * s0))
     alpha_lo, alpha_hi = 1e-5, 1e-1
 
-    def eval_cfg(cfg_try: GSCConfig, use_X: bool) -> float:
-        scores = []
-        for step, (gap_idx, hold_idx) in enumerate(folds):
-            M_train = _apply_time_mask(ep.M, gap_idx, hold_idx)
-            model = GSCModel(cfg_try).fit(ep.Y, M_train, ep.X if use_X else None)
-            Yhat = model.predict(ep.X if use_X else None)
-            y_true = ep.Y[ep.treated_row, hold_idx]
-            y_hat = Yhat[ep.treated_row, hold_idx]
-            scores.append(_rmspe(y_true, y_hat))
-        sc = float(np.nanmedian(scores))
-        return _finite_or_big(sc)
-
     pruner = MedianPruner(n_warmup_steps=max(1, len(folds) // 2))
     sampler = optuna.samplers.TPESampler(seed=seed)
-    study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner,
-                                study_name="gsc_hpo")
+    study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner, study_name="gsc_hpo")
 
     def objective(trial) -> float:
         rank = trial.suggest_int("rank", 1, max_rank)
         tau = trial.suggest_float("tau", tau_lo, tau_hi, log=True)
         alpha = trial.suggest_float("alpha", alpha_lo, alpha_hi, log=True)
-
         incX = base_cfg.include_covariates and (ep.X is not None and ep.X.ndim == 3 and ep.X.shape[2] > 0)
         if incX:
             incX = trial.suggest_categorical("include_covariates", [True, False])
-
         max_inner = trial.suggest_int("max_inner", 60, 200)
 
         cfg_try = GSCConfig(rank=rank, tau=tau, alpha=alpha,
@@ -777,10 +719,8 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
 # ---------------------------------------------------------------------
 
 def placebo_space(ep: EpisodeWide, cfg: GSCConfig, max_units: int = 20) -> pd.DataFrame:
-    """Trata cada control como 'víctima' (misma ventana temporal) y estima ATT placebo."""
     rows = []
-    control_rows = [i for i in range(len(ep.units)) if i != ep.treated_row]
-    control_rows = control_rows[:max_units]
+    control_rows = [i for i in range(len(ep.units)) if i != ep.treated_row][:max_units]
     for r in control_rows:
         M_alt = ep.M.copy()
         M_alt[r, ep.treated_post_mask] = False
@@ -796,7 +736,6 @@ def placebo_space(ep: EpisodeWide, cfg: GSCConfig, max_units: int = 20) -> pd.Da
     return pd.DataFrame(rows)
 
 def placebo_time(ep: EpisodeWide, cfg: GSCConfig) -> pd.DataFrame:
-    """In-time placebo: desplaza ventana (mismo largo) dentro del pre de la víctima."""
     pre_idx = np.where(ep.pre_mask)[0]
     Lpre = len(pre_idx)
     Lpost = int(ep.treated_post_mask.sum())
@@ -818,7 +757,6 @@ def placebo_time(ep: EpisodeWide, cfg: GSCConfig) -> pd.DataFrame:
     }])
 
 def leave_one_out(ep: EpisodeWide, cfg: GSCConfig, max_units: int = 20) -> pd.DataFrame:
-    """Robustez: excluir un control a la vez."""
     rows = []
     control_rows = [i for i in range(len(ep.units)) if i != ep.treated_row][:max_units]
     for r in control_rows:
@@ -840,9 +778,7 @@ def leave_one_out(ep: EpisodeWide, cfg: GSCConfig, max_units: int = 20) -> pd.Da
 def global_sensitivity(ep: EpisodeWide,
                        base_cfg: GSCConfig,
                        n_samples: int = 24) -> pd.DataFrame:
-    """Barrido global simple sobre hiperparámetros/especificaciones."""
     rng = np.random.default_rng(base_cfg.random_state)
-    # Límites adaptativos suaves
     U, T = ep.Y.shape
     max_rank = int(max(1, min(U - 1, T - 1, 10)))
     s0 = _svd_scale_pre(ep)
@@ -880,10 +816,6 @@ def global_sensitivity(ep: EpisodeWide,
 
 @dataclass
 class RunConfig:
-    gsc_dir: Path
-    donors_csv: Path
-    episodes_index: Optional[Path]
-    out_dir: Path
     include_covariates: bool = True
     max_episodes: Optional[int] = None
     log_level: str = "INFO"
@@ -914,12 +846,40 @@ class RunConfig:
     train_gap: int = 7
     # HPO
     hpo_trials: int = 300  # 0 => off
-    # --- robustez/no-negatividad ---
-    link: str = "identity"               # 'identity' | 'log1p'
+    # robustez/no-negatividad
+    link: str = "identity"
     link_eps: float = 0.0
-    pred_clip_min: Optional[float] = 0.0 # None => sin clip
-    calibrate_victim: str = "level"      # 'none' | 'level' | 'level_and_trend'
-    post_smooth_window: int = 1          # 1 => sin suavizado
+    pred_clip_min: Optional[float] = 0.0
+    calibrate_victim: str = "level"
+    post_smooth_window: int = 1
+    # Salidas
+    out_dir: Path = field(default_factory=lambda: _data_root() / "processed" / "gsc")
+    # NUEVO: etiquetar experimento y resolver raíz figures/<exp_tag>
+    exp_tag: str = "A_base"
+    fig_root: Path = Path(default_factory=_fig_root)
+    gsc_dir: Path = field(default_factory=lambda: _data_root() / "processed" / "gsc")
+    donors_csv: Path = field(default_factory=lambda: _data_root() / "processed" / "donors.csv")
+    episodes_index: Optional[Path] = field(default_factory=lambda: _data_root() / "processed" / "episodes_index.parquet")
+
+from dataclasses import field  # si el archivo define dataclasses con default_factory
+def _data_root() -> Path:
+    """
+    Prefiere ./.data; si no existe, intenta ./data; y por último crea ./.data.
+    """
+    for cand in (Path("./.data"), Path("./data")):
+        try:
+            if cand.exists():
+                return cand
+        except Exception:
+            pass
+    return Path("./.data")
+
+def _fig_root() -> Path:
+    return Path("./figures")
+
+# --- helper local (colócalo cerca de otros helpers de paths) ---
+def _exp_root(exp_tag: Optional[str]) -> Optional[Path]:
+    return (Path("figures") / str(exp_tag)) if exp_tag else None
 
 def _discover_episode_files(gsc_dir: Path) -> List[Path]:
     files = [p for p in gsc_dir.glob("*.parquet") if p.name != "donor_quality.parquet"]
@@ -940,7 +900,7 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
     df = _load_episode_df(p)
     epw = long_to_wide_for_episode(df, include_covariates=cfg.include_covariates)
 
-    # Config base
+    # Config base y CV
     base = GSCConfig(rank=cfg.rank, tau=cfg.tau, alpha=cfg.alpha,
                      max_inner=cfg.max_inner, max_outer=cfg.max_outer,
                      tol=cfg.tol, include_covariates=cfg.include_covariates,
@@ -952,14 +912,12 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
                      post_smooth_window=cfg.post_smooth_window)
     cv_cfg = CVCfg(folds=cfg.cv_folds, holdout_days=cfg.cv_holdout, gap_days=cfg.cv_gap,
                    grid_ranks=cfg.grid_ranks, grid_tau=cfg.grid_tau, grid_alpha=cfg.grid_alpha)
-
-    # Selección de hiperparámetros
     if cfg.hpo_trials and cfg.hpo_trials > 0:
         best_cfg, cv_info = optuna_cv_select(epw, cv_cfg, base, trials=cfg.hpo_trials, seed=cfg.random_state)
     else:
         best_cfg, cv_info = time_cv_select(epw, cv_cfg, base)
 
-    # Entrenamiento final con embargo antes del tratamiento (para robustez)
+    # Entrenamiento final con embargo en PRE
     M_final = epw.M.copy()
     pre_idx = np.where(epw.pre_mask)[0]
     if len(pre_idx) > 0 and cfg.train_gap > 0:
@@ -969,12 +927,12 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
     model = GSCModel(best_cfg).fit(epw.Y, M_final, epw.X if best_cfg.include_covariates else None)
     Yhat = model.predict(epw.X if best_cfg.include_covariates else None)
 
-    # ---- Serie plot‑ready + log de NaNs en observado -----------
+    # Serie víctima
     y_obs_vec = epw.Y[epw.treated_row, :]
     y_hat_vec = Yhat[epw.treated_row, :]
     obs_mask  = np.isfinite(y_obs_vec)
 
-    # (Calibración exacta con y_obs en PRE y suavizado — solo víctima)
+    # Calibración exacta en PRE (nivel o nivel+trend)
     mode = (best_cfg.calibrate_victim or "none").lower()
     if mode in {"level", "level_and_trend"}:
         jj = np.where(epw.pre_mask & obs_mask)[0]
@@ -984,7 +942,6 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
                 bias = float(np.nanmean(res))
                 y_hat_vec = y_hat_vec + bias
             else:
-                # level + trend: ajuste lineal de residuales ~ a + b*t
                 t = jj.astype(float)
                 t0 = float(np.mean(t))
                 t_c = t - t0
@@ -1002,60 +959,86 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
     W = int(max(1, best_cfg.post_smooth_window))
     if W > 1:
         k = np.ones(W, dtype=float) / float(W)
-        row_conv = np.convolve(np.nan_to_num(y_hat_vec, nan=np.nanmean(y_hat_vec)), k, mode="same")
+        base_val = float(np.nanmean(y_hat_vec)) if np.isfinite(np.nanmean(y_hat_vec)) else 0.0
+        row_conv = np.convolve(np.nan_to_num(y_hat_vec, nan=base_val), k, mode="same")
         y_hat_vec = row_conv
 
-    # Clip mínimo (no-negatividad)
+    # No-negatividad
     if best_cfg.pred_clip_min is not None:
         y_hat_vec = np.maximum(y_hat_vec, float(best_cfg.pred_clip_min))
 
-    # Sustituir fila víctima en Yhat por la calibrada/suavizada/clipped
+    # Inyectar la fila calibrada en la matriz final
     Yhat[epw.treated_row, :] = y_hat_vec
 
-    # Política de relleno SOLO PARA GRÁFICO:
-    y_obs_plot = np.where(obs_mask, y_obs_vec, 0.0)
+    # Métricas PRE
+    y_obs_pre = y_obs_vec[epw.pre_mask]
+    y_hat_pre = Yhat[epw.treated_row, epw.pre_mask]
+    rmspe_pre = _rmspe(y_obs_pre, y_hat_pre)
+    mae_pre   = _mae(y_obs_pre, y_hat_pre)
 
-    # Sanity extra: ¿reconstrucción perfecta?
-    if np.allclose(y_hat_vec, y_obs_vec, atol=1e-12):
-        n_false = int(np.sum(~epw.M[epw.treated_row, :]))
-        logging.warning(f"[{ep_id}] Reconstrucción perfecta (y_hat ≈ y_obs). "
-                        f"Verifica máscara: celdas no‑entrenadas en víctima = {n_false}.")
+    # ---- Anti-overfit: re‑entrena si PRE ≈ copiado ----
+    overfit_refit = False
+    if (np.isfinite(rmspe_pre) and rmspe_pre < 1e-8) or np.allclose(y_obs_pre, y_hat_pre, atol=1e-10, rtol=0.0):
+        overfit_refit = True
+        logging.warning(f"[{ep_id}] PRE ≈ reconstrucción perfecta (RMSPE_pre≈0). Re‑entrenando con mayor regularización.")
+        s0 = _svd_scale_pre(epw)
+        # subir tau (regularización nuclear) y bajar rank (capacidad)
+        safer_cfg = GSCConfig(
+            rank=max(1, min(best_cfg.rank,  max(1, best_cfg.rank // 2))),
+            tau=max(best_cfg.tau * 3.0, 0.25 * s0),
+            alpha=max(best_cfg.alpha, 0.01),
+            max_inner=best_cfg.max_inner,
+            max_outer=best_cfg.max_outer,
+            tol=best_cfg.tol,
+            include_covariates=best_cfg.include_covariates,
+            random_state=best_cfg.random_state,
+            standardize_y=True,
+            link=best_cfg.link, link_eps=best_cfg.link_eps,
+            pred_clip_min=best_cfg.pred_clip_min,
+            calibrate_victim=best_cfg.calibrate_victim,
+            post_smooth_window=best_cfg.post_smooth_window,
+        )
+        model = GSCModel(safer_cfg).fit(epw.Y, M_final, epw.X if safer_cfg.include_covariates else None)
+        Yhat = model.predict(epw.X if safer_cfg.include_covariates else None)
+        y_hat_vec = Yhat[epw.treated_row, :]
+        # recalibración ligera de nivel
+        jj = np.where(epw.pre_mask & obs_mask)[0]
+        if jj.size > 0:
+            bias = float(np.nanmean(y_obs_vec[jj] - y_hat_vec[jj]))
+            y_hat_vec = y_hat_vec + bias
+            if safer_cfg.pred_clip_min is not None:
+                y_hat_vec = np.maximum(y_hat_vec, float(safer_cfg.pred_clip_min))
+            Yhat[epw.treated_row, :] = y_hat_vec
+        y_hat_pre = Yhat[epw.treated_row, epw.pre_mask]
+        rmspe_pre = _rmspe(y_obs_pre, y_hat_pre)
+        mae_pre   = _mae(y_obs_pre, y_hat_pre)
 
-    n_nan_pre  = int(np.sum(~obs_mask[epw.pre_mask]))
-    n_nan_post = int(np.sum(~obs_mask[epw.treated_post_mask]))
-    logging.info(f"[{ep_id}] NaN en y_obs | pre={n_nan_pre} | post={n_nan_post}")
+    # Serie para gráfico (observado con fill para huecos de render)
+    y_obs_plot = np.where(np.isfinite(y_obs_vec), y_obs_vec, 0.0)
 
     # Efectos
     eff_post = y_obs_vec[epw.treated_post_mask] - y_hat_vec[epw.treated_post_mask]
-    y_obs_pre = y_obs_vec[epw.pre_mask]
-    y_hat_pre = Yhat[epw.treated_row, epw.pre_mask]
-
-    # Métricas NaN‑safe
-    rmspe_pre = _rmspe(y_obs_pre, y_hat_pre)
-    mae_pre   = _mae(y_obs_pre, y_hat_pre)
     att_mean  = float(np.nanmean(eff_post))
     att_sum   = float(np.nansum(eff_post))
     base_level = float(np.nanmean(y_obs_pre))
     rel_att   = _safe_pct(att_mean, base_level)
 
     # Guardar serie contrafactual + columnas plot‑ready
+    
     cf_dir = cfg.out_dir / "cf_series"
     _ensure_dir(cf_dir)
-
     effect = y_obs_vec - y_hat_vec
-    effect_plot = y_obs_plot - y_hat_vec
     cum_effect_obs = np.cumsum(np.where(np.isfinite(effect), effect, 0.0))
-
     cf = pd.DataFrame({
         "episode_id": ep_id,
         "date": [epw.dates[j] for j in range(len(epw.dates))],
         "y_obs": y_obs_vec,
         "y_hat": y_hat_vec,
         "treated_time": epw.treated_post_mask.astype(int),
-        "obs_mask": obs_mask.astype(int),
+        "obs_mask": np.isfinite(y_obs_vec).astype(int),
         "y_obs_plot": y_obs_plot,
         "effect": effect,
-        "effect_plot": effect_plot,
+        "effect_plot": y_obs_plot - y_hat_vec,
         "cum_effect": pd.Series(effect).cumsum(),
         "cum_effect_obs": cum_effect_obs
     })
@@ -1119,6 +1102,11 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
             "rmspe_pre": rmspe_pre, "mae_pre": mae_pre,
             "att_mean": att_mean, "att_sum": att_sum, "rel_att_vs_pre_mean": rel_att
         },
+        "mask_debug": {
+            "train_victim_post_before": epw.meta["n_train_victim_post_before"],
+            "train_victim_post_after": epw.meta["n_train_victim_post_after"]
+        },
+        "overfit_refit": bool(overfit_refit),
         "p_value_placebo_space": pval_space,
         "paths": {
             "cf": str(cf_path),
@@ -1137,7 +1125,6 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
     with open(rep_dir / f"{ep_id}.json", "w", encoding="utf-8") as f:
         json.dump(rep, f, ensure_ascii=False, indent=2, default=str)
 
-    # Resumen para métricas globales
     summary = {
         "episode_id": ep_id,
         "victim_unit": epw.meta["victim_unit"],
@@ -1155,7 +1142,8 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
         "link": best_cfg.link,
         "pred_clip_min": best_cfg.pred_clip_min,
         "calibrate_victim": best_cfg.calibrate_victim,
-        "post_smooth_window": best_cfg.post_smooth_window
+        "post_smooth_window": best_cfg.post_smooth_window,
+        "overfit_refit": bool(overfit_refit),
     }
     return summary
 
@@ -1164,7 +1152,9 @@ def run_batch(cfg: RunConfig) -> None:
     logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO),
                         format="%(asctime)s | %(levelname)s | %(message)s",
                         datefmt="%Y-%m-%d %H:%M:%S")
-
+                        
+    
+    cfg.out_dir = (cfg.gsc_dir / cfg.exp_tag / "gsc").resolve()
     gsc_dir = cfg.gsc_dir
     if not gsc_dir.exists():
         alt = Path("./data/processed/gsc")
@@ -1190,7 +1180,7 @@ def run_batch(cfg: RunConfig) -> None:
             logging.info(f"[{k}/{len(files)}] Ejecutando GSC en {p.name} ...")
             summ = run_episode(p, cfg)
             metrics.append(summ)
-            logging.info(f"OK {p.stem} | ATT_sum={summ['att_sum']:.3f} | RMSPE_pre={summ['rmspe_pre']:.4f}")
+            logging.info(f"OK {p.stem} | ATT_sum={summ['att_sum']:.3f} | RMSPE_pre={summ['rmspe_pre']:.4f} | refit={summ['overfit_refit']}")
         except Exception as e:
             logging.exception(f"Error en episodio {p.name}: {e}")
 
@@ -1209,10 +1199,10 @@ def run_batch(cfg: RunConfig) -> None:
 
 def parse_args() -> RunConfig:
     p = argparse.ArgumentParser(description="GSC (Generalized Synthetic Control) para episodios de canibalización.")
-    p.add_argument("--gsc_dir", type=str, default="./.data/processed_data/gsc", help="Directorio con parquets de episodios GSC.")
-    p.add_argument("--donors_csv", type=str, default="./.data/processed_data/donors_per_victim.csv", help="CSV donantes por víctima (opcional).")
-    p.add_argument("--episodes_index", type=str, default="./.data/processed_data/episodes_index.parquet", help="Índice de episodios (opcional).")
-    p.add_argument("--out_dir", type=str, default="./.data/processed_data/gsc_outputs", help="Directorio de salida.")
+    p.add_argument("--gsc_dir", type=str, default=str(_data_root() / "processed_data/gsc"))
+    p.add_argument("--donors_csv", type=str, default=str(_data_root() / "processed_data/donors_per_victim.csv"))
+    p.add_argument("--episodes_index", type=str, default=str(_data_root() / "processed_data/episodes_index.parquet"))
+    p.add_argument("--out_dir", type=str, default=None)
     p.add_argument("--include_covariates", action="store_true", help="Usar covariables X_it en el ajuste (por defecto: off).")
     p.add_argument("--max_episodes", type=int, default=None, help="Limitar # episodios a procesar.")
     p.add_argument("--log_level", type=str, default="INFO")
@@ -1222,7 +1212,7 @@ def parse_args() -> RunConfig:
     p.add_argument("--cv_holdout", type=int, default=21)
     p.add_argument("--cv_gap", type=int, default=7, help="Embargo (días) antes del holdout en CV temporal.")
 
-    # Grillas (se sanea automáticamente a dominios válidos)
+    # Grillas
     p.add_argument("--grid_ranks", type=str, default="1,2,3")
     p.add_argument("--grid_tau", type=str, default="0.5,1.0,2.0")
     p.add_argument("--grid_alpha", type=str, default="0.001,0.01,0.1")
@@ -1250,24 +1240,25 @@ def parse_args() -> RunConfig:
     p.add_argument("--hpo_trials", type=int, default=300,
                    help="N° de trials de Optuna para rank/tau/alpha/include_covariates/max_inner (0=off).")
 
-    # --- robustez/no‑negatividad ---
-    p.add_argument("--link", type=str, default="identity", choices=["identity", "log1p"],
-                   help="Transformación del objetivo Y (identity|log1p).")
+    # robustez/no‑negatividad
+    p.add_argument("--link", type=str, default="identity", choices=["identity", "log1p"], help="Transformación del objetivo Y.")
     p.add_argument("--link_eps", type=float, default=0.0, help="Epsilon para log1p cuando hay ceros.")
-    p.add_argument("--pred_clip_min", type=str, default="0",
-                   help="Mínimo de predicción (float) o 'none' para desactivar clipping.")
-    p.add_argument("--calibrate_victim", type=str, default="level",
-                   choices=["none", "level", "level_and_trend"],
+    p.add_argument("--pred_clip_min", type=str, default="0", help="Mínimo de predicción (float) o 'none' para desactivar clipping.")
+    p.add_argument("--calibrate_victim", type=str, default="level", choices=["none", "level", "level_and_trend"],
                    help="Corrección post‑ajuste en PRE para la víctima.")
-    p.add_argument("--post_smooth_window", type=int, default=1,
-                   help="Tamaño de ventana de suavizado del contrafactual de la víctima (1 = off).")
+    p.add_argument("--post_smooth_window", type=int, default=1, help="Tamaño de ventana de suavizado (1 = off).")
 
+    p.add_argument("--exp_tag", type=str, default=None,
+                   help="Etiqueta del experimento. Si se define, todo se guarda en figures/<exp_tag>/gsc")
+
+    p.add_argument("--episodes_index", type=str, default="./.data/processed_data/episodes_index.parquet",
+                   help="Índice de episodios (opcional).")
+    
     a = p.parse_args()
     grid_ranks = tuple(int(x.strip()) for x in a.grid_ranks.split(",") if x.strip())
     grid_tau = tuple(float(x.strip()) for x in a.grid_tau.split(",") if x.strip())
     grid_alpha = tuple(float(x.strip()) for x in a.grid_alpha.split(",") if x.strip())
 
-    # Parse pred_clip_min
     clip_min: Optional[float]
     if isinstance(a.pred_clip_min, str) and a.pred_clip_min.strip().lower() == "none":
         clip_min = None
@@ -1277,11 +1268,14 @@ def parse_args() -> RunConfig:
         except Exception:
             clip_min = 0.0
 
+    exp_root = _exp_root(a.exp_tag)
+    out_dir = (exp_root / "gsc") if exp_root else _to_path(a.out_dir)
+
     return RunConfig(
         gsc_dir=_to_path(a.gsc_dir),
         donors_csv=_to_path(a.donors_csv),
         episodes_index=_to_path(a.episodes_index) if a.episodes_index else None,
-        out_dir=_to_path(a.out_dir),
+
         include_covariates=bool(a.include_covariates),
         max_episodes=a.max_episodes,
         log_level=a.log_level,
@@ -1302,6 +1296,9 @@ def parse_args() -> RunConfig:
         pred_clip_min=clip_min,
         calibrate_victim=a.calibrate_victim,
         post_smooth_window=max(1, int(a.post_smooth_window))
+        out_dir=out_dir,
+        exp_tag=a.exp_tag,
+        fig_root=exp_root,
     )
 
 
