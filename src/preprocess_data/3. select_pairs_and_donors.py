@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+from dataclasses import dataclass, field
+from pathlib import Path
+import argparse
+import logging
+import os
+import shutil
 
 import os
 import sys
@@ -20,6 +26,80 @@ from collections import OrderedDict, defaultdict
 # =============================================================================
 # Utilidades ENV
 # =============================================================================
+
+
+
+def _data_root() -> Path:
+    """
+    Prefiere ./.data; si no existe, intenta ./data; y por último crea ./.data.
+    """
+    for cand in (Path("./.data"), Path("./data")):
+        try:
+            if cand.exists():
+                return cand
+        except Exception:
+            pass
+    return Path("./.data")
+
+
+@dataclass
+class RunConfig:
+    # Entradas
+    H_csv: Path
+    train_csv: Path
+    items_csv: Path
+    stores_csv: Path
+    # Salidas base (se respeta exp_tag)
+    out_dir: Path = field(default_factory=lambda: _data_root() / "processed_data")
+    exp_tag: str | None = None
+    log_level: str = "INFO"
+
+def _ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def _touch_exp_fingerprint(dirpath: Path, exp_tag: str | None):
+    if not exp_tag:
+        return
+    try:
+        (dirpath / f".exp_{exp_tag}.stamp").write_text(exp_tag, encoding="utf-8")
+    except Exception:
+        pass
+
+def run_batch(cfg: RunConfig) -> dict:
+    logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO))
+    outdir_final = (cfg.out_dir / cfg.exp_tag) if cfg.exp_tag else cfg.out_dir
+    _ensure_dir(outdir_final)
+    _touch_exp_fingerprint(outdir_final, cfg.exp_tag)
+
+    # Ejecuta tu función principal usando el outdir scoped
+    pairs_path, donors_path = select_pairs_and_donors(
+        H_csv=str(cfg.H_csv),
+        train_csv=str(cfg.train_csv),
+        items_csv=str(cfg.items_csv),
+        stores_csv=str(cfg.stores_csv),
+        outdir=str(outdir_final),
+    )
+
+    # Normalizamos nombres canónicos esperados aguas abajo
+    try:
+        # pairs windows (GSC subset) ya se escribe como "pairs_windows.csv" por tu función
+        # índices canónicos (tu función también los escribe)
+        epi_idx_gsc  = outdir_final / "episodes_index.parquet"
+        epi_idx_meta = outdir_final / "episodes_index_meta.parquet"
+        for p in [Path(pairs_path), Path(donors_path), epi_idx_gsc, epi_idx_meta]:
+            if not p.exists():
+                logging.warning("[select_pairs_and_donors] Aviso: esperado pero no encontrado -> %s", p)
+    except Exception:
+        pass
+
+    return {
+        "out_dir": str(outdir_final),
+        "pairs_path": str(Path(pairs_path)),
+        "donors_path": str(Path(donors_path)),
+        "episodes_index": str(outdir_final / "episodes_index.parquet"),
+        "episodes_index_meta": str(outdir_final / "episodes_index_meta.parquet"),
+    }
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -1742,20 +1822,28 @@ def select_pairs_and_donors(H_csv: str, train_csv: str, items_csv: str, stores_c
 # =============================================================================
 # CLI
 # =============================================================================
+def parse_args() -> RunConfig:
+    p = argparse.ArgumentParser(description="Select pairs & donors con scoping por experimento.")
+    p.add_argument("--H", required=True, help="Ruta a features_h_exposure.csv (con 'class').")
+    p.add_argument("--train", required=True, help="Ruta a train.csv.")
+    p.add_argument("--items", required=True, help="Ruta a items.csv.")
+    p.add_argument("--stores", required=True, help="Ruta a stores.csv.")
+    p.add_argument("--out_dir", type=str, default=str(_data_root() / "processed_data"),
+                   help="Directorio raíz de salida (se aplicará /<exp_tag> si se define).")
+    p.add_argument("--exp_tag", type=str, default=None, help="Etiqueta de experimento (subcarpeta).")
+    p.add_argument("--log_level", type=str, default="INFO")
+    a = p.parse_args()
+    return RunConfig(
+        H_csv=Path(a.H),
+        train_csv=Path(a.train),
+        items_csv=Path(a.items),
+        stores_csv=Path(a.stores),
+        out_dir=Path(a.out_dir),
+        exp_tag=a.exp_tag,
+        log_level=a.log_level,
+    )
+
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser(description="Genera episodios para Meta y un subconjunto para GSC + donantes (optimizado + filtro de episodios fáciles).")
-    ap.add_argument("--H", required=True, help="features_h_exposure.csv (con o sin 'class')")
-    ap.add_argument("--train", required=True, help="train.csv")
-    ap.add_argument("--items", required=True, help="items.csv")
-    ap.add_argument("--stores", required=True, help="stores.csv")
-    ap.add_argument("--outdir", default="data", help="Directorio de salida")
-    args = ap.parse_args()
-    try:
-        p1, p2 = select_pairs_and_donors(args.H, args.train, args.items, args.stores, args.outdir)
-        print("[OK] Generados:")
-        print(" -", p1)  # pairs Windows (subconjunto GSC)
-        print(" -", p2)  # donors_per_victim.csv
-    except Exception as e:
-        _LOGGER.error(f"Fallo en ejecución: {e}\n{traceback.format_exc()}")
-        sys.exit(1)
+    cfg = parse_args()
+    out = run_batch(cfg)
+    print(json.dumps(out, ensure_ascii=False, indent=2))

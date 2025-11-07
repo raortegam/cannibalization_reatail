@@ -789,16 +789,57 @@ def attach_controls(panel: pd.DataFrame,
         if c in df.columns:
             df[c] = df[c].fillna(0.0)
 
+    # --- Proxies semanales por tienda (Fsw_log1p) ---
     if weekly_store_proxy is not None:
-        df = _safe_merge(df, weekly_store_proxy, on=["year_week", "store_nbr"], how="left", validate="many_to_one", name="panel×weekly_store_proxy")
-        df["Fsw_log1p"] = df["Fsw_log1p"].fillna(method="ffill").fillna(0.0)
-    if weekly_oil_proxy is not None:
-        df = _safe_merge(df, weekly_oil_proxy, on="year_week", how="left", validate="many_to_one", name="panel×weekly_oil_proxy")
-        df["Ow"] = df["Ow"].fillna(method="ffill").fillna(0.0)
+        df = _safe_merge(
+            df, weekly_store_proxy,
+            on=["year_week", "store_nbr"], how="left",
+            validate="many_to_one", name="panel×weekly_store_proxy"
+        )
+        # ordenar antes de propagar
+        df = df.sort_values(["store_nbr", "date"])
+        # ffill/bfill por tienda (sin deprecations)
+        df["Fsw_log1p"] = (
+            df.groupby("store_nbr", observed=False)["Fsw_log1p"]
+            .ffill().bfill().fillna(0.0)
+            .astype(float)
+        )
 
+    # --- Proxy semanal de petróleo (Ow) ---
+    if weekly_oil_proxy is not None:
+        df = _safe_merge(
+            df, weekly_oil_proxy,
+            on="year_week", how="left",
+            validate="many_to_one", name="panel×weekly_oil_proxy"
+        )
+        df = df.sort_values(["date"])
+        df["Ow"] = df["Ow"].ffill().bfill().fillna(0.0).astype(float)
+
+    # --- Proxy regional (cuota tienda dentro del estado esa semana) ---
     if cfg.use_regional_proxy and regional_proxy is not None:
-        df = _safe_merge(df, regional_proxy, on=["year_week", "store_nbr"], how="left", validate="many_to_one", name="panel×regional_proxy")
-        df["F_state_excl_store_log1p"] = df["F_state_excl_store_log1p"].fillna(method="ffill").fillna(0.0)
+        df = _safe_merge(
+            df, regional_proxy,
+            on=["year_week", "store_nbr"], how="left",
+            validate="many_to_one", name="panel×regional_proxy"
+        )
+        # 'regional_proxy' es la cuota en [0,1]; el resto del pipeline espera F_state_excl_store_log1p
+        # Creamos la columna derivada y la propagamos por tienda.
+        if "regional_proxy" in df.columns:
+            df["F_state_excl_store_log1p"] = np.log1p(
+                pd.to_numeric(df["regional_proxy"], errors="coerce").clip(lower=0.0)
+            )
+        else:
+            # por seguridad, si no llegó la columna tras el merge
+            df["F_state_excl_store_log1p"] = np.nan
+
+        df = df.sort_values(["store_nbr", "date"])
+        df["F_state_excl_store_log1p"] = (
+            df.groupby("store_nbr", observed=False)["F_state_excl_store_log1p"]
+            .ffill().bfill().fillna(0.0)
+            .astype(float)
+        )
+        # (opcional) podemos conservar 'regional_proxy' para auditoría o eliminarla:
+        # df = df.drop(columns=["regional_proxy"], errors="ignore")
 
     if cfg.add_promo_pressure and promo_ctx is not None:
         df = _safe_merge(df, promo_ctx, on=["store_nbr", "class", "date"], how="left", validate="many_to_one", name="panel×promo_pressure")
@@ -1435,3 +1476,5 @@ def parse_args() -> PrepConfig:
 if __name__ == "__main__":
     cfg = parse_args()
     prepare_datasets(cfg)
+
+    

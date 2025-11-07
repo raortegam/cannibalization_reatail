@@ -1,7 +1,7 @@
 {
   "project_name": "cannibalization_retail__A_base",
-  "start_time": "2025-11-05T14:05:28.926907",
-  "log_file": "D:\\repos\\cannibalization_reatail\\diagnostics\\pipeline_A_base_20251105_140528.log",
+  "start_time": "2025-11-06T18:18:39.510911",
+  "log_file": "D:\\repos\\cannibalization_reatail\\diagnostics\\pipeline_A_base_20251106_181839.log",
   "steps": {
     "step1": {
       "status": "ok",
@@ -81,13 +81,31 @@
     "step5_gsc": {
       "status": "skipped_or_failed",
       "outputs": {
-        "gsc_metrics": ".data\\processed_data\\gsc_outputs\\A_base\\gsc_metrics.parquet",
-        "gsc_cf_series_dir": ".data\\processed_data\\gsc_outputs\\A_base\\cf_series",
+        "gsc_metrics": ".data\\processed_data\\A_base\\gsc\\gsc_metrics.parquet",
+        "gsc_cf_series_dir": ".data\\processed_data\\A_base\\gsc\\cf_series",
         "episodes_done": []
       }
     },
     "step6_meta": {
-      "status": "skipped_or_failed"
+      "status": "ok",
+      "outputs": {
+        "x": {
+          "meta_metrics": ".data\\processed_data\\meta_outputs\\A_base\\x\\meta_metrics_x.parquet",
+          "cf_series_dir": ".data\\processed_data\\meta_outputs\\A_base\\x\\cf_series",
+          "episodes_done": [
+            "2-913363_2-841614_20170628",
+            "2-913363_2-911989_20170628",
+            "4-913363_4-841612_20170628",
+            "7-1576326_7-1576263_20161006",
+            "7-1576326_7-1576285_20161006",
+            "7-1576330_7-1576263_20161006",
+            "7-1576330_7-1576285_20161006",
+            "7-463901_7-1017791_20160915",
+            "7-463901_7-1460018_20160915",
+            "7-463901_7-801217_20160915"
+          ]
+        }
+      }
     },
     "eda_algorithms": {
       "status": "ok",
@@ -95,9 +113,9 @@
       "coverage": {
         "expected": 10,
         "gsc": 0,
-        "meta_union": 0,
-        "available": 0,
-        "missing": 10
+        "meta_union": 10,
+        "available": 10,
+        "missing": 0
       }
     }
   },
@@ -106,9 +124,9 @@
     "processed_dir": ".data\\processed_data\\A_base",
     "preprocessed_dir": ".data\\processed_data\\A_base",
     "figures_dir": "figures\\A_base",
-    "gsc_out_dir": ".data\\processed_data\\gsc_outputs\\A_base",
+    "gsc_out_dir": ".data\\processed_data\\A_base",
     "meta_out_root": ".data\\processed_data\\meta_outputs\\A_base",
     "exposure_csv": ".data\\processed_data\\A_base\\competitive_exposure.csv"
   },
-  "end_time": "2025-11-05T15:02:37.920566"
+  "end_time": "2025-11-06T19:34:18.232828"
 }

@@ -63,6 +63,21 @@ import pandas as pd
 # ---------------------------------------------------------------------
 # Utilidades generales
 # ---------------------------------------------------------------------
+from dataclasses import field  # si el archivo define dataclasses con default_factory
+def _data_root() -> Path:
+    """
+    Prefiere ./.data; si no existe, intenta ./data; y por último crea ./.data.
+    """
+    for cand in (Path("./.data"), Path("./data")):
+        try:
+            if cand.exists():
+                return cand
+        except Exception:
+            pass
+    return Path("./.data")
+
+def _fig_root() -> Path:
+    return Path("./figures")
 
 def _to_path(p: str | Path) -> Path:
     return p if isinstance(p, Path) else Path(p)
@@ -861,21 +876,7 @@ class RunConfig:
     donors_csv: Path = field(default_factory=lambda: _data_root() / "processed" / "donors.csv")
     episodes_index: Optional[Path] = field(default_factory=lambda: _data_root() / "processed" / "episodes_index.parquet")
 
-from dataclasses import field  # si el archivo define dataclasses con default_factory
-def _data_root() -> Path:
-    """
-    Prefiere ./.data; si no existe, intenta ./data; y por último crea ./.data.
-    """
-    for cand in (Path("./.data"), Path("./data")):
-        try:
-            if cand.exists():
-                return cand
-        except Exception:
-            pass
-    return Path("./.data")
 
-def _fig_root() -> Path:
-    return Path("./figures")
 
 # --- helper local (colócalo cerca de otros helpers de paths) ---
 def _exp_root(exp_tag: Optional[str]) -> Optional[Path]:
@@ -1295,10 +1296,10 @@ def parse_args() -> RunConfig:
         link=a.link, link_eps=a.link_eps,
         pred_clip_min=clip_min,
         calibrate_victim=a.calibrate_victim,
-        post_smooth_window=max(1, int(a.post_smooth_window))
+        post_smooth_window=max(1, int(a.post_smooth_window)),
         out_dir=out_dir,
         exp_tag=a.exp_tag,
-        fig_root=exp_root,
+        fig_root=exp_root
     )
 
 

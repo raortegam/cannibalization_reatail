@@ -113,6 +113,28 @@ def seed_everything(seed: int = 2025) -> None:
     except Exception:
         pass
 
+def _maybe_copy(src: Path, dst: Path, label: str) -> None:
+    """Si src existe y dst no, copia y deja traza."""
+    try:
+        if dst.exists():
+            return
+        if src.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            logging.info("[mirror] %s: %s -> %s", label, str(src), str(dst))
+    except Exception as e:
+        logging.warning("[mirror] No se pudo copiar %s -> %s: %s", str(src), str(dst), e)
+
+def _log_toggles(toggles: 'StepToggles') -> None:
+    try:
+        d = toggles.__dict__
+        on = [k for k, v in d.items() if v]
+        off = [k for k, v in d.items() if not v]
+        logging.info("Toggles ON: %s", ", ".join(sorted(on)))
+        logging.info("Toggles OFF: %s", ", ".join(sorted(off)))
+    except Exception:
+        pass
+
 
 def import_module_spawn_safe(module_name: str, real_path: Path):
     """
@@ -662,6 +684,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     log_path = setup_logging(cfg.log_level, cfg.log_to_file, exp_tag=exp_tag)
     logger = logging.getLogger("pipeline")
     seed_everything(cfg.seed)
+    _log_toggles(cfg.toggles)
 
     logger.info("Proyecto: %s", cfg.project_name)
     logger.info("Configuración cargada desde: %s", config_path)
@@ -697,7 +720,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         },
     }
 
-    # # -------------------- Paso 1: Data Quality --------------------
+    # # # -------------------- Paso 1: Data Quality --------------------
     step1_outputs = {}
     if cfg.toggles.step1:
         logger.info("Paso 1: Control de calidad y filtrado de datos 'train' y 'transactions'.")
@@ -826,7 +849,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("No pude validar columnas de exposure (%s): %s", exposure_path, e)
 
-    # # -------------------- Paso 3: select_pairs_and_donors + EDA 3 --------------------
+    # # # -------------------- Paso 3: select_pairs_and_donors + EDA 3 --------------------
     pairs_path = cfg.paths.preprocessed_dir / "pairs_windows.csv"
     donors_path = cfg.paths.preprocessed_dir / "donors_per_victim.csv"
 
@@ -918,12 +941,33 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         logger.info("Paso 3 deshabilitado por configuración.")
         manifest["steps"]["step3"] = {"status": "disabled"}
 
-    # Actualizar config para el paso 4
+
+        # --- Mirror opcional desde outdir_exp a processed_dir/<exp_tag> ---
+    try:
+        # processed_out_dir ya existe más abajo; aquí usamos la misma convención
+        processed_out_dir = cfg.paths.processed_dir
+        exp_tag_local = cfg.exp_tag if getattr(cfg, "exp_tag", None) else (exp_tag or "default")
+        # episodios (GSC) y meta
+        _maybe_copy(outdir_exp / "episodes_index.parquet",
+                    processed_out_dir / "episodes_index.parquet",
+                    "episodes_index (step3->processed_dir)")
+        _maybe_copy(outdir_exp / "episodes_index_meta.parquet",
+                    processed_out_dir / "episodes_index_meta.parquet",
+                    "episodes_index_meta (step3->processed_dir)")
+        _maybe_copy(pairs_path, processed_out_dir / "pairs_windows.csv",
+                    "pairs_windows (step3->processed_dir)")
+        _maybe_copy(donors_path, processed_out_dir / "donors_per_victim.csv",
+                    "donors (step3->processed_dir)")
+    except Exception:
+        pass
+  
+
+    # # Actualizar config para el paso 4
     cfg.params.episodes_path = pairs_path
     cfg.params.donors_path = donors_path
     cfg.params.outdir_pairs_donors = pairs_path.parent
 
-    # # -------------------- EDA 3 --------------------
+    # # # -------------------- EDA 3 --------------------
     if cfg.toggles.eda3:
         logger.info("EDA 3: Muestreo de episodios y diagnóstico de calidad.")
         try:
@@ -961,7 +1005,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         logger.info("EDA 3 deshabilitado por configuración.")
         manifest["steps"]["eda3"] = {"status": "disabled"}
 
-    # # -------------------- Paso 4: pre_algorithm + EDA 4 --------------------
+    # # # -------------------- Paso 4: pre_algorithm + EDA 4 --------------------
     processed_out_dir = cfg.paths.processed_dir
     episodes_path_for_step4 = cfg.params.episodes_path
     donors_path_for_step4 = cfg.params.donors_path
@@ -1105,7 +1149,10 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     if cfg.toggles.step5_gsc:
         logger.info("Paso 5: Ejecución de GSC (synthetic control generalizado).")
         episodes_index = processed_out_dir / "episodes_index.parquet"
-        gsc_in_dir = processed_out_dir / "gsc"
+        gsc_in_dir = processed_out_dir / "gsc"                     # insumos
+        gsc_out_dir = cfg.paths.gsc_out_dir / "gsc"               # <-- salida estandarizada (bajo <exp_tag>/gsc)
+        ensure_dir(gsc_out_dir)
+
         if not episodes_index.exists() or not gsc_in_dir.exists():
             logger.warning("Insumos de GSC no disponibles (episodes_index/gsc_dir). Paso 5 omitido.")
             manifest["steps"]["step5_gsc"] = {"status": "skipped_or_failed"}
@@ -1123,14 +1170,14 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 manifest["steps"]["step5_gsc"] = {"status": "skipped_or_failed"}
             else:
                 _assert_scoped(gsc_in_dir, exp_tag, "step5.gsc_in_dir", hard=cfg.hard_scope)
-                _assert_scoped(cfg.paths.gsc_out_dir, exp_tag, "step5.gsc_out_dir", hard=cfg.hard_scope)
-                _touch_fingerprint(cfg.paths.gsc_out_dir, exp_tag)
+                _assert_scoped(gsc_out_dir, exp_tag, "step5.gsc_out_dir", hard=cfg.hard_scope)
+                _touch_fingerprint(gsc_out_dir, exp_tag)
 
                 gsc_cfg = GSCRunConfig(
                     gsc_dir=Path(gsc_in_dir),
                     donors_csv=Path(donors_path),
                     episodes_index=Path(episodes_index),
-                    out_dir=Path(cfg.paths.gsc_out_dir),
+                    out_dir=Path(gsc_out_dir),                 # <-- salida unificada aquí
                     log_level=cfg.params.gsc_log_level,
                     max_episodes=cfg.params.gsc_max_episodes,
                     do_placebo_space=cfg.params.gsc_do_placebo_space,
@@ -1139,45 +1186,43 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                     max_loo=cfg.params.gsc_max_loo,
                     sens_samples=cfg.params.gsc_sens_samples,
                     cv_folds=cfg.params.gsc_cv_folds,
-                    cv_holdout=cfg.params.gsc_cv_holdout,  # nombre correcto
+                    cv_holdout=cfg.params.gsc_cv_holdout,
                     rank=cfg.params.gsc_rank,
                     tau=cfg.params.gsc_tau,
                     alpha=cfg.params.gsc_alpha,
                 )
                 _safe_call(gsc_run_batch, logger, cfg.fail_fast, "5. GSC run_batch", cfg=gsc_cfg)
-                out_metrics = cfg.paths.gsc_out_dir / "gsc_metrics.parquet"
+
+                # Buscamos métricas en la nueva ubicación canónica y con fallbacks
+                candidates = [
+                    gsc_out_dir / "gsc_metrics.parquet",
+                    cfg.paths.gsc_out_dir / "gsc_metrics.parquet",
+                    cfg.paths.gsc_out_dir / "metrics" / "gsc_metrics.parquet",
+                ]
+                out_metrics = None
+                for c in candidates:
+                    if c.exists():
+                        out_metrics = c
+                        break
+                if out_metrics is None:
+                    out_metrics = gsc_out_dir / "gsc_metrics.parquet"  # ruta canónica (para el assert)
                 _assert_exists(out_metrics, "step5.gsc_metrics")
 
-                # --- Sanidad GSC: no-RMSPE_pre≈0 y observado presente ---
-                try:
-                    if out_metrics.exists():
-                        mets = pd.read_parquet(out_metrics)
-                        cond = pd.Series(False, index=mets.index)
-                        if "rmspe_pre" in mets.columns:
-                            cond = cond | (mets["rmspe_pre"] <= RMSPE_EPS)
-                        if "has_observed" in mets.columns:
-                            cond = cond | (mets["has_observed"] == 0)
-                        bad = mets[cond]
-                        if len(bad) > 0:
-                            raise RuntimeError(f"GSC: {len(bad)} episodios con rmspe_pre≈0 o sin observado. Revisa EDA/inputs.")
-                except Exception as e:
-                    logger.warning("Chequeo de GSC (rmspe_pre/observado) no concluyente: %s", e)
-
-                # Episodios procesados
+                # Episodios procesados por GSC
                 episodes_done_gsc: List[Any] = []
                 try:
                     if out_metrics.exists():
-                        mets = pd.read_parquet(out_metrics)
-                        if "episode_id" in mets.columns:
-                            episodes_done_gsc = sorted(mets["episode_id"].dropna().unique().tolist())
+                        gm = pd.read_parquet(out_metrics)
+                        if "episode_id" in gm.columns:
+                            episodes_done_gsc = sorted(gm["episode_id"].dropna().unique().tolist())
                 except Exception:
                     pass
 
                 manifest["steps"]["step5_gsc"] = {
-                    "status": "ok" if out_metrics.exists() else "skipped_or_failed",
+                    "status": "ok" if (out_metrics and out_metrics.exists()) else "skipped_or_failed",
                     "outputs": {
                         "gsc_metrics": str(out_metrics),
-                        "gsc_cf_series_dir": str(cfg.paths.gsc_out_dir / "cf_series"),
+                        "gsc_cf_series_dir": str(gsc_out_dir / "cf_series"),
                         "episodes_done": episodes_done_gsc,
                     },
                 }
@@ -1185,7 +1230,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         logger.info("Paso 5 (GSC) deshabilitado por configuración.")
         manifest["steps"]["step5_gsc"] = {"status": "disabled"}
 
-    # -------------------- Paso 6: Algoritmos Meta-learners --------------------
+    # # -------------------- Paso 6: Algoritmos Meta-learners --------------------
     if cfg.toggles.step6_meta:
         logger.info("Paso 6: Ejecución de Meta‑learners (T/S/X).")
         meta_parquet = processed_out_dir / "meta" / "all_units.parquet"
@@ -1292,6 +1337,15 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 EDAAlgConfig = None  # type: ignore
 
         episodes_index_path = processed_out_dir / "episodes_index.parquet"
+
+        
+        if not episodes_index_path.exists():
+        # Fallback: usa el índice que generó step3 (si existe)
+            alt_from_step3 = cfg.params.outdir_pairs_donors / (cfg.exp_tag or exp_tag or "default") / "episodes_index.parquet"
+            if alt_from_step3.exists():
+                logging.warning("EDA_algorithms: se usará episodes_index desde Step 3: %s", str(alt_from_step3))
+                episodes_index_path = alt_from_step3
+            
 
         if eda_alg_run is None or EDAAlgConfig is None:
             logger.warning("EDA_algorithms no disponible (run/EDAConfig no encontrados).")
