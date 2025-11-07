@@ -52,14 +52,10 @@ Si 'effect' no existe, se calcula como (observado - contrafactual).
 Si no hay métricas en disco, se calculan por episodio con la ventana de episodes_index.
 """
 
-# EDA/EDA_algorithms.py
-from __future__ import annotations
-
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -77,51 +73,55 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 @dataclass
 class EDAConfig:
-    # Entradas obligatorias
+    # Entrada obligatoria
     episodes_index: Path
 
     # Salidas de algoritmos
-    gsc_out_dir: Optional[Path] = None         # salida de GSC (debe contener cf_series/)
-    meta_out_root: Optional[Path] = None       # raíz de meta (subcarpetas t/, s/, x/)
+    gsc_out_dir: Optional[Path] = None          # preferido
+    meta_out_root: Optional[Path] = None
 
-    # Compatibilidad hacia atrás (algunos scripts usan gsc_dir)
-    gsc_dir: Optional[Path] = None
+    # Compatibilidad hacia atrás
+    gsc_dir: Optional[Path] = None              # alias (se mapea a gsc_out_dir si viene)
 
     # Selección/estética
     meta_learners: Tuple[str, ...] = ("t", "s", "x")
     figures_dir: Path = Path("figures")
-    orientation: str = "landscape"             # "landscape" | "portrait"
+    orientation: str = "landscape"              # "landscape" | "portrait"
     dpi: int = 300
     style: str = "academic"
     font_size: int = 10
     grid: bool = True
+
+    # Límites de episodios (para render)
     max_episodes_gsc: Optional[int] = None
     max_episodes_meta: Optional[int] = None
+
+    # Exportación
     export_pdf: bool = True
 
     def __post_init__(self):
-        # Normalización de rutas/strings
+        # Normalizaciones
         self.episodes_index = Path(self.episodes_index)
         if self.meta_out_root is not None:
             self.meta_out_root = Path(self.meta_out_root)
         if self.figures_dir is not None:
             self.figures_dir = Path(self.figures_dir)
 
-        # Alias: si llega gsc_dir y no llega gsc_out_dir, usarlo
+        # Alias backward‑compat
         if self.gsc_out_dir is None and self.gsc_dir is not None:
             self.gsc_out_dir = Path(self.gsc_dir)
         if self.gsc_out_dir is not None:
             self.gsc_out_dir = Path(self.gsc_out_dir)
 
-        # Saneo de meta_learners
-        ml = []
+        # Learners
+        ml: List[str] = []
         for m in (self.meta_learners or ()):
             m = (m or "").strip().lower()
             if m in {"t", "s", "x"}:
                 ml.append(m)
         self.meta_learners = tuple(ml) if ml else tuple()
 
-        # Tamaños y estilo
+        # Estilo básico
         plt.rcParams.update({
             "font.size": self.font_size,
             "axes.grid": self.grid,
@@ -155,16 +155,8 @@ def _safe_read_parquet(p: Path, cols: Optional[List[str]] = None) -> pd.DataFram
         return pd.DataFrame()
 
 
-def _as_dt(s: pd.Series) -> pd.Series:
-    if s.dtype.kind == "M":
-        return s.dt.tz_localize(None)
-    return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
-
-
-def _rmspe(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    e = y_true - y_pred
-    denom = max(1.0, float(np.sqrt(np.mean(np.square(y_true)))))
-    return float(np.sqrt(np.mean(np.square(e))) / denom)
+def _sorted_unique(a: List) -> List:
+    return sorted(list(dict.fromkeys(a)))
 
 
 # ---------------------------------------------------------------------
@@ -179,13 +171,14 @@ def _load_gsc_metrics(gsc_out_dir: Optional[Path]) -> pd.DataFrame:
     if df.empty:
         return df
     # Normalizar nombres
-    rename_map = {"effect_sum": "att_sum", "effect_mean": "att_mean"}
-    for k, v in rename_map.items():
-        if k in df.columns and v not in df.columns:
-            df = df.rename(columns={k: v})
+    ren = {}
+    if "effect_sum" in df.columns and "att_sum" not in df.columns:
+        ren["effect_sum"] = "att_sum"
+    if "effect_mean" in df.columns and "att_mean" not in df.columns:
+        ren["effect_mean"] = "att_mean"
+    if ren:
+        df = df.rename(columns=ren)
     keep = [c for c in ["episode_id", "rmspe_pre", "att_sum", "att_mean"] if c in df.columns]
-    if not keep:
-        return pd.DataFrame()
     df = df[keep].copy()
     df["source"] = "gsc"
     return df
@@ -202,11 +195,13 @@ def _load_meta_metrics(meta_out_root: Optional[Path],
         df = _safe_read_parquet(path)
         if df.empty:
             continue
-        # Normalizar
-        rename_map = {"effect_sum": "att_sum", "effect_mean": "att_mean"}
-        for k, v in rename_map.items():
-            if k in df.columns and v not in df.columns:
-                df = df.rename(columns={k: v})
+        ren = {}
+        if "effect_sum" in df.columns and "att_sum" not in df.columns:
+            ren["effect_sum"] = "att_sum"
+        if "effect_mean" in df.columns and "att_mean" not in df.columns:
+            ren["effect_mean"] = "att_mean"
+        if ren:
+            df = df.rename(columns=ren)
         keep = [c for c in ["episode_id", "rmspe_pre", "att_sum", "att_mean"] if c in df.columns]
         if not keep:
             continue
@@ -217,98 +212,201 @@ def _load_meta_metrics(meta_out_root: Optional[Path],
 
 
 # ---------------------------------------------------------------------
-# Lectura de series contrafactuales (Meta y GSC)
+# Carga de series por episodio
 # ---------------------------------------------------------------------
 
-def _find_first_match(dirpath: Path, episode_id: str) -> Optional[Path]:
-    """
-    Busca un parquet de serie en dirpath/cf_series cuyo nombre contenga episode_id.
-    Intenta nombres comunes primero: {ep}.parquet, {ep}_cf.parquet.
-    """
-    if not dirpath:
-        return None
-    base = Path(dirpath) / "cf_series"
-    if not base.exists():
-        return None
-    # intentos directos
-    direct = [base / f"{episode_id}.parquet", base / f"{episode_id}_cf.parquet"]
-    for p in direct:
-        if p.exists():
-            return p
-    # búsqueda laxa
-    try:
-        for p in base.glob(f"*{episode_id}*.parquet"):
-            return p
-    except Exception:
-        pass
+# Sinónimos de columnas
+_OBS_COLS = ["sales", "y_obs", "observed", "Y", "y"]
+_CF_COLS  = ["mu0_hat", "y0_hat", "y_hat", "y_cf", "counterfactual", "Y0", "cf"]
+_EFF_COLS = ["effect", "tau_hat", "att", "delta"]
+_CUM_COLS = ["cum_effect", "cum_att", "cum_delta"]
+
+def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
     return None
 
 
-def _resolve_y_cols(df: pd.DataFrame) -> Tuple[str, str, str]:
+def _read_cf_file(p: Path) -> pd.DataFrame:
     """
-    Devuelve nombres de columnas (date, sales, y0_hat).
-    Intenta mapear variantes comunes.
+    Lee un parquet de serie CF y estandariza columnas a:
+    ['episode_id','unit_id','date','obs','cf','effect','cum_effect']
+    (las que existan).
     """
-    # fecha
-    date_col = "date" if "date" in df.columns else ("ds" if "ds" in df.columns else df.columns[0])
-    # observado
-    for c in ["sales", "y", "unit_sales", "obs", "observed"]:
-        if c in df.columns:
-            sales_col = c
+    df = _safe_read_parquet(p)
+    if df.empty:
+        return df
+
+    # Normalizar tipos básicos
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    ep_col = "episode_id" if "episode_id" in df.columns else None
+    if ep_col is None:
+        # intentar infiriendo desde el nombre del archivo
+        ep_guess = p.stem.replace("_cf", "")
+        df["episode_id"] = ep_guess
+        ep_col = "episode_id"
+
+    # Selección de columnas
+    obs_c = _pick_col(df, _OBS_COLS)
+    cf_c  = _pick_col(df, _CF_COLS)
+    eff_c = _pick_col(df, _EFF_COLS)
+    cum_c = _pick_col(df, _CUM_COLS)
+
+    # Si no hay efecto, lo creamos si obs y cf existen
+    if eff_c is None and obs_c and cf_c:
+        df["__effect__"] = pd.to_numeric(df[obs_c], errors="coerce") - pd.to_numeric(df[cf_c], errors="coerce")
+        eff_c = "__effect__"
+
+    # Ensamblar salida
+    keep = [c for c in [ep_col, "unit_id", "date", obs_c, cf_c, eff_c, cum_c] if c is not None and c in df.columns]
+    out = df[keep].copy()
+    ren = {}
+    if obs_c and obs_c in out.columns: ren[obs_c] = "obs"
+    if cf_c  and cf_c  in out.columns: ren[cf_c]  = "cf"
+    if eff_c and eff_c in out.columns: ren[eff_c] = "effect"
+    if cum_c and cum_c in out.columns: ren[cum_c] = "cum_effect"
+    if ren:
+        out = out.rename(columns=ren)
+
+    # Tipos
+    for c in ["obs", "cf", "effect", "cum_effect"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    # Ordenar y deduplicar por fecha
+    if "date" in out.columns:
+        out = out.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+
+    return out
+
+
+def _load_cf_series_from_dir(cf_dir: Path,
+                             episodes_allowed: Optional[set] = None,
+                             cap: Optional[int] = None) -> Dict[str, pd.DataFrame]:
+    """
+    Devuelve dict episode_id -> DataFrame estandarizado.
+    """
+    series: Dict[str, pd.DataFrame] = {}
+    if not cf_dir.exists():
+        return series
+
+    # Buscar *.parquet (nombres libres)
+    files = sorted(cf_dir.glob("*.parquet"))
+    for p in files:
+        df = _read_cf_file(p)
+        if df.empty or "episode_id" not in df.columns:
+            continue
+        ep = str(df["episode_id"].iloc[0])
+        if episodes_allowed and ep not in episodes_allowed:
+            continue
+        series[ep] = df
+        if cap is not None and len(series) >= int(cap):
             break
-    else:
-        # fallback: la primera numérica distinta a la fecha
-        candid = [c for c in df.columns if c != date_col]
-        sales_col = candid[0]
-    # cf / mu0
-    for c in ["mu0_hat", "y0_hat", "y_cf", "y_synth", "counterfactual", "cf", "y_hat0", "y_hat"]:
-        if c in df.columns:
-            y0_col = c
-            break
-    else:
-        # si no existe, crear columna nula para evitar crash (se avisará en plot)
-        y0_col = "__missing_cf__"
-        df[y0_col] = np.nan
-    return date_col, sales_col, y0_col
-
-
-def _read_meta_cf(meta_root: Path, learner: str, episode_id: str) -> pd.DataFrame:
-    p = _find_first_match(meta_root / learner, episode_id)
-    return pd.read_parquet(p) if p and p.exists() else pd.DataFrame()
-
-
-def _read_gsc_cf(gsc_root: Path, episode_id: str) -> pd.DataFrame:
-    p = _find_first_match(gsc_root, episode_id)
-    return pd.read_parquet(p) if p and p.exists() else pd.DataFrame()
-
-
-def _compute_metrics_from_series(df: pd.DataFrame,
-                                 date_col: str,
-                                 sales_col: str,
-                                 y0_col: str,
-                                 treat_start: pd.Timestamp) -> Dict[str, float]:
-    """Calcula RMSPE en pre y ATT (sum/mean) en post."""
-    dt = _as_dt(df[date_col])
-    y = pd.to_numeric(df[sales_col], errors="coerce").to_numpy(float)
-    y0 = pd.to_numeric(df[y0_col], errors="coerce").to_numpy(float)
-
-    pre = dt < treat_start
-    post = dt >= treat_start
-
-    rmspe_pre = _rmspe(y[pre], y0[pre]) if np.any(pre) else np.nan
-    effect_post = (y - y0)[post] if np.any(post) else np.array([], float)
-
-    return {
-        "rmspe_pre": float(rmspe_pre) if np.isfinite(rmspe_pre) else np.nan,
-        "att_sum": float(np.nansum(effect_post)) if effect_post.size else np.nan,
-        "att_mean": float(np.nanmean(effect_post)) if effect_post.size else np.nan,
-        "n_pre": int(np.count_nonzero(pre)),
-        "n_post": int(np.count_nonzero(post)),
-    }
+    return series
 
 
 # ---------------------------------------------------------------------
-# Gráficos simples (sin seaborn)
+# Cálculo de métricas y gráficos
+# ---------------------------------------------------------------------
+
+def _rmspe(y: np.ndarray, yhat: np.ndarray) -> float:
+    # Guardas numéricas
+    y = np.asarray(y, float); yhat = np.asarray(yhat, float)
+    m = np.isfinite(y) & np.isfinite(yhat)
+    if m.sum() == 0:
+        return np.nan
+    e = y[m] - yhat[m]
+    denom = np.sqrt(np.mean(np.square(y[m]))) if np.any(y[m] != 0) else 1.0
+    denom = float(max(denom, 1e-8))
+    return float(np.sqrt(np.mean(np.square(e))) / denom)
+
+
+def _compute_metrics_for_window(df: pd.DataFrame,
+                                pre_start: pd.Timestamp,
+                                treat_start: pd.Timestamp,
+                                post_end: pd.Timestamp) -> Dict[str, float]:
+    """
+    Calcula RMSPE(pre), ATT_sum y ATT_mean en la ventana del episodio.
+    """
+    d = df.copy()
+    d = d[(d["date"] >= pre_start) & (d["date"] <= post_end)].copy()
+    pre = d[d["date"] < treat_start]
+    post = d[d["date"] >= treat_start]
+
+    # Estimar cf si falta
+    if "cf" not in d.columns and "effect" in d.columns and "obs" in d.columns:
+        d["cf"] = d["obs"] - d["effect"]
+        pre["cf"] = pre["obs"] - pre["effect"]  # type: ignore
+        post["cf"] = post["obs"] - post["effect"]  # type: ignore
+
+    rmspe_pre = _rmspe(pre["obs"].to_numpy(float), pre["cf"].to_numpy(float)) if {"obs", "cf"}.issubset(pre.columns) else np.nan
+
+    if "effect" not in d.columns and {"obs", "cf"}.issubset(d.columns):
+        d["effect"] = d["obs"] - d["cf"]
+        post["effect"] = post["obs"] - post["cf"]  # type: ignore
+
+    att_sum = float(np.nansum(post["effect"])) if "effect" in post.columns else np.nan
+    att_mean = float(np.nanmean(post["effect"])) if "effect" in post.columns and len(post) > 0 else np.nan
+
+    return {"rmspe_pre": rmspe_pre, "att_sum": att_sum, "att_mean": att_mean}
+
+
+def _plot_episode_series(ax_top: plt.Axes,
+                         ax_bot: plt.Axes,
+                         df: pd.DataFrame,
+                         pre_start: pd.Timestamp,
+                         treat_start: pd.Timestamp,
+                         post_end: pd.Timestamp,
+                         title: str) -> None:
+    """
+    Dibuja Observado vs. Contrafactual (arriba) y Efecto / Acumulado (abajo).
+    """
+    d = df[(df["date"] >= pre_start) & (df["date"] <= post_end)].copy()
+    d = d.sort_values("date")
+    # Estimar columnas faltantes
+    if "cf" not in d.columns and {"obs", "effect"}.issubset(d.columns):
+        d["cf"] = d["obs"] - d["effect"]
+    if "effect" not in d.columns and {"obs", "cf"}.issubset(d.columns):
+        d["effect"] = d["obs"] - d["cf"]
+    if "cum_effect" not in d.columns and "effect" in d.columns:
+        d["cum_effect"] = (d["effect"].where(d["date"] >= treat_start, 0.0)).cumsum()
+
+    # ---- Panel superior: Observado vs Contrafactual
+    if {"obs", "cf"}.issubset(d.columns):
+        ax_top.plot(d["date"], d["obs"], label="Observado", linewidth=1.5)
+        ax_top.plot(d["date"], d["cf"], linestyle="--", label="Contrafactual", linewidth=1.2)
+    elif "obs" in d.columns:
+        ax_top.plot(d["date"], d["obs"], label="Observado", linewidth=1.5)
+    else:
+        ax_top.text(0.5, 0.5, "Sin columnas 'obs'/'cf'", ha="center", va="center", transform=ax_top.transAxes)
+
+    ax_top.set_title(title)
+    ax_top.set_ylabel("Ventas (unid.)")
+    ax_top.legend(loc="upper left")
+
+    # Línea vertical en inicio de tratamiento
+    ax_top.axvline(pd.to_datetime(treat_start), linewidth=1.0)
+
+    # ---- Panel inferior: Efecto y acumulado
+    if "effect" in d.columns:
+        ax_bot.plot(d["date"], d["effect"], label="Efecto (Y - Y0)", linewidth=1.2)
+        ax_bot.set_ylabel("Efecto")
+        # Acumulado en eje secundario
+        if "cum_effect" in d.columns:
+            ax2 = ax_bot.twinx()
+            ax2.plot(d["date"], d["cum_effect"], linestyle="--", label="Efecto acumulado", linewidth=1.0)
+            ax2.set_ylabel("Acumulado")
+        ax_bot.axvline(pd.to_datetime(treat_start), linewidth=1.0)
+        ax_bot.legend(loc="upper left")
+    else:
+        ax_bot.text(0.5, 0.5, "Sin columna 'effect' y sin 'obs'/'cf' para derivarlo.",
+                    ha="center", va="center", transform=ax_bot.transAxes)
+
+
+# ---------------------------------------------------------------------
+# Gráficos simples (resumen sin seaborn)
 # ---------------------------------------------------------------------
 
 def _hist_att(ax: plt.Axes, data: pd.Series, title: str) -> None:
@@ -335,87 +433,8 @@ def _scatter_rmspe_vs_att(ax: plt.Axes, rmspe: pd.Series, att: pd.Series, title:
     ax.set_title(title)
     ax.set_xlabel("RMSPE (pre)")
     ax.set_ylabel("ATT_sum")
-    ax.axvline(0.0, linewidth=0.6)
-    ax.axhline(0.0, linewidth=0.6)
-
-
-# ---------------------------------------------------------------------
-# Páginas de series por episodio (Observado vs CF + efectos)
-# ---------------------------------------------------------------------
-
-def _plot_episode_page(
-    fig: plt.Figure,
-    df: pd.DataFrame,
-    title: str,
-    treat_start: pd.Timestamp,
-    legend_loc: str = "upper left",
-    metrics_box_loc: str = "upper right",
-    dpi: int = 300
-) -> None:
-    gs = fig.add_gridspec(nrows=2, ncols=1, height_ratios=[2.0, 1.6], hspace=0.12)
-    ax_top = fig.add_subplot(gs[0, 0])
-    ax_bot = fig.add_subplot(gs[1, 0])
-
-    if df.empty:
-        ax_top.text(0.5, 0.5, "Serie no disponible", ha="center", va="center", transform=ax_top.transAxes)
-        ax_top.set_title(title)
-        return
-
-    # Columnas
-    date_col, sales_col, y0_col = _resolve_y_cols(df)
-    df = df.copy()
-    df[date_col] = _as_dt(df[date_col])
-    df = df.sort_values(date_col)
-
-    # Series principales
-    x = df[date_col]
-    y = pd.to_numeric(df[sales_col], errors="coerce").astype(float)
-    y0 = pd.to_numeric(df[y0_col], errors="coerce").astype(float)
-
-    # Plot superior: Observado vs Contrafactual
-    ax_top.plot(x, y, label="Observado", linewidth=1.3)
-    if y0.notna().any():
-        ax_top.plot(x, y0, label="Contrafactual", linestyle="--", linewidth=1.2)
-    ax_top.axvline(pd.to_datetime(treat_start), linestyle=":", linewidth=1.0)
-
-    ax_top.set_title(title)
-    ax_top.legend(loc=legend_loc, frameon=True)
-
-    # Métricas a la DERECHA (caja flotante)
-    try:
-        mets = _compute_metrics_from_series(df, date_col, sales_col, y0_col, pd.to_datetime(treat_start))
-        text = (f"RMSPE_pre: {mets['rmspe_pre']:.2f}\n"
-                f"ATT_sum: {mets['att_sum']:.2f}\n"
-                f"ATT_mean: {mets['att_mean']:.2f}\n"
-                f"n_pre: {mets['n_pre']} | n_post: {mets['n_post']}")
-    except Exception:
-        text = "Métricas no disponibles"
-    bbox = dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85, linewidth=0.8)
-    # coords en ejes para ubicar a la derecha
-    ax_top.text(0.98, 0.02, text, ha="right", va="bottom", transform=ax_top.transAxes, bbox=bbox)
-
-    # Plot inferior: efecto y acumulado (post)
-    effect = (y - y0) if y0.notna().any() else pd.Series(np.nan, index=df.index)
-    is_post = df[date_col] >= pd.to_datetime(treat_start)
-    effect_cum = effect.where(is_post, 0.0).cumsum()
-
-    ax_bot.plot(x, effect, label="Efecto (Y - Ŷ₀)", linewidth=1.2)
-    ax_bot.axvline(pd.to_datetime(treat_start), linestyle=":", linewidth=1.0)
-
-    ax2 = ax_bot.twinx()
-    ax2.plot(x, effect_cum, linestyle="--", linewidth=1.1, label="Efecto acumulado")
-
-    ax_bot.set_ylabel("Efecto")
-    ax2.set_ylabel("Acumulado")
-
-    # Leyendas separadas para evitar solapes
-    #   - Mantén la del panel superior (observado/cf) a la izquierda.
-    #   - En el panel inferior, sólo la curva acumulada a la derecha.
-    h2, l2 = ax2.get_legend_handles_labels()
-    if h2:
-        ax2.legend(h2, l2, loc="upper right", frameon=True)
-
-    fig.tight_layout()
+    ax.axvline(0.0, linewidth=0.5)
+    ax.axhline(0.0, linewidth=0.5)
 
 
 # ---------------------------------------------------------------------
@@ -431,22 +450,24 @@ def run(cfg: EDAConfig) -> None:
     fig_dir = _ensure_dir(fig_root / "algorithms")
     tbl_dir = _ensure_dir(fig_root / "tables")
 
-    # Cargar episodios (referencia/orden)
+    # 1) Cargar episodios (referencia)
     episodes = _safe_read_parquet(Path(cfg.episodes_index))
     if "episode_id" not in episodes.columns:
         raise ValueError("episodes_index.parquet no tiene columna 'episode_id'.")
-    if "treat_start" not in episodes.columns:
-        raise ValueError("episodes_index.parquet no tiene columna 'treat_start'.")
+    # Normalizar fechas usadas en plots/métricas
+    for c in ["pre_start", "treat_start", "post_end"]:
+        if c in episodes.columns:
+            episodes[c] = pd.to_datetime(episodes[c], errors="coerce")
 
-    episodes["treat_start"] = _as_dt(episodes["treat_start"])
-    ordered_ep_list = episodes["episode_id"].astype(str).tolist()
+    all_eps_set = set(episodes["episode_id"].astype(str).unique().tolist())
 
-    # --- Métricas de GSC + Meta (para resúmenes) ---
+    # 2) Cargar métricas de GSC + Meta (para figuras resumen)
     gsc_df = _load_gsc_metrics(cfg.gsc_out_dir)
     meta_dict = _load_meta_metrics(cfg.meta_out_root, cfg.meta_learners)
 
-    # ---------------- Cobertura por episodio ----------------
+    # 3) Cobertura por episodio
     cover = episodes[["episode_id"]].drop_duplicates().copy()
+    cover["episode_id"] = cover["episode_id"].astype(str)
     cover["has_gsc"] = cover["episode_id"].isin(gsc_df["episode_id"]) if not gsc_df.empty else False
     for lr, mdf in meta_dict.items():
         cover[f"has_meta_{lr}"] = cover["episode_id"].isin(mdf["episode_id"]) if not mdf.empty else False
@@ -457,22 +478,21 @@ def run(cfg: EDAConfig) -> None:
     cover_path = tbl_dir / "eda_algorithms_coverage.parquet"
     cover.to_parquet(cover_path, index=False)
 
-    # ---------------- Tablas consolidadas (para resúmenes) ----------------
+    # 4) Tablas consolidadas para gráficos simples
     stacks: List[pd.DataFrame] = []
     if not gsc_df.empty:
         stacks.append(gsc_df)
-    for lr, mdf in meta_dict.items():
+    for _, mdf in meta_dict.items():
         if not mdf.empty:
             stacks.append(mdf)
     all_mets = pd.concat(stacks, ignore_index=True) if stacks else pd.DataFrame()
 
-    # ---------------- Gráficos de resumen ----------------
+    # 5) Gráficos resumen (histogramas y dispersión)
     w, h = _figsize_from_orientation(cfg.orientation)
-    pdf_summary_path = fig_dir / "eda_algorithms_summary.pdf" if cfg.export_pdf else None
-    pdf_sum = PdfPages(pdf_summary_path) if pdf_summary_path else None
+    pdf_sum_path = fig_dir / "eda_algorithms_summary.pdf" if cfg.export_pdf else None
+    pdf_sum = PdfPages(pdf_sum_path) if pdf_sum_path else None
 
     if not all_mets.empty:
-        # 1) Distribuciones de ATT por fuente
         for src in sorted(all_mets["source"].unique()):
             sub = all_mets[all_mets["source"] == src]
             fig = plt.figure(figsize=(w, h))
@@ -485,7 +505,6 @@ def run(cfg: EDAConfig) -> None:
                 pdf_sum.savefig(fig, dpi=cfg.dpi)
             plt.close(fig)
 
-        # 2) Scatter RMSPE(pre) vs ATT_sum
         if "rmspe_pre" in all_mets.columns and "att_sum" in all_mets.columns:
             for src in sorted(all_mets["source"].unique()):
                 sub = all_mets[all_mets["source"] == src]
@@ -502,72 +521,109 @@ def run(cfg: EDAConfig) -> None:
     if pdf_sum:
         pdf_sum.close()
 
-    # ---------------- Páginas de series por episodio ----------------
-    # Definimos LA LISTA DE EPISODIOS A PLOTear segun meta y MANTENEMOS ESE ORDEN para GSC.
-    # Prioridad del learner de referencia: X, luego T, luego S.
-    learners_pref = [lr for lr in ["x", "t", "s"] if lr in set(cfg.meta_learners)]
-    ref_lr = None
-    for lr in learners_pref or []:
-        if (cfg.meta_out_root and (cfg.meta_out_root / lr / "cf_series").exists()):
-            ref_lr = lr
-            break
-    # Si no hay carpeta de meta, usamos todo el episodes_index como referencia
-    if ref_lr is None:
-        ep_ref_list = ordered_ep_list
-    else:
-        cf_dir = cfg.meta_out_root / ref_lr / "cf_series"
-        # Episodios que tenemos en meta (por archivos)
-        meta_files_eps = set([p.stem.replace("_cf", "") for p in cf_dir.glob("*.parquet")])
-        # mantener ORDEN según episodes_index
-        ep_ref_list = [ep for ep in ordered_ep_list if ep in meta_files_eps]
+    # 6) Carga de series contrafactuales para render por episodio
+    # --- GSC
+    gsc_series: Dict[str, pd.DataFrame] = {}
+    if cfg.gsc_out_dir is not None:
+        gsc_cf_dir = Path(cfg.gsc_out_dir) / "cf_series"
+        allowed = all_eps_set
+        cap = cfg.max_episodes_gsc
+        gsc_series = _load_cf_series_from_dir(gsc_cf_dir, episodes_allowed=allowed, cap=cap)
+        if not gsc_series:
+            logger.info("No se encontraron series CF de GSC en %s", str(gsc_cf_dir))
 
-    # aplicar límites si se solicitaron
-    if cfg.max_episodes_meta is not None:
-        ep_ref_list = ep_ref_list[: int(cfg.max_episodes_meta)]
-    if cfg.max_episodes_gsc is not None:
-        # queremos que GSC siga el MISMO orden/episodios; no recortamos distinto
-        ep_ref_list = ep_ref_list[: int(cfg.max_episodes_gsc)]
-
-    if not ep_ref_list:
-        logger.warning("No se encontraron episodios de referencia para renderizar series (¿meta/cf_series vacío?).")
-
-    pdf_series_path = fig_dir / "eda_algorithms_series.pdf" if cfg.export_pdf else None
-    pdf_ser = PdfPages(pdf_series_path) if pdf_series_path else None
-
-    # Render por episodio: primero cada meta-learner, luego GSC, EN EL MISMO ORDEN DE ep_ref_list
-    for ep_id in ep_ref_list:
-        # Tratamiento start por episodio
-        row = episodes.loc[episodes["episode_id"] == ep_id]
-        tstart = _as_dt(row["treat_start"]).iloc[0] if not row.empty else None
-
-        # META: por cada learner solicitado
+    # --- Meta (por learner)
+    meta_series: Dict[str, Dict[str, pd.DataFrame]] = {}
+    if cfg.meta_out_root is not None:
         for lr in cfg.meta_learners:
-            title = f"Meta-{lr.upper()} — Episodio {ep_id}"
-            df_cf = _read_meta_cf(cfg.meta_out_root, lr, ep_id) if cfg.meta_out_root else pd.DataFrame()
-            fig = plt.figure(figsize=(w, h))
-            _plot_episode_page(fig, df_cf, title, tstart, legend_loc="upper left", metrics_box_loc="upper right", dpi=cfg.dpi)
-            if pdf_ser:
-                pdf_ser.savefig(fig, dpi=cfg.dpi)
-            # opcional PNG por página:
-            png = fig_dir / f"series__meta-{lr}_{ep_id}.png"
-            fig.savefig(png, dpi=cfg.dpi)
-            plt.close(fig)
+            cf_dir = Path(cfg.meta_out_root) / lr / "cf_series"
+            cap = cfg.max_episodes_meta
+            meta_series[lr] = _load_cf_series_from_dir(cf_dir, episodes_allowed=all_eps_set, cap=cap)
+            if not meta_series[lr]:
+                logger.info("No se encontraron series CF de Meta-%s en %s", lr.upper(), str(cf_dir))
 
-        # GSC: MISMO episodio en el MISMO orden
-        title = f"GSC — Episodio {ep_id}"
-        df_gsc = _read_gsc_cf(cfg.gsc_out_dir, ep_id) if cfg.gsc_out_dir else pd.DataFrame()
-        fig = plt.figure(figsize=(w, h))
-        _plot_episode_page(fig, df_gsc, title, tstart, legend_loc="upper left", metrics_box_loc="upper right", dpi=cfg.dpi)
-        if pdf_ser:
-            pdf_ser.savefig(fig, dpi=cfg.dpi)
-        png = fig_dir / f"series__gsc_{ep_id}.png"
+    # 7) PDF con series por episodio (stack de páginas)
+    pdf_series_path = fig_dir / "series_by_episode.pdf" if cfg.export_pdf else None
+    pdf_series = PdfPages(pdf_series_path) if pdf_series_path else None
+
+    # Helper para obtener ventana de un episodio
+    epi_map = (
+        episodes[["episode_id", "pre_start", "treat_start", "post_end"]]
+        .dropna(subset=["episode_id"])
+        .copy()
+    )
+    epi_map["episode_id"] = epi_map["episode_id"].astype(str)
+    epi_map = epi_map.set_index("episode_id")
+
+    def _render_one(src: str, ep: str, d: pd.DataFrame) -> None:
+        if ep not in epi_map.index:
+            return
+        row = epi_map.loc[ep]
+        pre_start = pd.to_datetime(row["pre_start"])
+        treat_start = pd.to_datetime(row["treat_start"])
+        post_end = pd.to_datetime(row["post_end"])
+
+        # Asegurar columnas clave
+        if "date" not in d.columns:
+            return
+        if "obs" not in d.columns:
+            oc = _pick_col(d, _OBS_COLS)
+            if oc:
+                d = d.rename(columns={oc: "obs"})
+        if "cf" not in d.columns:
+            cc = _pick_col(d, _CF_COLS)
+            if cc:
+                d = d.rename(columns={cc: "cf"})
+        if "effect" not in d.columns and {"obs", "cf"}.issubset(d.columns):
+            d["effect"] = pd.to_numeric(d["obs"], errors="coerce") - pd.to_numeric(d["cf"], errors="coerce")
+        if "cum_effect" not in d.columns and "effect" in d.columns:
+            d["cum_effect"] = (d["effect"].where(d["date"] >= treat_start, 0.0)).cumsum()
+
+        # Calcular métricas in‑place (por si no hay métricas en parquet)
+        mets = _compute_metrics_for_window(d, pre_start, treat_start, post_end)
+
+        # Figura
+        w_, h_ = _figsize_from_orientation(cfg.orientation)
+        fig = plt.figure(figsize=(w_, h_))
+        gs = fig.add_gridspec(2, 1, height_ratios=[2, 1.4])
+        ax_top = fig.add_subplot(gs[0, 0])
+        ax_bot = fig.add_subplot(gs[1, 0])
+
+        _plot_episode_series(ax_top, ax_bot, d, pre_start, treat_start, post_end,
+                             title=f"{src} — Episodio {ep}")
+
+        # Caja de métricas
+        txt = (
+            f"RMSPE_pre: {mets['rmspe_pre']:.2f}\n"
+            f"ATT_sum: {mets['att_sum']:.2f}\n"
+            f"ATT_mean: {mets['att_mean']:.2f}"
+        )
+        ax_top.text(0.02, 0.98, txt, transform=ax_top.transAxes, va="top", ha="left",
+                    bbox=dict(facecolor="white", alpha=0.9, edgecolor="0.5"))
+
+        fig.tight_layout()
+
+        # Guardar PNG y PDF
+        safe_ep = ep.replace("/", "_")
+        png = fig_dir / f"series_{src.replace(' ', '_').replace('/', '_')}_{safe_ep}.png"
         fig.savefig(png, dpi=cfg.dpi)
+        if pdf_series:
+            pdf_series.savefig(fig, dpi=cfg.dpi)
         plt.close(fig)
 
-    if pdf_ser:
-        pdf_ser.close()
+    # --- Render GSC
+    for ep, d in gsc_series.items():
+        _render_one("GSC", ep, d)
 
-    # ---------------- Top episodios (por |ATT_sum|) ----------------
+    # --- Render Meta por learner
+    for lr, dmap in meta_series.items():
+        for ep, d in dmap.items():
+            _render_one(f"Meta-{lr.upper()}", ep, d)
+
+    if pdf_series:
+        pdf_series.close()
+
+    # 8) Top episodios por |ATT_sum| (si hubo métricas)
     if not all_mets.empty and "att_sum" in all_mets.columns:
         rows: List[pd.DataFrame] = []
         for src in sorted(all_mets["source"].unique()):
@@ -585,7 +641,7 @@ def run(cfg: EDAConfig) -> None:
     # Mensajes finales
     logger.info("EDA_algorithms completado.")
     logger.info("Cobertura guardada en: %s", str(cover_path))
-    if pdf_summary_path:
-        logger.info("Resumen PDF: %s", str(pdf_summary_path))
+    if pdf_sum_path:
+        logger.info("Resumen PDF: %s", str(pdf_sum_path))
     if pdf_series_path:
-        logger.info("Series PDF: %s", str(pdf_series_path))
+        logger.info("Series por episodio (PDF): %s", str(pdf_series_path))

@@ -1,7 +1,7 @@
 {
   "project_name": "cannibalization_retail__A_base",
-  "start_time": "2025-11-06T18:18:39.510911",
-  "log_file": "D:\\repos\\cannibalization_reatail\\diagnostics\\pipeline_A_base_20251106_181839.log",
+  "start_time": "2025-11-07T11:57:37.703280",
+  "log_file": "D:\\repos\\cannibalization_reatail\\diagnostics\\pipeline_A_base_20251107_115737.log",
   "steps": {
     "step1": {
       "status": "ok",
@@ -128,5 +128,5 @@
     "meta_out_root": ".data\\processed_data\\meta_outputs\\A_base",
     "exposure_csv": ".data\\processed_data\\A_base\\competitive_exposure.csv"
   },
-  "end_time": "2025-11-06T19:34:18.232828"
+  "end_time": "2025-11-07T13:05:45.625517"
 }
