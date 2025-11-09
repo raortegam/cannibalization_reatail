@@ -222,9 +222,10 @@ MIN_RUN_DAYS  = _env_int("SPD_MIN_RUN_DAYS", 3)
 N_CANNIBALS = _env_int("SPD_N_CANNIBALS", 5)
 
 # Caníbales/Víctimas orientados a Meta‑Learners (gran universo)
-N_CANNIBALS_META = _env_int("SPD_N_CANNIBALS_META", 30)
-N_VICTIMS_PER_I  = _env_int("SPD_N_VICTIMS_PER_I", 10)
-N_VICTIMS_PER_I_META = _env_int("SPD_N_VICTIMS_PER_I_META", N_VICTIMS_PER_I)
+# Aumentado para mejorar rendimiento de meta-learners con más datos de entrenamiento
+N_CANNIBALS_META = _env_int("SPD_N_CANNIBALS_META", 100)
+N_VICTIMS_PER_I  = _env_int("SPD_N_VICTIMS_PER_I", 30)
+N_VICTIMS_PER_I_META = _env_int("SPD_N_VICTIMS_PER_I_META", 50)
 
 # Víctimas j
 P_PROMO_J_MAX    = _env_float("SPD_P_PROMO_J_MAX", 0.10)
@@ -235,7 +236,8 @@ SPD_SAMPLE_J_CAP  = _env_int("SPD_SAMPLE_J_CAP", 0)
 N_DONORS_PER_J = _env_int("SPD_N_DONORS_PER_J", 10)
 
 # Limitar cálculo de donantes a un subconjunto de episodios
-MAX_EPISODES_FOR_DONORS = _env_int("SPD_MAX_EPISODES_FOR_DONORS", 10)
+# Aumentado de 10 a 150 para tener más episodios comparables entre algoritmos
+MAX_EPISODES_FOR_DONORS = _env_int("SPD_MAX_EPISODES_FOR_DONORS", 150)
 EPISODE_SELECTION_STRATEGY = _env_str("SPD_EPISODE_SELECTION", "top_delta_abs")  # top_delta_abs | random | first
 EPISODES_FOR_DONORS_PATH   = _env_str("SPD_EPISODES_FOR_DONORS_PATH", "")
 SKIP_DONORS                = bool(_env_int("SPD_SKIP_DONORS", 0))

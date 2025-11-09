@@ -473,22 +473,22 @@ def tune_hyperparams(meta_df: pd.DataFrame, feats: List[str], cfg_model: str,
     def objective(trial):
         if model_name == "lgbm":
             params = {
-                "num_leaves": trial.suggest_int("num_leaves", 63, 255),
-                "max_depth": trial.suggest_int("max_depth", 6, 12),
-                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
-                "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
-                "feature_fraction": trial.suggest_float("feature_fraction", 0.7, 1.0),
-                "subsample": trial.suggest_float("subsample", 0.7, 1.0),
-                "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
-                "max_iter": int(base_defaults.get("max_iter", 600)),
+                "num_leaves": trial.suggest_int("num_leaves", 31, 511),
+                "max_depth": trial.suggest_int("max_depth", 5, 15),
+                "learning_rate": trial.suggest_float("learning_rate", 5e-4, 0.3, log=True),
+                "min_child_samples": trial.suggest_int("min_child_samples", 3, 100),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 20.0),
+                "max_iter": trial.suggest_int("max_iter", 400, 1500, step=100),
             }
         elif model_name == "hgbt":
             params = {
-                "max_depth": trial.suggest_int("max_depth", 6, 12),
-                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
-                "max_iter": trial.suggest_int("max_iter", 400, 2000, step=50),
-                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 50),
-                "l2": trial.suggest_float("l2", 1e-6, 10.0, log=True),
+                "max_depth": trial.suggest_int("max_depth", 5, 15),
+                "learning_rate": trial.suggest_float("learning_rate", 5e-4, 0.3, log=True),
+                "max_iter": trial.suggest_int("max_iter", 400, 3000, step=100),
+                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 3, 100),
+                "l2": trial.suggest_float("l2", 1e-7, 20.0, log=True),
             }
         else:
             return np.inf
@@ -501,7 +501,7 @@ def tune_hyperparams(meta_df: pd.DataFrame, feats: List[str], cfg_model: str,
         return _finite_or_big(score)
 
     study = optuna.create_study(direction="minimize", study_name=f"hpo_{model_name}")
-    study.optimize(objective, n_trials=int(base_defaults.get("hpo_trials", 300)), show_progress_bar=False)
+    study.optimize(objective, n_trials=int(base_defaults.get("hpo_trials", 100)), show_progress_bar=False)
     best = dict(study.best_params)
     logging.info(f"[HPO] Modelo={model_name} | best_score(RMSPE)={study.best_value:.6f}")
     logging.info(f"[HPO] Mejores hiperparámetros: {best}")
@@ -953,7 +953,7 @@ class RunCfg:
     subsample: float = 0.8
 
     # HPO
-    hpo_trials: int = 10  # 0 para desactivar
+    hpo_trials: int = 100  # 0 para desactivar; aumentado para mejor exploración
 
     # diagnósticos
     do_placebo_space: bool = True

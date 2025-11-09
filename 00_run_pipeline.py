@@ -280,6 +280,10 @@ class StepToggles:
     step5_gsc: bool = True
     step6_meta: bool = True
     eda_algorithms: bool = True
+    # Cache control
+    use_cached_step1: bool = True  # Reutilizar outputs de Step 1 si existen
+    use_cached_step2: bool = True  # Reutilizar outputs de Step 2 si existen
+    use_cached_step3: bool = True  # Reutilizar outputs de Step 3 si existen
 
 
 @dataclass
@@ -403,6 +407,7 @@ class ParamsConfig:
     meta_max_iter: int = 500
     meta_min_samples_leaf: int = 20
     meta_l2: float = 0.0
+    meta_hpo_trials: int = 100  # Número de trials de Optuna para HPO
     # Tratamientos
     treat_col_s: str = "H_disc"
     s_ref: float = 0.0
@@ -723,46 +728,60 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     # # # -------------------- Paso 1: Data Quality --------------------
     step1_outputs = {}
     if cfg.toggles.step1:
-        logger.info("Paso 1: Control de calidad y filtrado de datos 'train' y 'transactions'.")
-
-        # assert de scoping de salida
-        _assert_scoped(cfg.paths.processed_dir, exp_tag, "step1.out_dir(processed_dir)", hard=cfg.hard_scope)
-
-        try:
-            dq_path = SRC_DIR / "preprocess_data" / "1. data_quality.py"
-            if dq_path.exists():
-                dq_mod = _dynamic_import("data_quality", dq_path)
-                run_data_quality = getattr(dq_mod, "run_data_quality")
-            else:
-                from preprocess_data.data_quality import run_data_quality  # type: ignore
-        except Exception:
-            logger.exception("No se pudo localizar 'run_data_quality'.")
-            if cfg.fail_fast:
-                raise
-            run_data_quality = None  # type: ignore
-
-        if run_data_quality is not None:
-            out_dir = cfg.paths.step1_out_dir or cfg.paths.processed_dir
-            ensure_dir(out_dir)
-            step1_outputs = _safe_call(
-                run_data_quality,
-                logger,
-                cfg.fail_fast,
-                "1. Data Quality",
-                train_path=str(cfg.paths.train_csv),
-                transactions_path=str(cfg.paths.transactions_csv) if cfg.paths.transactions_csv else None,
-                out_dir=str(out_dir),
-                min_date=cfg.params.min_date,
-                date_col=cfg.params.date_col,
-                store_col=cfg.params.store_col,
-                item_col=cfg.params.item_col,
-                promo_col=cfg.params.promo_col,
-                sales_col=cfg.params.sales_col,
-                tx_col=cfg.params.tx_col,
-                save_report_json=str(cfg.params.save_report_json) if cfg.params.save_report_json else None,
-            ) or {}
+        out_dir = cfg.paths.step1_out_dir or cfg.paths.processed_dir
+        train_filtered = out_dir / "train_filtered.csv"
+        transactions_filtered = out_dir / "transactions_filtered.csv"
+        
+        # Check if cached outputs exist
+        if cfg.toggles.use_cached_step1 and train_filtered.exists():
+            logger.info("⚡ Paso 1: Usando outputs cacheados (train_filtered.csv existe)")
+            step1_outputs = {
+                "paths": {
+                    "train_filtered": str(train_filtered),
+                    "transactions_filtered": str(transactions_filtered) if transactions_filtered.exists() else None,
+                }
+            }
+            logger.info("   ✓ Cache hit: %s", train_filtered)
         else:
-            logger.warning("Paso 1 omitido (función no disponible).")
+            logger.info("Paso 1: Control de calidad y filtrado de datos 'train' y 'transactions'.")
+
+            # assert de scoping de salida
+            _assert_scoped(cfg.paths.processed_dir, exp_tag, "step1.out_dir(processed_dir)", hard=cfg.hard_scope)
+
+            try:
+                dq_path = SRC_DIR / "preprocess_data" / "1. data_quality.py"
+                if dq_path.exists():
+                    dq_mod = _dynamic_import("data_quality", dq_path)
+                    run_data_quality = getattr(dq_mod, "run_data_quality")
+                else:
+                    from preprocess_data.data_quality import run_data_quality  # type: ignore
+            except Exception:
+                logger.exception("No se pudo localizar 'run_data_quality'.")
+                if cfg.fail_fast:
+                    raise
+                run_data_quality = None  # type: ignore
+
+            if run_data_quality is not None:
+                ensure_dir(out_dir)
+                step1_outputs = _safe_call(
+                    run_data_quality,
+                    logger,
+                    cfg.fail_fast,
+                    "1. Data Quality",
+                    train_path=str(cfg.paths.train_csv),
+                    transactions_path=str(cfg.paths.transactions_csv) if cfg.paths.transactions_csv else None,
+                    out_dir=str(out_dir),
+                    min_date=cfg.params.min_date,
+                    date_col=cfg.params.date_col,
+                    store_col=cfg.params.store_col,
+                    item_col=cfg.params.item_col,
+                    promo_col=cfg.params.promo_col,
+                    sales_col=cfg.params.sales_col,
+                    tx_col=cfg.params.tx_col,
+                    save_report_json=str(cfg.params.save_report_json) if cfg.params.save_report_json else None,
+                ) or {}
+            else:
+                logger.warning("Paso 1 omitido (función no disponible).")
 
         manifest["steps"]["step1"] = {
             "status": "ok" if step1_outputs else "skipped_or_failed",
@@ -789,43 +808,48 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     # # -------------------- Paso 2: Competitive Exposure + EDA 1 y 2 --------------------
     exposure_path = cfg.paths.exposure_csv
     if cfg.toggles.step2:
-        logger.info("Paso 2: Cálculo de exposición competitiva (H).")
-        _assert_scoped(cfg.paths.exposure_csv.parent, exp_tag, "step2.exposure_dir", hard=cfg.hard_scope)
-        _touch_fingerprint(cfg.paths.exposure_csv.parent, exp_tag)
-
-        try:
-            ce_path = SRC_DIR / "preprocess_data" / "2. competitive_exposure.py"
-            if ce_path.exists():
-                ce_mod = _dynamic_import("competitive_exposure", ce_path)
-                compute_competitive_exposure = getattr(ce_mod, "compute_competitive_exposure")
-            else:
-                from preprocess_data.competitive_exposure import compute_competitive_exposure  # type: ignore
-        except Exception:
-            logger.exception("No se pudo localizar 'compute_competitive_exposure'.")
-            if cfg.fail_fast:
-                raise
-            compute_competitive_exposure = None  # type: ignore
-
-        if compute_competitive_exposure is not None:
-            ensure_dir(cfg.paths.processed_dir)
-            _ = _safe_call(
-                compute_competitive_exposure,
-                logger,
-                cfg.fail_fast,
-                "2. Competitive Exposure",
-                train_path=str(train_for_next),
-                items_path=str(cfg.paths.items_csv) if cfg.paths.items_csv else None,
-                date_col=cfg.params.date_col,
-                store_col=cfg.params.store_col,
-                item_col=cfg.params.item_col,
-                promo_col=cfg.params.promo_col,
-                neighborhood_col=cfg.params.neighborhood_col if cfg.params.neighborhood_col else "class",
-                bin_threshold=cfg.params.h_bin_threshold,
-                save_path=str(exposure_path),
-                save_format=cfg.params.save_format,
-            )
+        # Check if cached output exists
+        if cfg.toggles.use_cached_step2 and exposure_path.exists():
+            logger.info("⚡ Paso 2: Usando output cacheado (competitive_exposure.csv existe)")
+            logger.info("   ✓ Cache hit: %s", exposure_path)
         else:
-            logger.warning("Paso 2 omitido (función no disponible).")
+            logger.info("Paso 2: Cálculo de exposición competitiva (H).")
+            _assert_scoped(cfg.paths.exposure_csv.parent, exp_tag, "step2.exposure_dir", hard=cfg.hard_scope)
+            _touch_fingerprint(cfg.paths.exposure_csv.parent, exp_tag)
+
+            try:
+                ce_path = SRC_DIR / "preprocess_data" / "2. competitive_exposure.py"
+                if ce_path.exists():
+                    ce_mod = _dynamic_import("competitive_exposure", ce_path)
+                    compute_competitive_exposure = getattr(ce_mod, "compute_competitive_exposure")
+                else:
+                    from preprocess_data.competitive_exposure import compute_competitive_exposure  # type: ignore
+            except Exception:
+                logger.exception("No se pudo localizar 'compute_competitive_exposure'.")
+                if cfg.fail_fast:
+                    raise
+                compute_competitive_exposure = None  # type: ignore
+
+            if compute_competitive_exposure is not None:
+                ensure_dir(cfg.paths.processed_dir)
+                _ = _safe_call(
+                    compute_competitive_exposure,
+                    logger,
+                    cfg.fail_fast,
+                    "2. Competitive Exposure",
+                    train_path=str(train_for_next),
+                    items_path=str(cfg.paths.items_csv) if cfg.paths.items_csv else None,
+                    date_col=cfg.params.date_col,
+                    store_col=cfg.params.store_col,
+                    item_col=cfg.params.item_col,
+                    promo_col=cfg.params.promo_col,
+                    neighborhood_col=cfg.params.neighborhood_col if cfg.params.neighborhood_col else "class",
+                    bin_threshold=cfg.params.h_bin_threshold,
+                    save_path=str(exposure_path),
+                    save_format=cfg.params.save_format,
+                )
+            else:
+                logger.warning("Paso 2 omitido (función no disponible).")
 
         manifest["steps"]["step2"] = {
             "status": "ok" if exposure_path.exists() else "skipped_or_failed",
@@ -856,46 +880,59 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     if cfg.toggles.step3:
         exp_tag_local = cfg.exp_tag if hasattr(cfg, 'exp_tag') and cfg.exp_tag else (exp_tag or "default")
         outdir_exp = cfg.params.outdir_pairs_donors / exp_tag_local
-        ensure_dir(outdir_exp)
-        _assert_scoped(outdir_exp, exp_tag_local, "step3.outdir_exp", hard=cfg.hard_scope)
-        _touch_fingerprint(outdir_exp, exp_tag_local)
-
-        logger.info(f"📁 Guardando pairs/donors en: {outdir_exp}")
-        logger.info("Paso 3: Selección de episodios (pares i-j) y donantes.")
-
-        try:
-            sp_path = SRC_DIR / "preprocess_data" / "3. select_pairs_and_donors.py"
-            if sp_path.exists():
-                sp_mod = import_module_spawn_safe("select_pairs_and_donors", sp_path)
-                select_pairs_and_donors = getattr(sp_mod, "select_pairs_and_donors")
-            else:
-                from preprocess_data.select_pairs_and_donors import select_pairs_and_donors  # type: ignore
-        except Exception:
-            logger.exception("No se pudo localizar 'select_pairs_and_donors'.")
-            if cfg.fail_fast:
-                raise
-            select_pairs_and_donors = None  # type: ignore
-
-        if select_pairs_and_donors is not None:
-            ensure_dir(cfg.params.outdir_pairs_donors)
-            out = _safe_call(
-                select_pairs_and_donors,
-                logger,
-                cfg.fail_fast,
-                "3. Select Pairs & Donors",
-                H_csv=str(exposure_path),
-                train_csv=str(train_for_next),
-                items_csv=str(cfg.paths.items_csv),
-                stores_csv=str(cfg.paths.stores_csv),
-                outdir=str(outdir_exp),  # ← con exp_tag
-            )
-            # Si el módulo devolvió paths concretos, respétalos
-            if isinstance(out, (tuple, list)) and len(out) >= 2 and out[0] and out[1]:
-                pairs_path = Path(out[0])
-                donors_path = Path(out[1])
-
+        
+        # Check if cached outputs exist
+        cached_pairs = outdir_exp / "pairs_windows.csv"
+        cached_donors = outdir_exp / "donors_per_victim.csv"
+        cached_episodes = outdir_exp / "episodes_index.parquet"
+        
+        if cfg.toggles.use_cached_step3 and cached_pairs.exists() and cached_donors.exists():
+            logger.info("⚡ Paso 3: Usando outputs cacheados (pairs_windows.csv y donors_per_victim.csv existen)")
+            logger.info("   ✓ Cache hit: %s", outdir_exp)
+            pairs_path = cached_pairs
+            donors_path = cached_donors
+            if cached_episodes.exists():
+                logger.info("   ✓ episodes_index.parquet también disponible")
         else:
-            logger.warning("Paso 3 omitido (función no disponible).")
+            ensure_dir(outdir_exp)
+            _assert_scoped(outdir_exp, exp_tag_local, "step3.outdir_exp", hard=cfg.hard_scope)
+            _touch_fingerprint(outdir_exp, exp_tag_local)
+
+            logger.info(f"📁 Guardando pairs/donors en: {outdir_exp}")
+            logger.info("Paso 3: Selección de episodios (pares i-j) y donantes.")
+
+            try:
+                sp_path = SRC_DIR / "preprocess_data" / "3. select_pairs_and_donors.py"
+                if sp_path.exists():
+                    sp_mod = import_module_spawn_safe("select_pairs_and_donors", sp_path)
+                    select_pairs_and_donors = getattr(sp_mod, "select_pairs_and_donors")
+                else:
+                    from preprocess_data.select_pairs_and_donors import select_pairs_and_donors  # type: ignore
+            except Exception:
+                logger.exception("No se pudo localizar 'select_pairs_and_donors'.")
+                if cfg.fail_fast:
+                    raise
+                select_pairs_and_donors = None  # type: ignore
+
+            if select_pairs_and_donors is not None:
+                ensure_dir(cfg.params.outdir_pairs_donors)
+                out = _safe_call(
+                    select_pairs_and_donors,
+                    logger,
+                    cfg.fail_fast,
+                    "3. Select Pairs & Donors",
+                    H_csv=str(exposure_path),
+                    train_csv=str(train_for_next),
+                    items_csv=str(cfg.paths.items_csv),
+                    stores_csv=str(cfg.paths.stores_csv),
+                    outdir=str(outdir_exp),  # ← con exp_tag
+                )
+                # Si el módulo devolvió paths concretos, respétalos
+                if isinstance(out, (tuple, list)) and len(out) >= 2 and out[0] and out[1]:
+                    pairs_path = Path(out[0])
+                    donors_path = Path(out[1])
+            else:
+                logger.warning("Paso 3 omitido (función no disponible).")
 
         # Filtrado a 10x10 episodios (si aplica)
         if cfg.params.n_cannibals and cfg.params.n_victims_per_cannibal:
@@ -1278,6 +1315,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                         max_iter=cfg.params.meta_max_iter,
                         min_samples_leaf=cfg.params.meta_min_samples_leaf,
                         l2=cfg.params.meta_l2,
+                        hpo_trials=cfg.params.meta_hpo_trials,
                         do_placebo_space=cfg.params.meta_do_placebo_space,
                         do_placebo_time=cfg.params.meta_do_placebo_time,
                         do_loo=cfg.params.meta_do_loo,

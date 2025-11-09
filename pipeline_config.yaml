@@ -14,6 +14,10 @@ toggles:
   step5_gsc: true
   step6_meta: true
   eda_algorithms: true
+  # Cache control - reutilizar outputs si existen (ahorra tiempo)
+  use_cached_step1: true  # Reutilizar train_filtered.csv si existe
+  use_cached_step2: true  # Reutilizar competitive_exposure.csv si existe
+  use_cached_step3: true  # Reutilizar pairs_windows.csv y donors si existen
 
 paths:
   raw_dir: ".data/raw_data"
@@ -39,11 +43,11 @@ params:
   fourier_k: 3
   max_donor_promo_share: 0.02
   min_availability_share: 0.90
-  max_episodes: 50
+  max_episodes: null  # null = sin límite, procesa todos los disponibles
 
   # Algoritmo GSC
   gsc_log_level: "INFO"
-  gsc_max_episodes: 50
+  gsc_max_episodes: null  # null = sin límite, procesa todos
   gsc_cv_folds: 3
   gsc_cv_holdout: 21
   gsc_do_placebo_space: true
@@ -63,7 +67,7 @@ params:
   meta_cv_folds: 3
   meta_cv_holdout: 21
   meta_min_train_samples: 50
-  meta_max_episodes: 50
+  meta_max_episodes: null  # null = sin límite, procesa todos
   meta_do_placebo_space: true
   meta_do_placebo_time: true
   meta_do_loo: false
@@ -74,6 +78,7 @@ params:
   meta_max_iter: 500
   meta_min_samples_leaf: 20
   meta_l2: 0.0
+  meta_hpo_trials: 100  # Número de trials de Optuna para HPO
   treat_col_s: "H_disc"
   s_ref: 0.0
   treat_col_b: "H_prop"
@@ -84,6 +89,6 @@ params:
   eda_alg_dpi: 300
   eda_alg_learners: ["t", "s", "x"]   # cuáles comparar/visualizar
   eda_alg_export_pdf: true
-  eda_alg_max_episodes_gsc: 40
-  eda_alg_max_episodes_meta: 40
+  eda_alg_max_episodes_gsc: null   # null = sin límite, plotea todos
+  eda_alg_max_episodes_meta: null  # null = sin límite, plotea todos
 

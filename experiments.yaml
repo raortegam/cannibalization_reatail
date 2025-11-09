@@ -2,7 +2,7 @@ base_config: "pipeline_config.yaml"
 
 experiments:
   - id: "A_base"
-    desc: "Baseline"
+    desc: "Baseline con HPO mejorado - GSC vs Meta (X,S,T)"
     overrides:
       params:
         top_k_donors: 20
@@ -13,63 +13,86 @@ experiments:
         gsc_rank: 5
         gsc_tau: 0.0001
         gsc_alpha: 0.0
-        meta_learners: ["x"]
+        meta_learners: ["x", "s", "t"]  # Todos los learners para comparación
         treat_col_s: "H_disc"
         h_bin_threshold: 0.02
         gsc_cv_folds: 3
         gsc_cv_holdout: 21
         meta_cv_folds: 3
         meta_cv_holdout: 21
+        meta_hpo_trials: 100
+        meta_max_iter: 1000
 
-  - id: "B_donors20"
-    desc: "More donors"
+  - id: "B_donors30"
+    desc: "Más donantes para mejor ajuste GSC"
     overrides:
       params:
-        top_k_donors: 20
+        top_k_donors: 30
+        meta_learners: ["x", "s", "t"]
+        meta_hpo_trials: 100
+        meta_max_iter: 1000
 
   - id: "C_donors5_hiqual"
-    desc: "Fewer/high-quality donors"
+    desc: "Pocos donantes de alta calidad"
     overrides:
       params:
         top_k_donors: 5
         max_donor_promo_share: 0.01
         min_availability_share: 0.95
+        meta_learners: ["x", "s", "t"]
+        meta_hpo_trials: 100
+        meta_max_iter: 1000
 
   - id: "D_seasonal_rich"
-    desc: "Richer seasonality"
+    desc: "Estacionalidad enriquecida"
     overrides:
       params:
         fourier_k: 6
         lags_days: [7, 14, 28, 56, 84]
+        meta_learners: ["x", "s", "t"]
+        meta_hpo_trials: 100
+        meta_max_iter: 1000
 
   - id: "E_no_stl"
-    desc: "No STL"
+    desc: "Sin descomposición STL"
     overrides:
       params:
         use_stl: false
         fourier_k: 6
+        meta_learners: ["x", "s", "t"]
+        meta_hpo_trials: 100
+        meta_max_iter: 1000
 
-  - id: "F_treat_prop"
-    desc: "Continuous treatment for Meta"
+  - id: "F_treat_continuous"
+    desc: "Tratamiento continuo (H_prop) para Meta"
     overrides:
       params:
-        meta_learners: ["x","s"]
+        meta_learners: ["x", "s", "t"]
+        treat_col_s: "H_prop"  # Tratamiento continuo
         treat_col_b: "H_prop"
         bin_threshold: 0.0
+        meta_hpo_trials: 100
+        meta_max_iter: 1000
 
-  - id: "G_cv_long"
-    desc: "Longer holdout / more folds"
+  - id: "G_cv_robust"
+    desc: "CV más robusto (5 folds, 35 días holdout)"
     overrides:
       params:
         gsc_cv_folds: 5
         gsc_cv_holdout: 35
         meta_cv_folds: 5
         meta_cv_holdout: 35
+        meta_learners: ["x", "s", "t"]
+        meta_hpo_trials: 100
+        meta_max_iter: 1000
 
-  - id: "H_gsc_rank8_tau1e5"
-    desc: "GSC spec sensitivity"
+  - id: "H_gsc_rank8"
+    desc: "GSC con mayor rank y regularización"
     overrides:
       params:
         gsc_rank: 8
         gsc_tau: 0.00001
         gsc_alpha: 0.001
+        meta_learners: ["x", "s", "t"]
+        meta_hpo_trials: 100
+        meta_max_iter: 1000
