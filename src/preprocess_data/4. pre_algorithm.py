@@ -655,11 +655,17 @@ def add_store_metadata(panel: pd.DataFrame, stores: pd.DataFrame) -> pd.DataFram
 # -------------------------------
 
 def load_episodes(episodes_path: Path) -> pd.DataFrame:
-    eps = pd.read_csv(episodes_path)
+    # Detectar formato por extensión
+    if str(episodes_path).endswith('.parquet'):
+        eps = pd.read_parquet(episodes_path)
+    else:
+        eps = pd.read_csv(episodes_path)
     _ensure_cols(eps, ["i_store", "i_item", "j_store", "j_item", "pre_start", "treat_start", "post_start", "post_end"], "pairs_windows")
     for col in ["pre_start", "treat_start", "post_start", "post_end"]:
         eps[col] = _parse_date(eps[col])
-    eps["episode_id"] = eps.apply(_episode_id, axis=1)
+    # episode_id puede ya existir en parquet
+    if "episode_id" not in eps.columns:
+        eps["episode_id"] = eps.apply(_episode_id, axis=1)
     return eps
 
 

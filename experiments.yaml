@@ -5,7 +5,7 @@ experiments:
     desc: "Baseline"
     overrides:
       params:
-        top_k_donors: 12
+        top_k_donors: 20
         donor_kind: "same_item"
         lags_days: [7, 14, 28, 56]
         fourier_k: 3

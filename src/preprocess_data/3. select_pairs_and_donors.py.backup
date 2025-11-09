@@ -16,7 +16,7 @@ import math
 import traceback
 import multiprocessing as mp
 from typing import List, Tuple, Dict, Optional
-# donors_selector se importa lazy para permitir configurar ENV vars primero
+# # from donors_selector import build_donors_for_pairs  # Temporalmente comentado  # Temporalmente comentado
 
 import numpy as np
 import pandas as pd
@@ -52,7 +52,6 @@ class RunConfig:
     # Salidas base (se respeta exp_tag)
     out_dir: Path = field(default_factory=lambda: _data_root() / "processed_data")
     exp_tag: str | None = None
-    top_k_donors: int = 10
     log_level: str = "INFO"
 
 def _ensure_dir(p: Path) -> Path:
@@ -72,11 +71,6 @@ def run_batch(cfg: RunConfig) -> dict:
     outdir_final = (cfg.out_dir / cfg.exp_tag) if cfg.exp_tag else cfg.out_dir
     _ensure_dir(outdir_final)
     _touch_exp_fingerprint(outdir_final, cfg.exp_tag)
-
-    # Configurar número de donantes ANTES de ejecutar (para que donors_selector lo lea)
-    if cfg.top_k_donors is not None:
-        os.environ["SPD_N_DONORS_PER_J"] = str(cfg.top_k_donors)
-        logging.info(f"Configurando SPD_N_DONORS_PER_J={cfg.top_k_donors} (desde RunConfig)")
 
     # Ejecuta tu función principal usando el outdir scoped
     pairs_path, donors_path = select_pairs_and_donors(
@@ -1527,6 +1521,12 @@ def _donors_for_episode_worker(vict_dict: Dict) -> List[Dict]:
 # Pipeline principal
 # =============================================================================
 def select_pairs_and_donors(H_csv: str, train_csv: str, items_csv: str, stores_csv: str,
+    logger = logging.getLogger(__name__)
+    logger.info("=== INICIO SELECT_PAIRS_AND_DONORS (MODIFICADO) ===")
+
+    logger = logging.getLogger(__name__)
+    logger.info("=== INICIO SELECT_PAIRS_AND_DONORS (MODIFICADO) ===")
+
                             outdir: str = "data") -> Tuple[str, str]:
     """
     Devuelve (pairs_path, donors_path).
@@ -1774,9 +1774,6 @@ def select_pairs_and_donors(H_csv: str, train_csv: str, items_csv: str, stores_c
     else:
         _progress_emit("select_donors", 0.0, "Seleccionando donantes por víctima (módulo externo) ...", force_log=True)
 
-        # Import lazy para que lea las ENV vars configuradas en run_batch
-        from donors_selector import build_donors_for_pairs
-        
         donors_df, donors_path = build_donors_for_pairs(
             H_use=H_use,
             pairs_df_gsc=pairs_df_gsc,
@@ -1840,7 +1837,6 @@ def parse_args() -> RunConfig:
     p.add_argument("--out_dir", type=str, default=str(_data_root() / "processed_data"),
                    help="Directorio raíz de salida (se aplicará /<exp_tag> si se define).")
     p.add_argument("--exp_tag", type=str, default=None, help="Etiqueta de experimento (subcarpeta).")
-    p.add_argument("--top_k_donors", type=int, default=10, help="Número de donantes por víctima.")
     p.add_argument("--log_level", type=str, default="INFO")
     a = p.parse_args()
     return RunConfig(
@@ -1850,7 +1846,6 @@ def parse_args() -> RunConfig:
         stores_csv=Path(a.stores),
         out_dir=Path(a.out_dir),
         exp_tag=a.exp_tag,
-        top_k_donors=a.top_k_donors,
         log_level=a.log_level,
     )
 

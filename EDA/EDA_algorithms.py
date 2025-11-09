@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
 EDA_algorithms.py
 =================
@@ -24,11 +26,7 @@ Salidas (por defecto en ./figures):
         figures/meta_<learner>_overview_summary_*.png
   - Comparación:
         figures/compare_att_sum_gsc_vs_meta_<learner>.png
-"""
-# EDA/EDA_algorithms.py
-from __future__ import annotations
 
-"""
 EDA de algoritmos (GSC + Meta-learners).
 
 - Lee métricas consolidadas (si existen) para histogramas y dispersión.
@@ -51,9 +49,6 @@ Campos esperados en las series (se manejan sinónimos):
 Si 'effect' no existe, se calcula como (observado - contrafactual).
 Si no hay métricas en disco, se calculan por episodio con la ventana de episodes_index.
 """
-
-# EDA/EDA_algorithms.py
-from __future__ import annotations
 
 import logging
 import os
@@ -248,27 +243,65 @@ def _resolve_y_cols(df: pd.DataFrame) -> Tuple[str, str, str]:
     """
     Devuelve nombres de columnas (date, sales, y0_hat).
     Intenta mapear variantes comunes.
+    
+    ESTRATEGIA DE RESOLUCIÓN:
+    - Para OBSERVADO: Priorizar 'sales' (completo) > 'y_obs_plot' (GSC) > 'y' > 'y_obs' (con NaNs)
+    - Para CONTRAFACTUAL: Priorizar 'mu0_hat' (GSC estándar) > 'y0_hat' > 'y_hat' > otros
+    
+    IMPORTANTE: 
+    - GSC exporta 'sales' (=y_obs_plot, completo) y 'mu0_hat' (contrafactual)
+    - Meta exporta 'sales' (original) y 'y0_hat' o 'y_hat'
+    - 'y_obs' puede tener NaNs por máscara de entrenamiento - NO usar para visualización
     """
     # fecha
     date_col = "date" if "date" in df.columns else ("ds" if "ds" in df.columns else df.columns[0])
-    # observado
-    for c in ["sales", "y", "unit_sales", "obs", "observed"]:
-        if c in df.columns:
-            sales_col = c
-            break
-    else:
-        # fallback: la primera numérica distinta a la fecha
-        candid = [c for c in df.columns if c != date_col]
-        sales_col = candid[0]
-    # cf / mu0
-    for c in ["mu0_hat", "y0_hat", "y_cf", "y_synth", "counterfactual", "cf", "y_hat0", "y_hat"]:
+    
+    # ========== OBSERVADO: Priorizar series COMPLETAS ==========
+    sales_col = None
+    
+    # 1. Prioridad MÁXIMA: 'sales' (debe estar completa tanto en GSC como Meta)
+    if "sales" in df.columns:
+        sales_data = pd.to_numeric(df["sales"], errors="coerce")
+        nan_ratio = sales_data.isna().sum() / len(sales_data) if len(sales_data) > 0 else 1.0
+        
+        if nan_ratio < 0.05:  # Menos del 5% NaNs - usar directamente
+            sales_col = "sales"
+        elif nan_ratio < 0.3:  # Entre 5% y 30% NaNs - interpolar
+            df["sales_interpolated"] = sales_data.interpolate(method="linear", limit_direction="both").fillna(method="bfill").fillna(method="ffill")
+            sales_col = "sales_interpolated"
+    
+    # 2. Fallback: 'y_obs_plot' (GSC - serie completa para visualización)
+    if sales_col is None and "y_obs_plot" in df.columns:
+        sales_col = "y_obs_plot"
+    
+    # 3. Fallback: 'y' (Meta-learners)
+    if sales_col is None and "y" in df.columns:
+        sales_col = "y"
+    
+    # 4. Último recurso: 'y_obs' (puede tener NaNs - interpolar)
+    if sales_col is None and "y_obs" in df.columns:
+        y_obs_data = pd.to_numeric(df["y_obs"], errors="coerce")
+        df["y_obs_filled"] = y_obs_data.interpolate(method="linear", limit_direction="both").fillna(method="bfill").fillna(method="ffill")
+        sales_col = "y_obs_filled"
+    
+    # 5. Fallback final: primera columna numérica disponible
+    if sales_col is None:
+        candid = [c for c in df.columns if c != date_col and c != "episode_id" and c not in ["obs_mask", "treated_time", "D"]]
+        sales_col = candid[0] if candid else df.columns[1]
+    
+    # ========== CONTRAFACTUAL: Priorizar nombres estándar ==========
+    y0_col = None
+    # Orden de prioridad actualizado para GSC
+    for c in ["mu0_hat", "y0_hat", "y_hat", "y_cf", "y_synth", "counterfactual", "cf", "y_hat0"]:
         if c in df.columns:
             y0_col = c
             break
-    else:
-        # si no existe, crear columna nula para evitar crash (se avisará en plot)
+    
+    # Si no existe contrafactual, crear columna vacía
+    if y0_col is None:
         y0_col = "__missing_cf__"
         df[y0_col] = np.nan
+    
     return date_col, sales_col, y0_col
 
 
@@ -277,9 +310,34 @@ def _read_meta_cf(meta_root: Path, learner: str, episode_id: str) -> pd.DataFram
     return pd.read_parquet(p) if p and p.exists() else pd.DataFrame()
 
 
-def _read_gsc_cf(gsc_root: Path, episode_id: str) -> pd.DataFrame:
+def _read_gsc_cf(gsc_root: Path, episode_id: str, meta_root: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Lee serie contrafactual de GSC.
+    Si meta_root está disponible, intenta agregar la columna 'sales' original desde Meta.
+    """
     p = _find_first_match(gsc_root, episode_id)
-    return pd.read_parquet(p) if p and p.exists() else pd.DataFrame()
+    if not p or not p.exists():
+        return pd.DataFrame()
+    
+    df_gsc = pd.read_parquet(p)
+    
+    # Intentar agregar 'sales' original desde Meta si no existe
+    if "sales" not in df_gsc.columns and meta_root:
+        # Buscar en meta/x primero
+        for learner in ["x", "t", "s"]:
+            p_meta = _find_first_match(meta_root / learner, episode_id)
+            if p_meta and p_meta.exists():
+                df_meta = pd.read_parquet(p_meta)
+                if "sales" in df_meta.columns and "date" in df_meta.columns:
+                    # Merge sales desde Meta
+                    df_gsc = df_gsc.merge(
+                        df_meta[["date", "sales"]], 
+                        on="date", 
+                        how="left"
+                    )
+                    break
+    
+    return df_gsc
 
 
 def _compute_metrics_from_series(df: pd.DataFrame,
@@ -363,6 +421,9 @@ def _plot_episode_page(
 
     # Columnas
     date_col, sales_col, y0_col = _resolve_y_cols(df)
+    # DEBUG: mostrar qué columna se está usando
+    import logging
+    logging.info(f"[{title}] Usando columna observada: '{sales_col}' | Columnas disponibles: {df.columns.tolist()}")
     df = df.copy()
     df[date_col] = _as_dt(df[date_col])
     df = df.sort_values(date_col)
@@ -373,6 +434,7 @@ def _plot_episode_page(
     y0 = pd.to_numeric(df[y0_col], errors="coerce").astype(float)
 
     # Plot superior: Observado vs Contrafactual
+    # NO aplicar obs_mask - mostrar todos los datos de y_obs para visualización
     ax_top.plot(x, y, label="Observado", linewidth=1.3)
     if y0.notna().any():
         ax_top.plot(x, y0, label="Contrafactual", linestyle="--", linewidth=1.2)
@@ -391,8 +453,8 @@ def _plot_episode_page(
     except Exception:
         text = "Métricas no disponibles"
     bbox = dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85, linewidth=0.8)
-    # coords en ejes para ubicar a la derecha
-    ax_top.text(0.98, 0.02, text, ha="right", va="bottom", transform=ax_top.transAxes, bbox=bbox)
+    # coords en ejes para ubicar a la derecha superior
+    ax_top.text(0.98, 0.98, text, ha="right", va="top", transform=ax_top.transAxes, bbox=bbox)
 
     # Plot inferior: efecto y acumulado (post)
     effect = (y - y0) if y0.notna().any() else pd.Series(np.nan, index=df.index)
@@ -407,6 +469,20 @@ def _plot_episode_page(
 
     ax_bot.set_ylabel("Efecto")
     ax2.set_ylabel("Acumulado")
+    
+    # Alinear el cero de ambos ejes
+    y1_min, y1_max = ax_bot.get_ylim()
+    y2_min, y2_max = ax2.get_ylim()
+    
+    # Calcular rangos simétricos alrededor de cero
+    y1_abs_max = max(abs(y1_min), abs(y1_max))
+    y2_abs_max = max(abs(y2_min), abs(y2_max))
+    
+    # Aplicar límites simétricos si hay datos válidos
+    if np.isfinite(y1_abs_max) and y1_abs_max > 0:
+        ax_bot.set_ylim(-y1_abs_max, y1_abs_max)
+    if np.isfinite(y2_abs_max) and y2_abs_max > 0:
+        ax2.set_ylim(-y2_abs_max, y2_abs_max)
 
     # Leyendas separadas para evitar solapes
     #   - Mantén la del panel superior (observado/cf) a la izquierda.
@@ -555,7 +631,7 @@ def run(cfg: EDAConfig) -> None:
 
         # GSC: MISMO episodio en el MISMO orden
         title = f"GSC — Episodio {ep_id}"
-        df_gsc = _read_gsc_cf(cfg.gsc_out_dir, ep_id) if cfg.gsc_out_dir else pd.DataFrame()
+        df_gsc = _read_gsc_cf(cfg.gsc_out_dir, ep_id, cfg.meta_out_root) if cfg.gsc_out_dir else pd.DataFrame()
         fig = plt.figure(figsize=(w, h))
         _plot_episode_page(fig, df_gsc, title, tstart, legend_loc="upper left", metrics_box_loc="upper right", dpi=cfg.dpi)
         if pdf_ser:

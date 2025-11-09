@@ -649,12 +649,15 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
         return base_cfg, {"cv_used": False, "score": np.nan, "best": asdict(base_cfg), "method": "optuna"}
 
     U, T = ep.Y.shape
-    max_rank = int(max(1, min(U - 1, T - 1, 10)))
+    # Rango amplio para rank - permitir exploración completa
+    max_rank = int(max(1, min(U - 1, T - 1, 6)))  # Máximo 6 (más opciones)
 
     s0 = _svd_scale_pre(ep)
-    tau_lo = float(max(1e-3, 0.05 * s0))
-    tau_hi = float(max(tau_lo * 1.25, 0.8 * s0))
-    alpha_lo, alpha_hi = 1e-5, 1e-1
+    # Rangos amplios para tau - explorar desde muy bajo hasta moderado
+    tau_lo = float(max(5e-5, 0.005 * s0))   # Mínimo más bajo
+    tau_hi = float(max(tau_lo * 10.0, 0.4 * s0))  # Rango más amplio (10x)
+    # Rangos amplios para alpha - explorar desde muy bajo hasta moderado
+    alpha_lo, alpha_hi = 5e-5, 1e-2  # Rango más amplio
 
     pruner = MedianPruner(n_warmup_steps=max(1, len(folds) // 2))
     sampler = optuna.samplers.TPESampler(seed=seed)
@@ -680,6 +683,7 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
                             post_smooth_window=base_cfg.post_smooth_window)
 
         scores = []
+        cv_ratios = []  # Para penalizar contrafactuales planos
         for step, (gap_idx, hold_idx) in enumerate(folds):
             M_train = _apply_time_mask(ep.M, gap_idx, hold_idx)
             model = GSCModel(cfg_try).fit(ep.Y, M_train, ep.X if cfg_try.include_covariates else None)
@@ -688,10 +692,30 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
             y_hat = Yhat[ep.treated_row, hold_idx]
             sc = _finite_or_big(_rmspe(y_true, y_hat))
             scores.append(sc)
+            
+            # Calcular ratio de variabilidad para penalizar contrafactuales planos
+            cv_true = np.std(y_true) / (np.mean(np.abs(y_true)) + 1e-8)
+            cv_hat = np.std(y_hat) / (np.mean(np.abs(y_hat)) + 1e-8)
+            cv_ratio = cv_hat / (cv_true + 1e-8) if cv_true > 0.05 else 1.0
+            cv_ratios.append(cv_ratio)
+            
             trial.report(sc, step=step)
             if trial.should_prune():
                 raise optuna.TrialPruned()
-        return float(np.median(scores))
+        
+        median_score = float(np.median(scores))
+        median_cv_ratio = float(np.median(cv_ratios))
+        
+        # Penalizar si el contrafactual es demasiado plano (cv_ratio < 0.3)
+        # o demasiado variable (cv_ratio > 1.5)
+        if median_cv_ratio < 0.3:
+            penalty = (0.3 - median_cv_ratio) * 0.5  # Penalización por ser plano
+            median_score += penalty
+        elif median_cv_ratio > 1.5:
+            penalty = (median_cv_ratio - 1.5) * 0.3  # Penalización por ser muy variable
+            median_score += penalty
+            
+        return median_score
 
     logging.info(f"Iniciando HPO (Optuna) para GSC con {int(trials)} trials...")
     study.optimize(objective, n_trials=int(trials), show_progress_bar=False)
@@ -979,15 +1003,26 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
 
     # ---- Anti-overfit: re‑entrena si PRE ≈ copiado ----
     overfit_refit = False
-    if (np.isfinite(rmspe_pre) and rmspe_pre < 1e-8) or np.allclose(y_obs_pre, y_hat_pre, atol=1e-10, rtol=0.0):
+    # Detección multi-criterio de overfitting:
+    # 1. RMSPE extremadamente bajo (< 0.05)
+    # 2. Correlación casi perfecta (> 0.99)
+    # 3. Valores casi idénticos (allclose)
+    corr_pre = np.corrcoef(y_obs_pre, y_hat_pre)[0, 1] if len(y_obs_pre) > 1 else 0.0
+    if (np.isfinite(rmspe_pre) and rmspe_pre < 0.05) or \
+       (np.isfinite(corr_pre) and corr_pre > 0.99) or \
+       np.allclose(y_obs_pre, y_hat_pre, atol=1e-3, rtol=0.05):
         overfit_refit = True
-        logging.warning(f"[{ep_id}] PRE ≈ reconstrucción perfecta (RMSPE_pre≈0). Re‑entrenando con mayor regularización.")
+        logging.warning(f"[{ep_id}] Overfitting detectado (RMSPE_pre={rmspe_pre:.4f} < 0.10). Re‑entrenando con mayor regularización.")
         s0 = _svd_scale_pre(epw)
-        # subir tau (regularización nuclear) y bajar rank (capacidad)
+        # AUMENTAR regularización agresivamente para combatir overfitting
+        # - Reducir rank drásticamente (capacidad del modelo)
+        # - Aumentar tau significativamente (penalización nuclear)
+        # - Aumentar alpha (penalización de covariables)
+        # - Solo calibración de nivel (no tendencia que puede sobreajustar)
         safer_cfg = GSCConfig(
-            rank=max(1, min(best_cfg.rank,  max(1, best_cfg.rank // 2))),
-            tau=max(best_cfg.tau * 3.0, 0.25 * s0),
-            alpha=max(best_cfg.alpha, 0.01),
+            rank=max(1, best_cfg.rank // 3),              # Reducir a 1/3 del original
+            tau=max(best_cfg.tau * 10.0, 0.5 * s0),       # 10x tau o 50% del singular mayor
+            alpha=max(best_cfg.alpha * 5.0, 0.05),        # 5x alpha, mínimo 0.05
             max_inner=best_cfg.max_inner,
             max_outer=best_cfg.max_outer,
             tol=best_cfg.tol,
@@ -996,8 +1031,8 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
             standardize_y=True,
             link=best_cfg.link, link_eps=best_cfg.link_eps,
             pred_clip_min=best_cfg.pred_clip_min,
-            calibrate_victim=best_cfg.calibrate_victim,
-            post_smooth_window=best_cfg.post_smooth_window,
+            calibrate_victim="level",                     # Solo nivel, NO tendencia
+            post_smooth_window=1,                         # Sin suavizado
         )
         model = GSCModel(safer_cfg).fit(epw.Y, M_final, epw.X if safer_cfg.include_covariates else None)
         Yhat = model.predict(epw.X if safer_cfg.include_covariates else None)
@@ -1013,35 +1048,98 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
         y_hat_pre = Yhat[epw.treated_row, epw.pre_mask]
         rmspe_pre = _rmspe(y_obs_pre, y_hat_pre)
         mae_pre   = _mae(y_obs_pre, y_hat_pre)
+    
+    # ---- Detección de contrafactuales planos (sobre-regularización) ----
+    flat_cf_refit = False
+    # Calcular coeficiente de variación del contrafactual en PRE
+    y_hat_pre_cv = float(np.nanstd(y_hat_pre) / (np.nanmean(np.abs(y_hat_pre)) + 1e-8))
+    y_obs_pre_cv = float(np.nanstd(y_obs_pre) / (np.nanmean(np.abs(y_obs_pre)) + 1e-8))
+    
+    # Solo aplicar si NO hubo overfit_refit (para evitar conflictos)
+    # Si el CF tiene mucha menos variabilidad que el observado, está sobre-regularizado
+    # Pero también verificar que RMSPE no sea demasiado bajo (evitar casos de overfit)
+    if not overfit_refit and y_hat_pre_cv < 0.5 * y_obs_pre_cv and y_obs_pre_cv > 0.1 and rmspe_pre > 0.20:
+        flat_cf_refit = True
+        logging.warning(f"[{ep_id}] Contrafactual plano detectado (CV_cf={y_hat_pre_cv:.3f} vs CV_obs={y_obs_pre_cv:.3f}). "
+                       f"Re-entrenando con MENOR regularización para capturar variabilidad.")
+        s0 = _svd_scale_pre(epw)
+        # REDUCIR tau y AUMENTAR rank para más flexibilidad
+        less_reg_cfg = GSCConfig(
+            rank=min(10, max(best_cfg.rank + 2, 5)),  # Aumentar capacidad
+            tau=max(best_cfg.tau * 0.3, 0.01 * s0),   # Reducir regularización nuclear
+            alpha=max(best_cfg.alpha * 0.5, 1e-4),    # Reducir regularización de covariables
+            max_inner=best_cfg.max_inner,
+            max_outer=best_cfg.max_outer,
+            tol=best_cfg.tol,
+            include_covariates=best_cfg.include_covariates,
+            random_state=best_cfg.random_state,
+            standardize_y=True,
+            link=best_cfg.link, link_eps=best_cfg.link_eps,
+            pred_clip_min=best_cfg.pred_clip_min,
+            calibrate_victim="level",  # Solo calibración de nivel, no tendencia
+            post_smooth_window=1,      # Sin suavizado para preservar variabilidad
+        )
+        model = GSCModel(less_reg_cfg).fit(epw.Y, M_final, epw.X if less_reg_cfg.include_covariates else None)
+        Yhat = model.predict(epw.X if less_reg_cfg.include_covariates else None)
+        y_hat_vec = Yhat[epw.treated_row, :]
+        # Calibración solo de nivel (no tendencia)
+        jj = np.where(epw.pre_mask & obs_mask)[0]
+        if jj.size > 0:
+            bias = float(np.nanmean(y_obs_vec[jj] - y_hat_vec[jj]))
+            y_hat_vec = y_hat_vec + bias
+            if less_reg_cfg.pred_clip_min is not None:
+                y_hat_vec = np.maximum(y_hat_vec, float(less_reg_cfg.pred_clip_min))
+            Yhat[epw.treated_row, :] = y_hat_vec
+        y_hat_pre = Yhat[epw.treated_row, epw.pre_mask]
+        rmspe_pre = _rmspe(y_obs_pre, y_hat_pre)
+        mae_pre   = _mae(y_obs_pre, y_hat_pre)
+        # Recalcular CV después del refit
+        y_hat_pre_cv_new = float(np.nanstd(y_hat_pre) / (np.nanmean(np.abs(y_hat_pre)) + 1e-8))
+        logging.info(f"[{ep_id}] Después de refit: CV_cf={y_hat_pre_cv_new:.3f}, RMSPE_pre={rmspe_pre:.4f}")
 
-    # Serie para gráfico (observado con fill para huecos de render)
-    y_obs_plot = np.where(np.isfinite(y_obs_vec), y_obs_vec, 0.0)
-
-    # Efectos
-    eff_post = y_obs_vec[epw.treated_post_mask] - y_hat_vec[epw.treated_post_mask]
+    # Filtrar solo las fechas donde la víctima tiene datos reales
+    # CRÍTICO: epw.dates contiene TODAS las fechas del panel (víctima + donantes)
+    # pero y_obs_vec solo tiene datos válidos en las fechas de la víctima
+    # Necesitamos exportar SOLO las fechas con datos reales (no NaNs)
+    valid_mask = np.isfinite(y_obs_vec)
+    valid_indices = np.where(valid_mask)[0]
+    
+    # Extraer solo datos válidos
+    dates_valid = [epw.dates[j] for j in valid_indices]
+    y_obs_valid = y_obs_vec[valid_indices]
+    y_hat_valid = y_hat_vec[valid_indices]
+    treated_time_valid = epw.treated_post_mask[valid_indices]
+    
+    # Efectos (calculados sobre datos válidos)
+    eff_post = y_obs_vec[epw.treated_post_mask & valid_mask] - y_hat_vec[epw.treated_post_mask & valid_mask]
     att_mean  = float(np.nanmean(eff_post))
     att_sum   = float(np.nansum(eff_post))
     base_level = float(np.nanmean(y_obs_pre))
     rel_att   = _safe_pct(att_mean, base_level)
 
     # Guardar serie contrafactual + columnas plot‑ready
+    # IMPORTANTE: Exportar 'sales' (datos reales) y 'mu0_hat' (contrafactual) 
+    # Solo para fechas donde la víctima tiene datos válidos
     
     cf_dir = cfg.out_dir / "cf_series"
     _ensure_dir(cf_dir)
-    effect = y_obs_vec - y_hat_vec
-    cum_effect_obs = np.cumsum(np.where(np.isfinite(effect), effect, 0.0))
+    effect_valid = y_obs_valid - y_hat_valid
+    cum_effect_valid = pd.Series(effect_valid).cumsum()
+    
     cf = pd.DataFrame({
         "episode_id": ep_id,
-        "date": [epw.dates[j] for j in range(len(epw.dates))],
-        "y_obs": y_obs_vec,
-        "y_hat": y_hat_vec,
-        "treated_time": epw.treated_post_mask.astype(int),
-        "obs_mask": np.isfinite(y_obs_vec).astype(int),
-        "y_obs_plot": y_obs_plot,
-        "effect": effect,
-        "effect_plot": y_obs_plot - y_hat_vec,
-        "cum_effect": pd.Series(effect).cumsum(),
-        "cum_effect_obs": cum_effect_obs
+        "date": dates_valid,
+        "sales": y_obs_valid,             # Serie observada REAL (sin NaNs ni ceros artificiales)
+        "y_obs": y_obs_valid,             # Alias
+        "mu0_hat": y_hat_valid,           # Contrafactual (nombre estándar para EDA)
+        "y_hat": y_hat_valid,             # Alias para compatibilidad hacia atrás
+        "treated_time": treated_time_valid.astype(int),
+        "obs_mask": np.ones(len(dates_valid), dtype=int),  # Todos son válidos por construcción
+        "y_obs_plot": y_obs_valid,        # Alias
+        "effect": effect_valid,
+        "effect_plot": effect_valid,
+        "cum_effect": cum_effect_valid,
+        "cum_effect_obs": cum_effect_valid
     })
     cf_path = cf_dir / f"{ep_id}_cf.parquet"
     cf.to_parquet(cf_path, index=False)
@@ -1108,6 +1206,11 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
             "train_victim_post_after": epw.meta["n_train_victim_post_after"]
         },
         "overfit_refit": bool(overfit_refit),
+        "flat_cf_refit": bool(flat_cf_refit),
+        "variability": {
+            "cv_obs_pre": float(y_obs_pre_cv),
+            "cv_cf_pre": float(y_hat_pre_cv)
+        },
         "p_value_placebo_space": pval_space,
         "paths": {
             "cf": str(cf_path),
@@ -1145,6 +1248,9 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
         "calibrate_victim": best_cfg.calibrate_victim,
         "post_smooth_window": best_cfg.post_smooth_window,
         "overfit_refit": bool(overfit_refit),
+        "flat_cf_refit": bool(flat_cf_refit),
+        "cv_obs_pre": float(y_obs_pre_cv),
+        "cv_cf_pre": float(y_hat_pre_cv),
     }
     return summary
 
@@ -1155,7 +1261,12 @@ def run_batch(cfg: RunConfig) -> None:
                         datefmt="%Y-%m-%d %H:%M:%S")
                         
     
-    cfg.out_dir = (cfg.gsc_dir / cfg.exp_tag / "gsc").resolve()
+    # Solo construir out_dir desde exp_tag si out_dir no está definido y exp_tag existe
+    if cfg.out_dir is None and cfg.exp_tag:
+        cfg.out_dir = (cfg.gsc_dir / cfg.exp_tag / "gsc").resolve()
+    elif cfg.out_dir is None:
+        cfg.out_dir = cfg.gsc_dir.parent / "gsc_output"
+    
     gsc_dir = cfg.gsc_dir
     if not gsc_dir.exists():
         alt = Path("./data/processed/gsc")
@@ -1181,7 +1292,13 @@ def run_batch(cfg: RunConfig) -> None:
             logging.info(f"[{k}/{len(files)}] Ejecutando GSC en {p.name} ...")
             summ = run_episode(p, cfg)
             metrics.append(summ)
-            logging.info(f"OK {p.stem} | ATT_sum={summ['att_sum']:.3f} | RMSPE_pre={summ['rmspe_pre']:.4f} | refit={summ['overfit_refit']}")
+            refit_flags = []
+            if summ['overfit_refit']:
+                refit_flags.append("overfit")
+            if summ['flat_cf_refit']:
+                refit_flags.append("flat_cf")
+            refit_str = f" | refit=[{','.join(refit_flags)}]" if refit_flags else ""
+            logging.info(f"OK {p.stem} | ATT_sum={summ['att_sum']:.3f} | RMSPE_pre={summ['rmspe_pre']:.4f} | CV_cf={summ['cv_cf_pre']:.3f}{refit_str}")
         except Exception as e:
             logging.exception(f"Error en episodio {p.name}: {e}")
 
@@ -1251,9 +1368,6 @@ def parse_args() -> RunConfig:
 
     p.add_argument("--exp_tag", type=str, default=None,
                    help="Etiqueta del experimento. Si se define, todo se guarda en figures/<exp_tag>/gsc")
-
-    p.add_argument("--episodes_index", type=str, default="./.data/processed_data/episodes_index.parquet",
-                   help="Índice de episodios (opcional).")
     
     a = p.parse_args()
     grid_ranks = tuple(int(x.strip()) for x in a.grid_ranks.split(",") if x.strip())

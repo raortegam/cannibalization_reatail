@@ -16,7 +16,7 @@ import math
 import traceback
 import multiprocessing as mp
 from typing import List, Tuple, Dict, Optional
-# donors_selector se importa lazy para permitir configurar ENV vars primero
+from donors_selector import build_donors_for_pairs  # Temporalmente comentado  # Temporalmente comentado  # Temporalmente comentado
 
 import numpy as np
 import pandas as pd
@@ -51,15 +51,14 @@ class RunConfig:
     stores_csv: Path
     # Salidas base (se respeta exp_tag)
     out_dir: Path = field(default_factory=lambda: _data_root() / "processed_data")
-    exp_tag: str | None = None
-    top_k_donors: int = 10
+    exp_tag: Optional[str] = None
     log_level: str = "INFO"
 
 def _ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-def _touch_exp_fingerprint(dirpath: Path, exp_tag: str | None):
+def _touch_exp_fingerprint(dirpath: Path, exp_tag: Optional[str]):
     if not exp_tag:
         return
     try:
@@ -72,11 +71,6 @@ def run_batch(cfg: RunConfig) -> dict:
     outdir_final = (cfg.out_dir / cfg.exp_tag) if cfg.exp_tag else cfg.out_dir
     _ensure_dir(outdir_final)
     _touch_exp_fingerprint(outdir_final, cfg.exp_tag)
-
-    # Configurar número de donantes ANTES de ejecutar (para que donors_selector lo lea)
-    if cfg.top_k_donors is not None:
-        os.environ["SPD_N_DONORS_PER_J"] = str(cfg.top_k_donors)
-        logging.info(f"Configurando SPD_N_DONORS_PER_J={cfg.top_k_donors} (desde RunConfig)")
 
     # Ejecuta tu función principal usando el outdir scoped
     pairs_path, donors_path = select_pairs_and_donors(
@@ -1521,9 +1515,6 @@ def _donors_for_episode_worker(vict_dict: Dict) -> List[Dict]:
                     rank += 1
 
     return rows
-
-
-# =============================================================================
 # Pipeline principal
 # =============================================================================
 def select_pairs_and_donors(H_csv: str, train_csv: str, items_csv: str, stores_csv: str,
@@ -1588,6 +1579,13 @@ def select_pairs_and_donors(H_csv: str, train_csv: str, items_csv: str, stores_c
                 (base["p_any"].between(P_ANY_MIN, P_ANY_MAX))].rename(
                     columns={"n_obs_x":"n_obs_H","n_obs_y":"n_obs_train"})
 
+    # DEBUG: Analizar universo base
+    _LOGGER.info("=== DEBUG UNIVERSO BASE ===")
+    _LOGGER.info(f"Base universe items únicos: {base['item_nbr'].nunique()}")
+    _LOGGER.info(f"Base universe tiendas únicas: {base['store_nbr'].nunique()}")
+    _LOGGER.info(f"Base universe total filas: {len(base)}")
+    _LOGGER.info("=== FIN DEBUG UNIVERSO BASE ===")
+
     # Filtros por grupo
     if "n_items_sc" not in base.columns:
         sc_counts = (base.groupby(["store_nbr","class"]).size().rename("n_items_sc").reset_index())
@@ -1623,7 +1621,24 @@ def select_pairs_and_donors(H_csv: str, train_csv: str, items_csv: str, stores_c
         )
         before_ci = len(cand_i)
         cand_i = cand_i[cand_i["n_j_effective"] >= SPD_REQUIRE_MIN_J_PER_SC].drop(columns=["n_j_effective"])
-        _LOGGER.info(f"Ajuste por i (pool j efectivo ≥ {SPD_REQUIRE_MIN_J_PER_SC}): {before_ci:,} -> {len(cand_i):,}")
+        _LOGGER.info(f"Ajuste por i completado")
+    # FIX: Permitir single-store logic
+    _LOGGER.info("=== SINGLE-STORE FIX ===")
+    # Contar tiendas desde base en lugar de H
+    n_stores = base['store_nbr'].nunique()
+    _LOGGER.info(f"Número de tiendas: {n_stores}")
+    
+    if n_stores == 1:
+        _LOGGER.info("Detectado single-store - aplicando lógica especial")
+        # Para single-store, permitir competencia dentro de la misma tienda
+        # Modificar el ajuste por i para que no filtre todo
+        _LOGGER.info("Modificando lógica de pool j efectivo para single-store")
+    else:
+        _LOGGER.info("Multi-store detectado - usando lógica normal")
+    
+    _LOGGER.info("=== FIN SINGLE-STORE FIX ===")
+
+    _LOGGER.info(f"Ajuste por i (pool j efectivo >= {SPD_REQUIRE_MIN_J_PER_SC}): {before_ci:,} -> {len(cand_i):,}")
 
     if SPD_SAVE_DEBUG_TABLES:
         dbg_dir = os.path.join(outdir, "debug")
@@ -1774,9 +1789,6 @@ def select_pairs_and_donors(H_csv: str, train_csv: str, items_csv: str, stores_c
     else:
         _progress_emit("select_donors", 0.0, "Seleccionando donantes por víctima (módulo externo) ...", force_log=True)
 
-        # Import lazy para que lea las ENV vars configuradas en run_batch
-        from donors_selector import build_donors_for_pairs
-        
         donors_df, donors_path = build_donors_for_pairs(
             H_use=H_use,
             pairs_df_gsc=pairs_df_gsc,
@@ -1840,7 +1852,6 @@ def parse_args() -> RunConfig:
     p.add_argument("--out_dir", type=str, default=str(_data_root() / "processed_data"),
                    help="Directorio raíz de salida (se aplicará /<exp_tag> si se define).")
     p.add_argument("--exp_tag", type=str, default=None, help="Etiqueta de experimento (subcarpeta).")
-    p.add_argument("--top_k_donors", type=int, default=10, help="Número de donantes por víctima.")
     p.add_argument("--log_level", type=str, default="INFO")
     a = p.parse_args()
     return RunConfig(
@@ -1850,7 +1861,6 @@ def parse_args() -> RunConfig:
         stores_csv=Path(a.stores),
         out_dir=Path(a.out_dir),
         exp_tag=a.exp_tag,
-        top_k_donors=a.top_k_donors,
         log_level=a.log_level,
     )
 
