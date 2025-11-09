@@ -1324,7 +1324,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         logger.info("Paso 6 (Meta) deshabilitado por configuración.")
         manifest["steps"]["step6_meta"] = {"status": "disabled"}
 
-    # -------------------- EDA FINAL: Algoritmos (series y resúmenes) --------------------
+   # -------------------- EDA FINAL: Algoritmos (series y resúmenes) --------------------
     if cfg.toggles.eda_algorithms:
         logger.info("EDA final de algoritmos: render de láminas por episodio y comparativas.")
         try:
@@ -1338,14 +1338,12 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
 
         episodes_index_path = processed_out_dir / "episodes_index.parquet"
 
-        
+        # Fallback: usa el índice generado en Step 3 si falta el del Step 4
         if not episodes_index_path.exists():
-        # Fallback: usa el índice que generó step3 (si existe)
             alt_from_step3 = cfg.params.outdir_pairs_donors / (cfg.exp_tag or exp_tag or "default") / "episodes_index.parquet"
             if alt_from_step3.exists():
                 logging.warning("EDA_algorithms: se usará episodes_index desde Step 3: %s", str(alt_from_step3))
                 episodes_index_path = alt_from_step3
-            
 
         if eda_alg_run is None or EDAAlgConfig is None:
             logger.warning("EDA_algorithms no disponible (run/EDAConfig no encontrados).")
@@ -1357,21 +1355,31 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 "reason": f"missing episodes_index at {episodes_index_path}"
             }
         else:
-            # Cobertura de episodios (diagnóstico previo a EDA)
+            # Cobertura de episodios para diagnóstico
             coverage: Dict[str, Any] = {}
             try:
                 expected = set(pd.read_parquet(episodes_index_path)["episode_id"].unique().tolist())
             except Exception:
                 expected = set()
-            gsc_mets = cfg.paths.gsc_out_dir / "gsc_metrics.parquet"
-            eps_gsc = set()
-            if gsc_mets.exists():
+
+            # GSC: buscar métricas con rutas alternativas
+            gsc_mets_candidates = [
+                cfg.paths.gsc_out_dir / "gsc" / "gsc_metrics.parquet",   # <-- ubicación canónica nueva
+                cfg.paths.gsc_out_dir / "gsc_metrics.parquet",            # backward-compat
+                cfg.paths.gsc_out_dir / "metrics" / "gsc_metrics.parquet" # por si el modelo las deja en /metrics
+            ]
+            gsc_mets_path = next((p for p in gsc_mets_candidates if p.exists()), None)
+
+            eps_gsc: set = set()
+            if gsc_mets_path and gsc_mets_path.exists():
                 try:
-                    gm = pd.read_parquet(gsc_mets)
+                    gm = pd.read_parquet(gsc_mets_path)
                     if "episode_id" in gm.columns:
-                        eps_gsc = set(gm["episode_id"].unique().tolist())
+                        eps_gsc = set(gm["episode_id"].dropna().unique().tolist())
                 except Exception:
                     pass
+
+            # Meta: unión de episodios procesados por los learners ejecutados
             eps_meta_union: set = set()
             if "step6_meta" in manifest["steps"] and manifest["steps"]["step6_meta"].get("outputs"):
                 for lr, out in manifest["steps"]["step6_meta"]["outputs"].items():
@@ -1383,9 +1391,9 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                                 eps_meta_union |= set(mm["episode_id"].unique().tolist())
                         except Exception:
                             pass
+
             available = eps_gsc | eps_meta_union
             missing = expected - available if expected else set()
-
             coverage = {
                 "expected": len(expected),
                 "gsc": len(eps_gsc),
@@ -1396,9 +1404,11 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
             logger.info("Cobertura de episodios para EDA_algorithms: %s", coverage)
 
             learners_for_eda = tuple(cfg.params.eda_alg_learners) if cfg.params.eda_alg_learners else tuple(cfg.params.meta_learners)
+
+            # IMPORTANTE: pasar el directorio donde REALMENTE quedaron los outputs de GSC
             eda_cfg = EDAAlgConfig(
                 episodes_index=Path(episodes_index_path),
-                gsc_out_dir=Path(cfg.paths.gsc_out_dir),
+                gsc_out_dir=Path(cfg.paths.gsc_out_dir) / "gsc",   # <-- aquí va el subdirectorio 'gsc'
                 meta_out_root=Path(cfg.paths.meta_out_root),
                 meta_learners=learners_for_eda,
                 figures_dir=Path(cfg.paths.figures_dir),
@@ -1411,6 +1421,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 max_episodes_meta=cfg.params.eda_alg_max_episodes_meta,
                 export_pdf=cfg.params.eda_alg_export_pdf,
             )
+
             _safe_call(eda_alg_run, logger, cfg.fail_fast, "EDA Algorithms", cfg=eda_cfg)
             _assert_scoped(cfg.paths.figures_dir, exp_tag, "EDA.figures_dir", hard=cfg.hard_scope)
             _touch_fingerprint(cfg.paths.figures_dir, exp_tag)
@@ -1424,15 +1435,6 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     else:
         logger.info("EDA Algorithms deshabilitado por configuración.")
         manifest["steps"]["eda_algorithms"] = {"status": "disabled"}
-
-    # Guardar manifest de ejecución
-    manifest["end_time"] = datetime.now().isoformat()
-    manifest_path = DIAG_DIR / "pipeline_run_manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
-    logger.info("📄 Manifest de ejecución guardado en: %s", str(manifest_path))
-
-    return manifest
 
 
 def parse_args(argv=None):
