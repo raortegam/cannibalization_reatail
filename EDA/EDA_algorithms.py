@@ -391,11 +391,36 @@ def _plot_episode_series(ax_top: plt.Axes,
     if "effect" in d.columns:
         ax_bot.plot(d["date"], d["effect"], label="Efecto (Y - Y0)", linewidth=1.2)
         ax_bot.set_ylabel("Efecto")
-        # Acumulado en eje secundario
+        # Acumulado en eje secundario - solo post-tratamiento
         if "cum_effect" in d.columns:
+            # Recalcular acumulado: 0 antes del tratamiento, acumular solo después
+            d_plot = d.copy()
+            d_plot["cum_effect_plot"] = d_plot["effect"].where(d_plot["date"] >= treat_start, 0.0).cumsum()
             ax2 = ax_bot.twinx()
-            ax2.plot(d["date"], d["cum_effect"], linestyle="--", label="Efecto acumulado", linewidth=1.0)
+            ax2.plot(d_plot["date"], d_plot["cum_effect_plot"], linestyle="--", label="Efecto acumulado", linewidth=1.0)
             ax2.set_ylabel("Acumulado")
+            
+            # Alinear el cero de ambos ejes
+            y1_min, y1_max = ax_bot.get_ylim()
+            y2_min, y2_max = ax2.get_ylim()
+            
+            # Para alinear el cero, necesitamos que la proporción sea la misma:
+            # |y1_min| / y1_max = |y2_min| / y2_max
+            # Ajustamos el eje 2 para que coincida con el eje 1
+            
+            if y1_min < 0 and y1_max > 0:
+                # El eje 1 cruza el cero - usamos su proporción
+                ratio = abs(y1_min) / y1_max
+                
+                if y2_max > 0:
+                    # Ajustar y2_min para que tenga la misma proporción
+                    new_y2_min = -y2_max * ratio
+                    ax2.set_ylim(new_y2_min, y2_max)
+                elif y2_min < 0:
+                    # Ajustar y2_max para que tenga la misma proporción
+                    new_y2_max = abs(y2_min) / ratio
+                    ax2.set_ylim(y2_min, new_y2_max)
+        
         ax_bot.axvline(pd.to_datetime(treat_start), linewidth=1.0)
         ax_bot.legend(loc="upper left")
     else:
@@ -540,10 +565,7 @@ def run(cfg: EDAConfig) -> None:
             if not meta_series[lr]:
                 logger.info("No se encontraron series CF de Meta-%s en %s", lr.upper(), str(cf_dir))
 
-    # 7) PDF con series por episodio (stack de páginas)
-    pdf_series_path = fig_dir / "series_by_episode.pdf" if cfg.export_pdf else None
-    pdf_series = PdfPages(pdf_series_path) if pdf_series_path else None
-
+    # 7) PDFs separados por fuente (GSC y Meta-learners)
     # Helper para obtener ventana de un episodio
     epi_map = (
         episodes[["episode_id", "pre_start", "treat_start", "post_end"]]
@@ -553,7 +575,7 @@ def run(cfg: EDAConfig) -> None:
     epi_map["episode_id"] = epi_map["episode_id"].astype(str)
     epi_map = epi_map.set_index("episode_id")
 
-    def _render_one(src: str, ep: str, d: pd.DataFrame) -> None:
+    def _render_one(src: str, ep: str, d: pd.DataFrame, pdf_writer=None) -> None:
         if ep not in epi_map.index:
             return
         row = epi_map.loc[ep]
@@ -596,7 +618,7 @@ def run(cfg: EDAConfig) -> None:
             f"ATT_sum: {mets['att_sum']:.2f}\n"
             f"ATT_mean: {mets['att_mean']:.2f}"
         )
-        ax_top.text(0.02, 0.98, txt, transform=ax_top.transAxes, va="top", ha="left",
+        ax_top.text(0.98, 0.98, txt, transform=ax_top.transAxes, va="top", ha="right",
                     bbox=dict(facecolor="white", alpha=0.9, edgecolor="0.5"))
 
         fig.tight_layout()
@@ -605,21 +627,34 @@ def run(cfg: EDAConfig) -> None:
         safe_ep = ep.replace("/", "_")
         png = fig_dir / f"series_{src.replace(' ', '_').replace('/', '_')}_{safe_ep}.png"
         fig.savefig(png, dpi=cfg.dpi)
-        if pdf_series:
-            pdf_series.savefig(fig, dpi=cfg.dpi)
+        if pdf_writer:
+            pdf_writer.savefig(fig, dpi=cfg.dpi)
         plt.close(fig)
 
-    # --- Render GSC
-    for ep, d in gsc_series.items():
-        _render_one("GSC", ep, d)
+    # --- Render GSC (PDF separado)
+    if gsc_series and cfg.export_pdf:
+        pdf_gsc_path = fig_dir / "series_gsc.pdf"
+        with PdfPages(pdf_gsc_path) as pdf_gsc:
+            for ep, d in gsc_series.items():
+                _render_one("GSC", ep, d, pdf_writer=pdf_gsc)
+        logger.info("PDF GSC guardado en: %s", str(pdf_gsc_path))
+    elif gsc_series:
+        # Solo PNG, sin PDF
+        for ep, d in gsc_series.items():
+            _render_one("GSC", ep, d, pdf_writer=None)
 
-    # --- Render Meta por learner
+    # --- Render Meta por learner (PDF separado por learner)
     for lr, dmap in meta_series.items():
-        for ep, d in dmap.items():
-            _render_one(f"Meta-{lr.upper()}", ep, d)
-
-    if pdf_series:
-        pdf_series.close()
+        if dmap and cfg.export_pdf:
+            pdf_meta_path = fig_dir / f"series_meta_{lr}.pdf"
+            with PdfPages(pdf_meta_path) as pdf_meta:
+                for ep, d in dmap.items():
+                    _render_one(f"Meta-{lr.upper()}", ep, d, pdf_writer=pdf_meta)
+            logger.info("PDF Meta-%s guardado en: %s", lr.upper(), str(pdf_meta_path))
+        elif dmap:
+            # Solo PNG, sin PDF
+            for ep, d in dmap.items():
+                _render_one(f"Meta-{lr.upper()}", ep, d, pdf_writer=None)
 
     # 8) Top episodios por |ATT_sum| (si hubo métricas)
     if not all_mets.empty and "att_sum" in all_mets.columns:
@@ -641,5 +676,9 @@ def run(cfg: EDAConfig) -> None:
     logger.info("Cobertura guardada en: %s", str(cover_path))
     if pdf_sum_path:
         logger.info("Resumen PDF: %s", str(pdf_sum_path))
-    if pdf_series_path:
-        logger.info("Series por episodio (PDF): %s", str(pdf_series_path))
+    logger.info("PDFs de series generados:")
+    if gsc_series and cfg.export_pdf:
+        logger.info("  - series_gsc.pdf")
+    for lr in meta_series.keys():
+        if meta_series[lr] and cfg.export_pdf:
+            logger.info("  - series_meta_%s.pdf", lr)
