@@ -60,6 +60,14 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+# Importar módulo de métricas causales
+try:
+    from .causal_metrics import CausalMetricsCalculator
+    CAUSAL_METRICS_AVAILABLE = True
+except ImportError:
+    CAUSAL_METRICS_AVAILABLE = False
+    logging.warning("causal_metrics.py no disponible; métricas causales comparativas desactivadas.")
+
 # =============================================================================
 # Rutas por defecto
 # =============================================================================
@@ -1163,6 +1171,38 @@ def run_episode(meta_df: pd.DataFrame,
         pt.to_parquet(pt_path, index=False)
     else:
         pt_path = None
+
+    # ===== MÉTRICAS CAUSALES COMPARATIVAS =====
+    causal_metrics_report = None
+    if CAUSAL_METRICS_AVAILABLE:
+        try:
+            calc = CausalMetricsCalculator(ep_id, f"meta-{cfg.learner}")
+            
+            # Cargar placebos si existen
+            ps_df = pd.read_parquet(ps_path) if ps_path and Path(ps_path).exists() else None
+            pt_df = pd.read_parquet(pt_path) if pt_path and Path(pt_path).exists() else None
+            
+            # Para meta-learners, no tenemos análisis de sensibilidad por defecto
+            # pero podríamos agregarlo en el futuro
+            
+            # Calcular métricas
+            causal_metrics_report = calc.compute_all(
+                y_obs_pre=y_obs_pre,
+                y_hat_pre=y_hat_pre,
+                tau_post=effect_post,
+                att_base=att_sum,
+                placebo_space_df=ps_df,
+                placebo_time_df=pt_df,
+                n_control_units=0  # Meta-learners no tienen concepto directo de unidades control
+            )
+            
+            # Guardar reporte de métricas causales
+            causal_dir = Path(cfg.out_dir) / "causal_metrics"; _ensure_dir(causal_dir)
+            causal_path = causal_dir / f"{ep_id}_causal.parquet"
+            pd.DataFrame([causal_metrics_report.to_flat_dict()]).to_parquet(causal_path, index=False)
+            
+        except Exception as e:
+            logging.warning(f"[{ep_id}] Error calculando métricas causales: {e}")
 
     # Reporte JSON
     rep_dir = Path(cfg.out_dir) / "reports"; _ensure_dir(rep_dir)

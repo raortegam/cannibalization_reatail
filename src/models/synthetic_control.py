@@ -59,6 +59,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+# Importar módulo de métricas causales
+try:
+    from .causal_metrics import CausalMetricsCalculator
+    CAUSAL_METRICS_AVAILABLE = True
+except ImportError:
+    CAUSAL_METRICS_AVAILABLE = False
+    logging.warning("causal_metrics.py no disponible; métricas causales comparativas desactivadas.")
 
 # ---------------------------------------------------------------------
 # Utilidades generales
@@ -907,7 +914,9 @@ def _exp_root(exp_tag: Optional[str]) -> Optional[Path]:
     return (Path("figures") / str(exp_tag)) if exp_tag else None
 
 def _discover_episode_files(gsc_dir: Path) -> List[Path]:
-    files = [p for p in gsc_dir.glob("*.parquet") if p.name != "donor_quality.parquet"]
+    # Excluir archivos de métricas/calidad que no son episodios
+    exclude = {"donor_quality.parquet", "gsc_metrics.parquet"}
+    files = [p for p in gsc_dir.glob("*.parquet") if p.name not in exclude]
     return sorted(files)
 
 def _episode_id_from_path(p: Path) -> str:
@@ -1187,6 +1196,50 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
         sens_sd = float(np.nanstd(sens["att_sum"])) if not sens.empty else np.nan
     else:
         sens_sd, sens_path = np.nan, None
+
+    # ===== MÉTRICAS CAUSALES COMPARATIVAS =====
+    causal_metrics_report = None
+    if CAUSAL_METRICS_AVAILABLE:
+        try:
+            calc = CausalMetricsCalculator(ep_id, "gsc")
+            
+            # Preparar datos para balance de covariables (si hay X)
+            X_treat_pre, X_control_pre = None, None
+            if epw.X is not None and epw.X.ndim == 3:
+                # Víctima en PRE
+                X_treat_pre = epw.X[epw.treated_row, epw.pre_mask, :]
+                # Controles en PRE (promedio)
+                control_rows = [i for i in range(len(epw.units)) if i != epw.treated_row]
+                if control_rows:
+                    X_control_pre = epw.X[control_rows, :, :][:, epw.pre_mask, :].reshape(-1, epw.X.shape[2])
+            
+            # Cargar placebos si existen
+            ps_df = pd.read_parquet(ps_path) if ps_path and Path(ps_path).exists() else None
+            pt_df = pd.read_parquet(pt_path) if pt_path and Path(pt_path).exists() else None
+            sens_df = pd.read_parquet(sens_path) if sens_path and Path(sens_path).exists() else None
+            
+            # Calcular todas las métricas
+            causal_metrics_report = calc.compute_all(
+                y_obs_pre=y_obs_pre,
+                y_hat_pre=y_hat_pre,
+                tau_post=eff_post,
+                att_base=att_sum,
+                X_treat_pre=X_treat_pre,
+                X_control_pre=X_control_pre,
+                feature_names=epw.feats if epw.X is not None else None,
+                sensitivity_df=sens_df,
+                placebo_space_df=ps_df,
+                placebo_time_df=pt_df,
+                n_control_units=epw.meta["n_controls"]
+            )
+            
+            # Guardar reporte de métricas causales
+            causal_dir = cfg.out_dir / "causal_metrics"; _ensure_dir(causal_dir)
+            causal_path = causal_dir / f"{ep_id}_causal.parquet"
+            pd.DataFrame([causal_metrics_report.to_flat_dict()]).to_parquet(causal_path, index=False)
+            
+        except Exception as e:
+            logging.warning(f"[{ep_id}] Error calculando métricas causales: {e}")
 
     # Reporte
     rep = {

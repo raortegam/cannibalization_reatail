@@ -33,7 +33,7 @@ paths:
   meta_out_root: ".data/processed_data/meta_outputs"
 
 params:
-  gsc_eval_n: 10
+  gsc_eval_n: null  # null = procesar TODOS los episodios (150)
   gsc_eval_selection: "head"
   # Step 4 (pre_algorithm)
   

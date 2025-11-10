@@ -876,29 +876,32 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     # # # -------------------- Paso 3: select_pairs_and_donors + EDA 3 --------------------
     pairs_path = cfg.paths.preprocessed_dir / "pairs_windows.csv"
     donors_path = cfg.paths.preprocessed_dir / "donors_per_victim.csv"
+    
+    # Definir ubicación CENTRAL compartida y exp_tag_local (fuera del if para scope)
+    outdir_central = cfg.params.outdir_pairs_donors / "_shared_base"
+    exp_tag_local = cfg.exp_tag if hasattr(cfg, 'exp_tag') and cfg.exp_tag else (exp_tag or "default")
 
     if cfg.toggles.step3:
-        exp_tag_local = cfg.exp_tag if hasattr(cfg, 'exp_tag') and cfg.exp_tag else (exp_tag or "default")
-        outdir_exp = cfg.params.outdir_pairs_donors / exp_tag_local
         
-        # Check if cached outputs exist
-        cached_pairs = outdir_exp / "pairs_windows.csv"
-        cached_donors = outdir_exp / "donors_per_victim.csv"
-        cached_episodes = outdir_exp / "episodes_index.parquet"
+        # Check if cached outputs exist en ubicación central
+        cached_pairs = outdir_central / "pairs_windows.csv"
+        cached_donors = outdir_central / "donors_per_victim.csv"
+        cached_episodes = outdir_central / "episodes_index.parquet"
         
         if cfg.toggles.use_cached_step3 and cached_pairs.exists() and cached_donors.exists():
-            logger.info("⚡ Paso 3: Usando outputs cacheados (pairs_windows.csv y donors_per_victim.csv existen)")
-            logger.info("   ✓ Cache hit: %s", outdir_exp)
+            logger.info("⚡ Paso 3: Usando outputs cacheados CENTRALES (compartidos por todos los experimentos)")
+            logger.info("   ✓ Cache hit: %s", outdir_central)
             pairs_path = cached_pairs
             donors_path = cached_donors
             if cached_episodes.exists():
                 logger.info("   ✓ episodes_index.parquet también disponible")
         else:
-            ensure_dir(outdir_exp)
-            _assert_scoped(outdir_exp, exp_tag_local, "step3.outdir_exp", hard=cfg.hard_scope)
-            _touch_fingerprint(outdir_exp, exp_tag_local)
+            ensure_dir(outdir_central)
+            # No usar exp_tag para scoping ya que es compartido
+            _touch_fingerprint(outdir_central, "_shared_base")
 
-            logger.info(f"📁 Guardando pairs/donors en: {outdir_exp}")
+            logger.info(f"📁 Guardando pairs/donors en ubicación CENTRAL: {outdir_central}")
+            logger.info("   (Compartido por todos los experimentos)")
             logger.info("Paso 3: Selección de episodios (pares i-j) y donantes.")
 
             try:
@@ -925,7 +928,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                     train_csv=str(train_for_next),
                     items_csv=str(cfg.paths.items_csv),
                     stores_csv=str(cfg.paths.stores_csv),
-                    outdir=str(outdir_exp),  # ← con exp_tag
+                    outdir=str(outdir_central),  # ← ubicación CENTRAL compartida
                 )
                 # Si el módulo devolvió paths concretos, respétalos
                 if isinstance(out, (tuple, list)) and len(out) >= 2 and out[0] and out[1]:
@@ -953,8 +956,8 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                                cfg.params.n_cannibals, cfg.params.n_victims_per_cannibal, e)
 
         # Normalizar nombres canónicos (por si el selector usó sufijos)
-        canonical_pairs = outdir_exp / "pairs_windows.csv"
-        canonical_donors = outdir_exp / "donors_per_victim.csv"
+        canonical_pairs = outdir_central / "pairs_windows.csv"
+        canonical_donors = outdir_central / "donors_per_victim.csv"
         try:
             if pairs_path.resolve() != canonical_pairs.resolve() and pairs_path.exists():
                 shutil.copy2(pairs_path, canonical_pairs)
@@ -967,8 +970,10 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
 
         _assert_exists(pairs_path, "step3.pairs_path")
         _assert_exists(donors_path, "step3.donors_path")
-        _assert_scoped(pairs_path.parent, exp_tag_local, "step3.pairs_dir", hard=cfg.hard_scope)
-        _assert_scoped(donors_path.parent, exp_tag_local, "step3.donors_dir", hard=cfg.hard_scope)
+        # NO validar scope para _shared_base ya que es compartido por todos los experimentos
+        if "_shared_base" not in str(pairs_path.parent):
+            _assert_scoped(pairs_path.parent, exp_tag_local, "step3.pairs_dir", hard=cfg.hard_scope)
+            _assert_scoped(donors_path.parent, exp_tag_local, "step3.donors_dir", hard=cfg.hard_scope)
 
         manifest["steps"]["step3"] = {
             "status": "ok" if pairs_path.exists() and donors_path.exists() else "skipped_or_failed",
@@ -979,16 +984,16 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         manifest["steps"]["step3"] = {"status": "disabled"}
 
 
-        # --- Mirror opcional desde outdir_exp a processed_dir/<exp_tag> ---
+        # --- Mirror opcional desde outdir_central a processed_dir/<exp_tag> ---
     try:
         # processed_out_dir ya existe más abajo; aquí usamos la misma convención
         processed_out_dir = cfg.paths.processed_dir
         exp_tag_local = cfg.exp_tag if getattr(cfg, "exp_tag", None) else (exp_tag or "default")
         # episodios (GSC) y meta
-        _maybe_copy(outdir_exp / "episodes_index.parquet",
+        _maybe_copy(outdir_central / "episodes_index.parquet",
                     processed_out_dir / "episodes_index.parquet",
                     "episodes_index (step3->processed_dir)")
-        _maybe_copy(outdir_exp / "episodes_index_meta.parquet",
+        _maybe_copy(outdir_central / "episodes_index_meta.parquet",
                     processed_out_dir / "episodes_index_meta.parquet",
                     "episodes_index_meta (step3->processed_dir)")
         _maybe_copy(pairs_path, processed_out_dir / "pairs_windows.csv",

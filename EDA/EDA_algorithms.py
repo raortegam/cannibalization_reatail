@@ -461,8 +461,427 @@ def _scatter_rmspe_vs_att(ax: plt.Axes, rmspe: pd.Series, att: pd.Series, title:
 
 
 # ---------------------------------------------------------------------
+# Gráficos académicos para métricas causales comparativas
+# ---------------------------------------------------------------------
+
+def _plot_causal_metrics_comparison(causal_df: pd.DataFrame, fig_dir: Path, dpi: int = 300) -> None:
+    """
+    Genera gráficos académicos comparando métricas causales entre modelos.
+    Estilo apropiado para publicación en papers.
+    """
+    if causal_df.empty or "model_type" not in causal_df.columns:
+        return
+    
+    # Configuración de estilo académico
+    plt.style.use('seaborn-v0_8-paper' if 'seaborn-v0_8-paper' in plt.style.available else 'default')
+    
+    # Colores consistentes por modelo
+    model_colors = {
+        'gsc': '#2E86AB',      # Azul profesional
+        'meta-t': '#A23B72',   # Magenta
+        'meta-s': '#F18F01',   # Naranja
+        'meta-x': '#C73E1D'    # Rojo
+    }
+    
+    models = sorted(causal_df['model_type'].unique())
+    
+    # ========== FIGURA 1: Panel de métricas de predicción ==========
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle('Prediction Quality Metrics Comparison', fontsize=14, fontweight='bold', y=0.995)
+    
+    # 1.1 RMSPE Pre-tratamiento (boxplot)
+    ax = axes[0, 0]
+    data_rmspe = []
+    labels_rmspe = []
+    for model in models:
+        vals = causal_df[causal_df['model_type'] == model]['pred_rmspe_pre'].dropna()
+        if len(vals) > 0:
+            data_rmspe.append(vals)
+            labels_rmspe.append(model.upper())
+    
+    if data_rmspe:
+        bp = ax.boxplot(data_rmspe, labels=labels_rmspe, patch_artist=True, widths=0.6)
+        for patch, model in zip(bp['boxes'], models[:len(data_rmspe)]):
+            patch.set_facecolor(model_colors.get(model, '#888888'))
+            patch.set_alpha(0.7)
+        ax.set_ylabel('RMSPE (Pre-treatment)', fontsize=11)
+        ax.set_title('(A) Prediction Error', fontsize=11, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        ax.axhline(y=0.25, color='red', linestyle='--', linewidth=1, alpha=0.5, label='Threshold')
+    
+    # 1.2 Correlación Pre-tratamiento
+    ax = axes[0, 1]
+    data_corr = []
+    labels_corr = []
+    for model in models:
+        vals = causal_df[causal_df['model_type'] == model]['pred_corr_pre'].dropna()
+        if len(vals) > 0:
+            data_corr.append(vals)
+            labels_corr.append(model.upper())
+    
+    if data_corr:
+        bp = ax.boxplot(data_corr, labels=labels_corr, patch_artist=True, widths=0.6)
+        for patch, model in zip(bp['boxes'], models[:len(data_corr)]):
+            patch.set_facecolor(model_colors.get(model, '#888888'))
+            patch.set_alpha(0.7)
+        ax.set_ylabel('Correlation (Obs vs Pred)', fontsize=11)
+        ax.set_title('(B) Pre-treatment Correlation', fontsize=11, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        ax.axhline(y=0.9, color='green', linestyle='--', linewidth=1, alpha=0.5)
+    
+    # 1.3 R² Pre-tratamiento
+    ax = axes[1, 0]
+    data_r2 = []
+    labels_r2 = []
+    for model in models:
+        vals = causal_df[causal_df['model_type'] == model]['pred_r2_pre'].dropna()
+        if len(vals) > 0:
+            data_r2.append(vals)
+            labels_r2.append(model.upper())
+    
+    if data_r2:
+        bp = ax.boxplot(data_r2, labels=labels_r2, patch_artist=True, widths=0.6)
+        for patch, model in zip(bp['boxes'], models[:len(data_r2)]):
+            patch.set_facecolor(model_colors.get(model, '#888888'))
+            patch.set_alpha(0.7)
+        ax.set_ylabel('R² (Pre-treatment)', fontsize=11)
+        ax.set_title('(C) Goodness of Fit', fontsize=11, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        ax.axhline(y=0.8, color='green', linestyle='--', linewidth=1, alpha=0.5)
+    
+    # 1.4 Tabla resumen
+    ax = axes[1, 1]
+    ax.axis('off')
+    
+    summary_data = []
+    for model in models:
+        subset = causal_df[causal_df['model_type'] == model]
+        if len(subset) > 0:
+            summary_data.append([
+                model.upper(),
+                f"{subset['pred_rmspe_pre'].median():.3f}",
+                f"{subset['pred_corr_pre'].median():.3f}",
+                f"{subset['pred_r2_pre'].median():.3f}",
+                f"{len(subset)}"
+            ])
+    
+    if summary_data:
+        table = ax.table(cellText=summary_data,
+                        colLabels=['Model', 'RMSPE↓', 'Corr↑', 'R²↑', 'N'],
+                        cellLoc='center',
+                        loc='center',
+                        bbox=[0.1, 0.2, 0.8, 0.6])
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1, 2)
+        
+        # Colorear header
+        for i in range(5):
+            table[(0, i)].set_facecolor('#E8E8E8')
+            table[(0, i)].set_text_props(weight='bold')
+        
+        ax.set_title('(D) Summary Statistics (Median)', fontsize=11, fontweight='bold')
+    
+    plt.tight_layout()
+    fig.savefig(fig_dir / 'causal_metrics_prediction_quality.png', dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    
+    # ========== FIGURA 2: Heterogeneidad y Sensibilidad ==========
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle('Effect Heterogeneity and Sensitivity Analysis', fontsize=14, fontweight='bold', y=0.995)
+    
+    # 2.1 Heterogeneidad del efecto (CV de tau)
+    ax = axes[0, 0]
+    data_het = []
+    labels_het = []
+    for model in models:
+        vals = causal_df[causal_df['model_type'] == model]['het_tau_cv'].dropna()
+        vals = vals[np.isfinite(vals) & (vals >= 0) & (vals < 10)]  # Filtrar outliers
+        if len(vals) > 0:
+            data_het.append(vals)
+            labels_het.append(model.upper())
+    
+    if data_het:
+        bp = ax.boxplot(data_het, labels=labels_het, patch_artist=True, widths=0.6)
+        for patch, model in zip(bp['boxes'], models[:len(data_het)]):
+            patch.set_facecolor(model_colors.get(model, '#888888'))
+            patch.set_alpha(0.7)
+        ax.set_ylabel('CV(τ) - Coefficient of Variation', fontsize=11)
+        ax.set_title('(A) Effect Heterogeneity', fontsize=11, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    # 2.2 Sensibilidad relativa
+    ax = axes[0, 1]
+    data_sens = []
+    labels_sens = []
+    for model in models:
+        vals = causal_df[causal_df['model_type'] == model]['sens_relative_std'].dropna()
+        vals = vals[np.isfinite(vals) & (vals >= 0) & (vals < 5)]  # Filtrar outliers
+        if len(vals) > 0:
+            data_sens.append(vals)
+            labels_sens.append(model.upper())
+    
+    if data_sens:
+        bp = ax.boxplot(data_sens, labels=labels_sens, patch_artist=True, widths=0.6)
+        for patch, model in zip(bp['boxes'], models[:len(data_sens)]):
+            patch.set_facecolor(model_colors.get(model, '#888888'))
+            patch.set_alpha(0.7)
+        ax.set_ylabel('Relative Std (σ/|ATT|)', fontsize=11)
+        ax.set_title('(B) Sensitivity to Specifications', fontsize=11, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        ax.axhline(y=0.3, color='orange', linestyle='--', linewidth=1, alpha=0.5, label='High sensitivity')
+    
+    # 2.3 Distribución de efectos positivos/negativos
+    ax = axes[1, 0]
+    pct_pos_data = []
+    for model in models:
+        vals = causal_df[causal_df['model_type'] == model]['het_pct_positive'].dropna()
+        if len(vals) > 0:
+            pct_pos_data.append(vals.median())
+        else:
+            pct_pos_data.append(0)
+    
+    if any(pct_pos_data):
+        x_pos = np.arange(len(models))
+        bars = ax.bar(x_pos, pct_pos_data, width=0.6, alpha=0.7)
+        for bar, model in zip(bars, models):
+            bar.set_color(model_colors.get(model, '#888888'))
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([m.upper() for m in models])
+        ax.set_ylabel('% Positive Effects (Median)', fontsize=11)
+        ax.set_title('(C) Direction of Effects', fontsize=11, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        ax.axhline(y=50, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+        ax.set_ylim(0, 100)
+    
+    # 2.4 Tabla resumen heterogeneidad
+    ax = axes[1, 1]
+    ax.axis('off')
+    
+    het_summary = []
+    for model in models:
+        subset = causal_df[causal_df['model_type'] == model]
+        if len(subset) > 0:
+            het_summary.append([
+                model.upper(),
+                f"{subset['het_tau_cv'].median():.3f}",
+                f"{subset['het_tau_std'].median():.2f}",
+                f"{subset['sens_relative_std'].median():.3f}",
+                f"{subset['het_pct_positive'].median():.1f}%"
+            ])
+    
+    if het_summary:
+        table = ax.table(cellText=het_summary,
+                        colLabels=['Model', 'CV(τ)', 'σ(τ)', 'Sens', '% Pos'],
+                        cellLoc='center',
+                        loc='center',
+                        bbox=[0.05, 0.2, 0.9, 0.6])
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1, 2)
+        
+        for i in range(5):
+            table[(0, i)].set_facecolor('#E8E8E8')
+            table[(0, i)].set_text_props(weight='bold')
+        
+        ax.set_title('(D) Summary Statistics (Median)', fontsize=11, fontweight='bold')
+    
+    plt.tight_layout()
+    fig.savefig(fig_dir / 'causal_metrics_heterogeneity_sensitivity.png', dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    
+    # ========== FIGURA 3: Balance y Placebos ==========
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle('Covariate Balance and Placebo Tests', fontsize=14, fontweight='bold', y=0.995)
+    
+    # 3.1 Balance de covariables (diferencia estandarizada media)
+    ax = axes[0, 0]
+    data_bal = []
+    labels_bal = []
+    for model in models:
+        vals = causal_df[causal_df['model_type'] == model]['bal_mean_abs_std_diff'].dropna()
+        if len(vals) > 0:
+            data_bal.append(vals)
+            labels_bal.append(model.upper())
+    
+    if data_bal:
+        bp = ax.boxplot(data_bal, labels=labels_bal, patch_artist=True, widths=0.6)
+        for patch, model in zip(bp['boxes'], models[:len(data_bal)]):
+            patch.set_facecolor(model_colors.get(model, '#888888'))
+            patch.set_alpha(0.7)
+        ax.set_ylabel('Mean |Std. Diff|', fontsize=11)
+        ax.set_title('(A) Covariate Balance', fontsize=11, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        ax.axhline(y=0.25, color='red', linestyle='--', linewidth=1, alpha=0.5, label='Imbalance threshold')
+        ax.axhline(y=0.1, color='green', linestyle='--', linewidth=1, alpha=0.5, label='Good balance')
+    
+    # 3.2 Tasa de balance (proporción de covariables balanceadas)
+    ax = axes[0, 1]
+    data_bal_rate = []
+    labels_bal_rate = []
+    for model in models:
+        vals = causal_df[causal_df['model_type'] == model]['bal_rate'].dropna()
+        if len(vals) > 0:
+            data_bal_rate.append(vals * 100)  # Convertir a porcentaje
+            labels_bal_rate.append(model.upper())
+    
+    if data_bal_rate:
+        bp = ax.boxplot(data_bal_rate, labels=labels_bal_rate, patch_artist=True, widths=0.6)
+        for patch, model in zip(bp['boxes'], models[:len(data_bal_rate)]):
+            patch.set_facecolor(model_colors.get(model, '#888888'))
+            patch.set_alpha(0.7)
+        ax.set_ylabel('Balance Rate (%)', fontsize=11)
+        ax.set_title('(B) Proportion of Balanced Covariates', fontsize=11, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        ax.set_ylim(0, 105)
+    
+    # 3.3 P-values de tests placebo espaciales
+    ax = axes[1, 0]
+    for model in models:
+        vals = causal_df[causal_df['model_type'] == model]['plac_p_value_space'].dropna()
+        vals = vals[(vals >= 0) & (vals <= 1)]
+        if len(vals) > 0:
+            ax.hist(vals, bins=20, alpha=0.5, label=model.upper(), 
+                   color=model_colors.get(model, '#888888'), edgecolor='black', linewidth=0.5)
+    
+    ax.set_xlabel('P-value', fontsize=11)
+    ax.set_ylabel('Frequency', fontsize=11)
+    ax.set_title('(C) Placebo Test P-values (Spatial)', fontsize=11, fontweight='bold')
+    ax.axvline(x=0.05, color='red', linestyle='--', linewidth=1.5, label='α=0.05')
+    ax.axvline(x=0.10, color='orange', linestyle='--', linewidth=1, label='α=0.10')
+    ax.legend(fontsize=9, loc='upper right')
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    # 3.4 Tabla resumen validación
+    ax = axes[1, 1]
+    ax.axis('off')
+    
+    val_summary = []
+    for model in models:
+        subset = causal_df[causal_df['model_type'] == model]
+        if len(subset) > 0:
+            p_vals = subset['plac_p_value_space'].dropna()
+            p_vals = p_vals[(p_vals >= 0) & (p_vals <= 1)]
+            pct_sig = (p_vals < 0.05).mean() * 100 if len(p_vals) > 0 else np.nan
+            
+            val_summary.append([
+                model.upper(),
+                f"{subset['bal_mean_abs_std_diff'].median():.3f}",
+                f"{subset['bal_rate'].median()*100:.1f}%",
+                f"{p_vals.median():.3f}" if len(p_vals) > 0 else "N/A",
+                f"{pct_sig:.1f}%" if not np.isnan(pct_sig) else "N/A"
+            ])
+    
+    if val_summary:
+        table = ax.table(cellText=val_summary,
+                        colLabels=['Model', 'Bal↓', 'Rate↑', 'p-val', '% Sig'],
+                        cellLoc='center',
+                        loc='center',
+                        bbox=[0.05, 0.2, 0.9, 0.6])
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1, 2)
+        
+        for i in range(5):
+            table[(0, i)].set_facecolor('#E8E8E8')
+            table[(0, i)].set_text_props(weight='bold')
+        
+        ax.set_title('(D) Validation Summary (Median)', fontsize=11, fontweight='bold')
+    
+    plt.tight_layout()
+    fig.savefig(fig_dir / 'causal_metrics_balance_placebo.png', dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    
+    # ========== FIGURA 4: Radar chart comparativo (resumen ejecutivo) ==========
+    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(projection='polar'))
+    
+    # Métricas normalizadas (0-1, donde 1 es mejor)
+    metrics_radar = []
+    labels_radar = ['Prediction\nQuality', 'Low\nSensitivity', 'Effect\nHeterogeneity',
+                    'Covariate\nBalance', 'Placebo\nTests']
+    
+    for model in models:
+        subset = causal_df[causal_df['model_type'] == model]
+        if len(subset) > 0:
+            # Normalizar cada métrica (1 = mejor)
+            pred_quality = 1 - subset['pred_rmspe_pre'].median()  # Menor RMSPE es mejor
+            pred_quality = np.clip(pred_quality, 0, 1)
+            
+            low_sens = 1 / (1 + subset['sens_relative_std'].median())  # Menor sensibilidad es mejor
+            
+            heterog = subset['het_tau_cv'].median()
+            heterog = np.clip(heterog / 2, 0, 1)  # Normalizar CV
+            
+            balance = 1 - subset['bal_mean_abs_std_diff'].median() / 0.5  # Menor diferencia es mejor
+            balance = np.clip(balance, 0, 1)
+            
+            p_vals = subset['plac_p_value_space'].dropna()
+            p_vals = p_vals[(p_vals >= 0) & (p_vals <= 1)]
+            placebo = p_vals.median() if len(p_vals) > 0 else 0.5  # P-value alto es mejor
+            
+            metrics_radar.append([pred_quality, low_sens, heterog, balance, placebo])
+    
+    # Ángulos para el radar
+    angles = np.linspace(0, 2 * np.pi, len(labels_radar), endpoint=False).tolist()
+    angles += angles[:1]  # Cerrar el círculo
+    
+    for i, model in enumerate(models):
+        if i < len(metrics_radar):
+            values = metrics_radar[i] + metrics_radar[i][:1]  # Cerrar el círculo
+            ax.plot(angles, values, 'o-', linewidth=2, label=model.upper(),
+                   color=model_colors.get(model, '#888888'))
+            ax.fill(angles, values, alpha=0.15, color=model_colors.get(model, '#888888'))
+    
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels_radar, fontsize=11)
+    ax.set_ylim(0, 1)
+    ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_yticklabels(['0.2', '0.4', '0.6', '0.8', '1.0'], fontsize=9)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=11)
+    ax.set_title('Overall Model Performance Comparison\n(Normalized Metrics)', 
+                fontsize=14, fontweight='bold', pad=20)
+    
+    plt.tight_layout()
+    fig.savefig(fig_dir / 'causal_metrics_radar_summary.png', dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    
+    # Restaurar estilo por defecto
+    plt.style.use('default')
+
+
+# ---------------------------------------------------------------------
 # EDA principal
 # ---------------------------------------------------------------------
+
+def _load_causal_metrics(base_dir: Path, model_type: str) -> pd.DataFrame:
+    """Carga métricas causales desde carpeta causal_metrics."""
+    if not base_dir:
+        return pd.DataFrame()
+    
+    causal_dir = Path(base_dir) / "causal_metrics"
+    if not causal_dir.exists():
+        return pd.DataFrame()
+    
+    files = list(causal_dir.glob("*_causal.parquet"))
+    if not files:
+        return pd.DataFrame()
+    
+    dfs = []
+    for f in files:
+        try:
+            df = pd.read_parquet(f)
+            dfs.append(df)
+        except Exception:
+            continue
+    
+    if not dfs:
+        return pd.DataFrame()
+    
+    result = pd.concat(dfs, ignore_index=True)
+    result["source"] = model_type
+    return result
+
 
 def run(cfg: EDAConfig) -> None:
     logger = logging.getLogger("EDA_algorithms")
@@ -670,6 +1089,62 @@ def run(cfg: EDAConfig) -> None:
             top_tbl = top_tbl[["source", "rank", "episode_id", "att_sum", "rmspe_pre"]]
             top_tbl_path = tbl_dir / "top_episodes_by_abs_att.parquet"
             top_tbl.to_parquet(top_tbl_path, index=False)
+
+    # 9) Cargar y consolidar métricas causales comparativas
+    causal_metrics_list = []
+    
+    # GSC
+    if cfg.gsc_out_dir:
+        gsc_causal = _load_causal_metrics(cfg.gsc_out_dir, "gsc")
+        if not gsc_causal.empty:
+            causal_metrics_list.append(gsc_causal)
+            logger.info("Métricas causales GSC cargadas: %d episodios", len(gsc_causal))
+    
+    # Meta-learners
+    if cfg.meta_out_root:
+        for lr in cfg.meta_learners:
+            meta_dir = Path(cfg.meta_out_root) / lr
+            meta_causal = _load_causal_metrics(meta_dir, f"meta-{lr}")
+            if not meta_causal.empty:
+                causal_metrics_list.append(meta_causal)
+                logger.info("Métricas causales Meta-%s cargadas: %d episodios", lr.upper(), len(meta_causal))
+    
+    # Consolidar y guardar tabla comparativa
+    if causal_metrics_list:
+        causal_all = pd.concat(causal_metrics_list, ignore_index=True)
+        causal_path = tbl_dir / "causal_metrics_comparison.parquet"
+        causal_all.to_parquet(causal_path, index=False)
+        logger.info("Tabla comparativa de métricas causales guardada: %s", str(causal_path))
+        
+        # Exportar también a CSV para fácil inspección
+        causal_csv_path = tbl_dir / "causal_metrics_comparison.csv"
+        causal_all.to_csv(causal_csv_path, index=False)
+        
+        # Resumen por modelo
+        summary_cols = [
+            "pred_rmspe_pre", "pred_corr_pre", "pred_r2_pre",
+            "het_tau_std", "het_tau_cv", "sens_att_cv", "sens_relative_std",
+            "bal_mean_abs_std_diff", "bal_rate", "plac_p_value_space"
+        ]
+        available_cols = [c for c in summary_cols if c in causal_all.columns]
+        
+        if available_cols:
+            summary = causal_all.groupby("model_type")[available_cols].agg(['mean', 'median', 'std']).round(4)
+            summary_path = tbl_dir / "causal_metrics_summary_by_model.csv"
+            summary.to_csv(summary_path)
+            logger.info("Resumen por modelo guardado: %s", str(summary_path))
+        
+        # ===== GENERAR GRÁFICOS ACADÉMICOS DE MÉTRICAS CAUSALES =====
+        logger.info("Generando gráficos académicos de métricas causales comparativas...")
+        try:
+            _plot_causal_metrics_comparison(causal_all, fig_dir, dpi=cfg.dpi)
+            logger.info("Gráficos de métricas causales generados exitosamente:")
+            logger.info("  - causal_metrics_prediction_quality.png")
+            logger.info("  - causal_metrics_heterogeneity_sensitivity.png")
+            logger.info("  - causal_metrics_balance_placebo.png")
+            logger.info("  - causal_metrics_radar_summary.png")
+        except Exception as e:
+            logger.error(f"Error generando gráficos de métricas causales: {e}", exc_info=True)
 
     # Mensajes finales
     logger.info("EDA_algorithms completado.")
