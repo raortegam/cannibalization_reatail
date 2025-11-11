@@ -274,7 +274,7 @@ def _donors_for_episode_worker(ep: Dict) -> List[Dict]:
     j_pre_mean = None if st_victim.empty else float(st_victim["pre_mean"].iloc[0])
 
     # SAME_ITEM (mismo SKU en otras tiendas)
-    cand_si = profiles[profiles["item_nbr"]==j].merge(stores, on="store_nbr", how="left")
+    cand_si = profiles[profiles["item_nbr"]==j]
     cand_si = cand_si[cand_si["store_nbr"] != s]
     if SPD_AVOID_CANNIBAL_STORE and i_store is not None:
         cand_si = cand_si[cand_si["store_nbr"] != int(i_store)]
@@ -284,8 +284,7 @@ def _donors_for_episode_worker(ep: Dict) -> List[Dict]:
         X = cand_si[["h_mean","h_sd","p_any"]].to_numpy(dtype=float, copy=False)
         d = np.sqrt(((X - tgt) ** 2 * w).sum(axis=1))
         cand_si = cand_si.assign(profile_distance=d)
-        pre_si = cand_si.sort_values(["profile_distance","state","city"], ascending=[True,True,True])\
-                        .head(max(N_DONORS_PER_J * 5, SPD_DONOR_PRESELECT_TOP_K))
+        pre_si = cand_si.nsmallest(max(N_DONORS_PER_J * 4, SPD_DONOR_PRESELECT_TOP_K), "profile_distance")
         scored = []
         if j_pre_mean is None:
             for _, r in pre_si.iterrows():
@@ -343,16 +342,14 @@ def _donors_for_episode_worker(ep: Dict) -> List[Dict]:
     # SAME_CLASS (misma clase, otras tiendas; además evitamos la TIENDA CANÍBAL si se conoce)
     remaining = max(0, N_DONORS_PER_J - (rank - 1))
     if remaining > 0:
-        prof_sc = profiles[(profiles["class"]==c) & (profiles["store_nbr"]!=s) & (profiles["item_nbr"]!=j)] \
-                    .merge(_GLOBALS["STORES"], on="store_nbr", how="left")  # type: ignore
+        prof_sc = profiles[(profiles["class"]==c) & (profiles["store_nbr"]!=s) & (profiles["item_nbr"]!=j)]
         if SPD_AVOID_CANNIBAL_STORE and i_store is not None:
             prof_sc = prof_sc[prof_sc["store_nbr"] != int(i_store)]
         if not prof_sc.empty:
             Xc = prof_sc[["h_mean","h_sd","p_any"]].to_numpy(dtype=float, copy=False)
             dc = np.sqrt(((Xc - tgt) ** 2 * w).sum(axis=1))
             prof_sc = prof_sc.assign(profile_distance=dc)
-            preselect_sc = prof_sc.sort_values(["profile_distance","state","city"], ascending=[True,True,True])\
-                                  .head(max(remaining*6, SPD_DONOR_PRESELECT_TOP_K))
+            preselect_sc = prof_sc.nsmallest(max(remaining*4, SPD_DONOR_PRESELECT_TOP_K), "profile_distance")
             chosen_parts: List[pd.DataFrame] = []
             for s_d, grp in preselect_sc.groupby("store_nbr", sort=False):
                 g_d = _get_H_group_cache(H_use, int(s_d), c)
@@ -430,10 +427,10 @@ def build_donors_for_pairs(*,
     log = _log_setup_from_parent(logger)
     t0 = time.time()
 
-    # Perfiles agregados (h_mean, h_sd, p_any) + clase
+    # Perfiles agregados (h_mean, h_sd, p_any) + clase + metadatos de tienda
     profiles = item_stats_df[["store_nbr","item_nbr","h_mean","h_sd","p_any"]].merge(
         items_df[["item_nbr","class"]], on="item_nbr", how="left"
-    )
+    ).merge(stores_df, on="store_nbr", how="left")
 
     # Episodios como dicts (conservar i_store/i_item si están)
     eps = []
@@ -451,7 +448,10 @@ def build_donors_for_pairs(*,
         n_proc = max(1, min(DONORS_N_CORES, len(eps)))
         with mp.Pool(processes=n_proc, initializer=_init_pool,
                      initargs=(H_use, profiles, items_df, stores_df, shard_dir)) as pool:
-            for k, rows in enumerate(pool.imap_unordered(_donors_for_episode_worker, eps, chunksize=DONORS_CHUNKSIZE), start=1):
+            chunksize = max(1, DONORS_CHUNKSIZE)
+            if chunksize == 1 and len(eps) > 100:
+                chunksize = min(8, max(2, len(eps)//(n_proc*4)))
+            for k, rows in enumerate(pool.imap_unordered(_donors_for_episode_worker, eps, chunksize=chunksize), start=1):
                 donors_rows_all.append(rows or [])
                 _emit_progress(progress_cb, 100.0 * k / max(1, len(eps)), f"Episodios GSC con donantes: {k}/{len(eps)}", log)
     else:

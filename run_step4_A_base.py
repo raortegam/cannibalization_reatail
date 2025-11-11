@@ -47,8 +47,8 @@ def main():
     }
     
     config = {
-        "episodes_index": ".data/processed_data/A_base/episodes_index.parquet",
-        "donors_csv": ".data/processed_data/A_base/donors_per_victim.csv",
+        "episodes_index": ".data/processed_data/_shared_base/episodes_index.parquet",
+        "donors_csv": ".data/processed_data/_shared_base/donors_per_victim.csv",
         "raw_dir": ".data/raw_data",  # Directorio, no archivo
         "out_gsc": ".data/processed/A_base/gsc",
         "out_meta": ".data/processed_meta/A_base",
@@ -56,7 +56,7 @@ def main():
         "lags_days": exp_config["params"]["lags_days"],
         "fourier_k": exp_config["params"]["fourier_k"],
         "use_stl": exp_config["params"]["use_stl"],
-        "gsc_eval_n": 10,
+        "gsc_eval_n": 150,  # Procesar todos los episodios disponibles
         "meta_units": "victims_plus_donors"
     }
     

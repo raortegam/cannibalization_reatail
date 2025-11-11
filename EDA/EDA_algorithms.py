@@ -888,9 +888,8 @@ def run(cfg: EDAConfig) -> None:
     logger.setLevel(logging.INFO)
 
     # Carpetas de salida
-    fig_root = _ensure_dir(Path(cfg.figures_dir))
-    fig_dir = _ensure_dir(fig_root / "algorithms")
-    tbl_dir = _ensure_dir(fig_root / "tables")
+    fig_dir = _ensure_dir(Path(cfg.figures_dir))
+    tbl_dir = _ensure_dir(fig_dir / "tables")
 
     # 1) Cargar episodios (referencia)
     episodes = _safe_read_parquet(Path(cfg.episodes_index))

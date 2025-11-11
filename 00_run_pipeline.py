@@ -379,14 +379,16 @@ class ParamsConfig:
     gsc_do_loo: bool = False
     gsc_max_loo: int = 5
     gsc_sens_samples: int = 0
-    gsc_cv_folds: int = 3
-    gsc_cv_holdout: int = 21
+    gsc_cv_folds: int = 5          # ACTUALIZADO: 3 -> 5 para rolling window
+    gsc_cv_holdout: int = 14       # ACTUALIZADO: 21 -> 14 (ventanas más pequeñas)
+    gsc_cv_gap: int = 7            # NUEVO: gap de 7 días
     gsc_eval_n: int = 10
     gsc_eval_selection: str = "head"
-    # Hiperparámetros ejemplo
-    gsc_rank: int = 5
-    gsc_tau: float = 0.0001
-    gsc_alpha: float = 0.0
+    # Hiperparámetros anti-overfitting
+    gsc_rank: int = 3              # ACTUALIZADO: 5 -> 3 (menor capacidad)
+    gsc_tau: float = 0.01          # ACTUALIZADO: 0.0001 -> 0.01 (100x más regularización)
+    gsc_alpha: float = 0.005       # ACTUALIZADO: 0.0 -> 0.005 (regularización L2)
+    gsc_hpo_trials: int = 500      # NUEVO: HPO con 500 trials
 
     # Meta-learners
     meta_learners: Tuple[str, ...] = ("x",)  # subset de {"t","s","x"}
@@ -883,6 +885,20 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
 
     if cfg.toggles.step3:
         
+        try:
+            _env_val = os.environ.get("SPD_N_DONORS_PER_J", "").strip()
+            if _env_val == "":
+                os.environ["SPD_N_DONORS_PER_J"] = "15"
+                logger.info("SPD_N_DONORS_PER_J no definido -> forzado a 15")
+            else:
+                try:
+                    if int(_env_val) != 15:
+                        logger.info("SPD_N_DONORS_PER_J ya definido (%s). No se sobreescribe.", _env_val)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Check if cached outputs exist en ubicación central
         cached_pairs = outdir_central / "pairs_windows.csv"
         cached_donors = outdir_central / "donors_per_victim.csv"
@@ -1005,9 +1021,10 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
   
 
     # # Actualizar config para el paso 4
-    cfg.params.episodes_path = pairs_path
-    cfg.params.donors_path = donors_path
-    cfg.params.outdir_pairs_donors = pairs_path.parent
+    # IMPORTANTE: Usar archivos de la ubicación CENTRAL (_shared_base) para tener todos los episodios
+    cfg.params.episodes_path = outdir_central / "pairs_windows.csv"
+    cfg.params.donors_path = outdir_central / "donors_per_victim.csv"
+    cfg.params.outdir_pairs_donors = outdir_central
 
     # # # -------------------- EDA 3 --------------------
     if cfg.toggles.eda3:
@@ -1229,9 +1246,11 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                     sens_samples=cfg.params.gsc_sens_samples,
                     cv_folds=cfg.params.gsc_cv_folds,
                     cv_holdout=cfg.params.gsc_cv_holdout,
+                    cv_gap=cfg.params.gsc_cv_gap,              # NUEVO: gap para rolling window CV
                     rank=cfg.params.gsc_rank,
                     tau=cfg.params.gsc_tau,
                     alpha=cfg.params.gsc_alpha,
+                    hpo_trials=cfg.params.gsc_hpo_trials,      # NUEVO: HPO trials
                 )
                 _safe_call(gsc_run_batch, logger, cfg.fail_fast, "5. GSC run_batch", cfg=gsc_cfg)
 

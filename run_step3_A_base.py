@@ -76,16 +76,13 @@ def main():
         
         logger.info("Comando: %s", " ".join(cmd))
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        # No capturar output para ver logs en tiempo real
+        result = subprocess.run(cmd, timeout=7200)
         
         if result.returncode == 0:
             logger.info("✅ Script ejecutado exitosamente")
-            if result.stdout:
-                logger.info("STDOUT:\n%s", result.stdout)
         else:
             logger.error("❌ Error (código %d)", result.returncode)
-            if result.stderr:
-                logger.error("STDERR:\n%s", result.stderr)
             raise RuntimeError(f"Falló con código {result.returncode}")
         
         execution_time = time.time() - start_time

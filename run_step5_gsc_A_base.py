@@ -41,21 +41,34 @@ def main():
         "donors_csv": f".data/processed_data/{exp_tag}/donors_per_victim.csv",
         "episodes_index": f".data/processed/{exp_tag}/episodes_index.parquet",
         "out_dir": f".data/processed_data/{exp_tag}/gsc",
-        # Parámetros GSC de A_base - ESTRATEGIA BALANCEADA
-        "rank": 3,           # Aumentado a 3 (más capacidad para capturar patrones)
-        "tau": 0.001,        # Reducido para permitir más flexibilidad
-        "alpha": 0.001,      # Reducido para permitir más uso de covariables
-        "cv_folds": 3,
-        "cv_holdout": 21,
-        "cv_gap": 7,         # Gap moderado en CV (7 días)
-        "train_gap": 7,      # Gap moderado (7 días)
-        "hpo_trials": 500,   # Aumentado de 300 a 500 para mejor exploración
+        # Parámetros GSC de A_base - ANTI-OVERFITTING con Rolling Window CV
+        "rank": 3,           # Rank moderado (balance capacidad/regularización)
+        "tau": 0.01,         # AUMENTADO 10x para mayor regularización nuclear
+        "alpha": 0.005,      # AUMENTADO 5x para mayor regularización L2
+        "cv_folds": 5,       # AUMENTADO a 5 para rolling window CV
+        "cv_holdout": 14,    # REDUCIDO a 14 días (ventanas más pequeñas)
+        "cv_gap": 7,         # Gap de 7 días para evitar filtración temporal
+        "train_gap": 7,      # Gap de 7 días antes del tratamiento
+        "hpo_trials": 500,   # HPO con Optuna (500 trials para buena exploración)
         "include_covariates": True,
-        # Grillas más amplias para HPO - mejor cobertura del espacio
-        "grid_ranks": "1,2,3,4,5,6",                    # Más opciones de rank
-        "grid_tau": "0.0001,0.0005,0.001,0.005,0.01",   # Más granularidad en tau
-        "grid_alpha": "0.00005,0.0001,0.0005,0.001,0.005,0.01", # Más granularidad en alpha
+        # Grillas para fallback (si Optuna no está disponible)
+        # Nota: Con HPO activo, Optuna explorará rangos más amplios automáticamente
+        "grid_ranks": "1,2,3,4",                        # Limitado a 4 (evitar overfitting)
+        "grid_tau": "0.005,0.01,0.02,0.05",             # Rangos MÁS ALTOS
+        "grid_alpha": "0.001,0.005,0.01,0.02",          # Rangos MÁS ALTOS
     }
+    
+    # Mostrar parámetros clave para validación
+    logger.info("="*60)
+    logger.info("PARÁMETROS GSC ANTI-OVERFITTING:")
+    logger.info("  rank: %s", config["rank"])
+    logger.info("  tau: %s", config["tau"])
+    logger.info("  alpha: %s", config["alpha"])
+    logger.info("  cv_folds: %s", config["cv_folds"])
+    logger.info("  cv_holdout: %s días", config["cv_holdout"])
+    logger.info("  cv_gap: %s días", config["cv_gap"])
+    logger.info("  hpo_trials: %s", config["hpo_trials"])
+    logger.info("="*60)
     
     # Validar entrada
     for key in ["gsc_dir", "donors_csv", "episodes_index"]:
@@ -88,12 +101,12 @@ def main():
             "--alpha", str(config["alpha"]),
             "--cv_folds", str(config["cv_folds"]),
             "--cv_holdout", str(config["cv_holdout"]),
-            "--cv_gap", str(config["cv_gap"]),
+            "--cv_gap", str(config["cv_gap"]),           # CRÍTICO: gap para rolling window
             "--train_gap", str(config["train_gap"]),
             "--grid_ranks", config["grid_ranks"],
             "--grid_tau", config["grid_tau"],
             "--grid_alpha", config["grid_alpha"],
-            "--hpo_trials", str(config["hpo_trials"]),
+            "--hpo_trials", str(config["hpo_trials"]),  # CRÍTICO: 500 trials
             "--log_level", "INFO",
         ]
         
@@ -101,17 +114,18 @@ def main():
             cmd.append("--include_covariates")
         
         logger.info("Comando: %s", " ".join(cmd))
+        logger.info("="*60)
+        logger.info("EJECUTANDO GSC (output en tiempo real):")
+        logger.info("="*60)
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
+        # NO capturar output para ver logs en tiempo real
+        result = subprocess.run(cmd, timeout=14400)
         
         if result.returncode == 0:
+            logger.info("="*60)
             logger.info("✅ Script ejecutado exitosamente")
-            if result.stdout:
-                logger.info("STDOUT:\n%s", result.stdout)
         else:
             logger.error("❌ Error (código %d)", result.returncode)
-            if result.stderr:
-                logger.error("STDERR:\n%s", result.stderr)
             raise RuntimeError(f"Falló con código {result.returncode}")
         
         execution_time = time.time() - start_time

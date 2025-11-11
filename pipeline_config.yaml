@@ -33,7 +33,7 @@ paths:
   meta_out_root: ".data/processed_data/meta_outputs"
 
 params:
-  gsc_eval_n: null  # null = procesar TODOS los episodios (150)
+  gsc_eval_n: 999  # Número grande para procesar todos (150)
   gsc_eval_selection: "head"
   # Step 4 (pre_algorithm)
   
@@ -45,19 +45,20 @@ params:
   min_availability_share: 0.90
   max_episodes: null  # null = sin límite, procesa todos los disponibles
 
-  # Algoritmo GSC
+  # Algoritmo GSC (parámetros anti-overfitting)
   gsc_log_level: "INFO"
   gsc_max_episodes: null  # null = sin límite, procesa todos
-  gsc_cv_folds: 3
-  gsc_cv_holdout: 21
+  gsc_cv_folds: 5         # Aumentado de 3 a 5 para rolling window CV
+  gsc_cv_holdout: 14      # Reducido de 21 a 14 (ventanas más pequeñas)
+  gsc_cv_gap: 7           # Gap de 7 días para evitar filtración temporal
   gsc_do_placebo_space: true
   gsc_do_placebo_time: true
   gsc_do_loo: false
   gsc_max_loo: 5
   gsc_sens_samples: 0
-  gsc_rank: 5
-  gsc_tau: 0.0001
-  gsc_alpha: 0.0
+  gsc_rank: 3             # Reducido de 5 a 3 (menor capacidad, menos overfitting)
+  gsc_tau: 0.01           # Aumentado de 0.0001 a 0.01 (100x más regularización)
+  gsc_alpha: 0.005        # Aumentado de 0.0 a 0.005 (regularización L2)
 
   # Meta‑learners
   meta_learners: ["x"]      # o ["t","s","x"]

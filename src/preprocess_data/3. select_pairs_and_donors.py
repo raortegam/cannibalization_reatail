@@ -258,7 +258,7 @@ MP_IMAP_CHUNKSIZE = _env_int("SPD_MP_CHUNKSIZE", 8)
 
 # [NEW] Paralelismo específico de donantes
 DONORS_PARALLEL      = bool(_env_int("SPD_DONORS_PARALLEL", 1))
-DONORS_N_CORES       = max(1, min(_env_int("SPD_DONORS_N_CORES", 10), os.cpu_count() or 1))
+DONORS_N_CORES       = max(1, min(_env_int("SPD_DONORS_N_CORES", 12), os.cpu_count() or 1))
 DONORS_CHUNKSIZE     = _env_int("SPD_DONORS_CHUNKSIZE", 1)
 
 # Flush incremental
@@ -1657,10 +1657,14 @@ def select_pairs_and_donors(H_csv: str, train_csv: str, items_csv: str, stores_c
     _progress_emit("build_base", 100.0, "Universo base construido.")
 
     # --- Sharding por tienda
+    # En lugar de shardear solo las tiendas con caníbales, shardear TODAS las tiendas relevantes
+    # para donantes (todas las presentes en item_stats). Evita múltiples lecturas completas de H
+    # en donors_selector.
     stores_of_interest = sorted(cand_i["store_nbr"].unique().astype(int).tolist())
-    if SPD_SHARD_H and stores_of_interest:
-        _progress_emit("score_cannibals", 0.0, "Preparando shards de H por tienda ...", force_log=True)
-        _build_H_store_shards(H_use, stores_of_interest)
+    donor_stores_all = sorted(item_stats["store_nbr"].unique().astype(int).tolist())
+    if SPD_SHARD_H and donor_stores_all:
+        _progress_emit("score_cannibals", 0.0, "Preparando shards de H por tienda (todas las tiendas relevantes) ...", force_log=True)
+        _build_H_store_shards(H_use, donor_stores_all)
 
     # --- 2) Scoring ΔH_cls por tienda
     _progress_emit("score_cannibals", 12.0, "Scoring caníbales (ΔH_cls) ...", force_log=True)

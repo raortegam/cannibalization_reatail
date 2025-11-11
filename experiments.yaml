@@ -2,39 +2,56 @@ base_config: "pipeline_config.yaml"
 
 experiments:
   - id: "A_base"
-    desc: "Baseline con HPO mejorado - GSC vs Meta (X,S,T)"
+    desc: "Baseline con HPO mejorado y regularización anti-overfitting - GSC vs Meta (X,S,T)"
     overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
       params:
         top_k_donors: 20
         donor_kind: "same_item"
         lags_days: [7, 14, 28, 56]
         fourier_k: 3
         use_stl: true
-        gsc_rank: 5
-        gsc_tau: 0.0001
-        gsc_alpha: 0.0
+        gsc_rank: 3                      # Reducido de 5 a 3 (menor capacidad)
+        gsc_tau: 0.01                    # Aumentado de 0.0001 a 0.01 (100x más regularización)
+        gsc_alpha: 0.005                 # Aumentado de 0.0 a 0.005
         meta_learners: ["x", "s", "t"]  # Todos los learners para comparación
         treat_col_s: "H_disc"
         h_bin_threshold: 0.02
-        gsc_cv_folds: 3
-        gsc_cv_holdout: 21
-        meta_cv_folds: 3
-        meta_cv_holdout: 21
+        gsc_cv_folds: 5                  # Aumentado de 3 a 5 (más validación)
+        gsc_cv_holdout: 14               # Reducido de 21 a 14 (ventanas más pequeñas para rolling CV)
+        gsc_cv_gap: 7                    # Gap de 7 días para evitar filtración
+        meta_cv_folds: 5
+        meta_cv_holdout: 14
         meta_hpo_trials: 100
         meta_max_iter: 1000
+        eda_alg_max_episodes_gsc: 30
+        eda_alg_max_episodes_meta: 30
 
   - id: "B_donors30"
     desc: "Más donantes para mejor ajuste GSC"
     overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
       params:
         top_k_donors: 30
         meta_learners: ["x", "s", "t"]
         meta_hpo_trials: 100
         meta_max_iter: 1000
+        eda_alg_max_episodes_gsc: 30
+        eda_alg_max_episodes_meta: 30
 
   - id: "C_donors5_hiqual"
     desc: "Pocos donantes de alta calidad"
     overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
       params:
         top_k_donors: 5
         max_donor_promo_share: 0.01
@@ -42,30 +59,48 @@ experiments:
         meta_learners: ["x", "s", "t"]
         meta_hpo_trials: 100
         meta_max_iter: 1000
+        eda_alg_max_episodes_gsc: 30
+        eda_alg_max_episodes_meta: 30
 
   - id: "D_seasonal_rich"
     desc: "Estacionalidad enriquecida"
     overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
       params:
         fourier_k: 6
         lags_days: [7, 14, 28, 56, 84]
         meta_learners: ["x", "s", "t"]
         meta_hpo_trials: 100
         meta_max_iter: 1000
+        eda_alg_max_episodes_gsc: 30
+        eda_alg_max_episodes_meta: 30
 
   - id: "E_no_stl"
     desc: "Sin descomposición STL"
     overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
       params:
         use_stl: false
         fourier_k: 6
         meta_learners: ["x", "s", "t"]
         meta_hpo_trials: 100
         meta_max_iter: 1000
+        eda_alg_max_episodes_gsc: 30
+        eda_alg_max_episodes_meta: 30
 
   - id: "F_treat_continuous"
     desc: "Tratamiento continuo (H_prop) para Meta"
     overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
       params:
         meta_learners: ["x", "s", "t"]
         treat_col_s: "H_prop"  # Tratamiento continuo
@@ -73,26 +108,47 @@ experiments:
         bin_threshold: 0.0
         meta_hpo_trials: 100
         meta_max_iter: 1000
+        eda_alg_max_episodes_gsc: 30
+        eda_alg_max_episodes_meta: 30
 
   - id: "G_cv_robust"
-    desc: "CV más robusto (5 folds, 35 días holdout)"
+    desc: "CV más robusto con rolling window (7 folds, 14 días holdout, gap 7)"
     overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
       params:
-        gsc_cv_folds: 5
-        gsc_cv_holdout: 35
-        meta_cv_folds: 5
-        meta_cv_holdout: 35
+        gsc_cv_folds: 7                  # Más folds para rolling CV
+        gsc_cv_holdout: 14               # Ventanas más pequeñas
+        gsc_cv_gap: 7                    # Gap de 7 días
+        gsc_rank: 3
+        gsc_tau: 0.01
+        gsc_alpha: 0.005
+        meta_cv_folds: 7
+        meta_cv_holdout: 14
         meta_learners: ["x", "s", "t"]
         meta_hpo_trials: 100
         meta_max_iter: 1000
+        eda_alg_max_episodes_gsc: 30
+        eda_alg_max_episodes_meta: 30
 
-  - id: "H_gsc_rank8"
-    desc: "GSC con mayor rank y regularización"
+  - id: "H_gsc_regularized"
+    desc: "GSC con ALTA regularización para evitar overfitting"
     overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
       params:
-        gsc_rank: 8
-        gsc_tau: 0.00001
-        gsc_alpha: 0.001
+        gsc_rank: 2                      # Rank bajo (alta regularización)
+        gsc_tau: 0.05                    # Tau alto (alta regularización nuclear)
+        gsc_alpha: 0.01                  # Alpha alto (alta regularización L2)
+        gsc_cv_folds: 5
+        gsc_cv_holdout: 14
+        gsc_cv_gap: 7
         meta_learners: ["x", "s", "t"]
         meta_hpo_trials: 100
         meta_max_iter: 1000
+        eda_alg_max_episodes_gsc: 30
+        eda_alg_max_episodes_meta: 30

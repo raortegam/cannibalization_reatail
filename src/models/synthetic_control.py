@@ -549,25 +549,99 @@ def _sanitize_grids(ep: EpisodeWide, cv: CVCfg) -> Tuple[Tuple[int, ...], Tuple[
     return tuple(ranks), tuple(taus), tuple(alphas), info
 
 def _cv_folds_pre_indices(ep: EpisodeWide, holdout_days: int, gap_days: int, k_folds: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Validación cruzada con VENTANA MÓVIL (rolling window) para evitar overfitting.
+    
+    En lugar de folds fijos desde el final, crea ventanas que se desplazan a través
+    del período PRE, simulando predicción fuera de muestra de forma más realista.
+    
+    Args:
+        ep: Episodio wide con datos
+        holdout_days: Tamaño de la ventana de validación
+        gap_days: Embargo antes de la ventana de validación
+        k_folds: Número de ventanas móviles a crear
+    
+    Returns:
+        Lista de tuplas (gap_idx, hold_idx) para cada fold
+    """
     pre_idx = np.where(ep.pre_mask)[0]
     if len(pre_idx) == 0:
         return []
+    
     H = int(max(1, holdout_days))
     G = int(max(0, gap_days))
-    end_max = pre_idx[-1] - G
-    if end_max < pre_idx[0] + H - 1:
-        return []
-
+    
+    # Necesitamos espacio suficiente para: train_min + gap + holdout
+    min_train = max(14, H)  # Al menos 14 días de entrenamiento
+    total_needed = min_train + G + H
+    
+    if len(pre_idx) < total_needed:
+        logging.warning(f"[CV-ROLLING] PRE insuficiente ({len(pre_idx)} días) para rolling CV (necesita {total_needed}). Usando CV estándar.")
+        # Fallback a CV estándar si no hay suficientes datos
+        end_max = pre_idx[-1] - G
+        if end_max < pre_idx[0] + H - 1:
+            return []
+        folds = []
+        for f in range(k_folds):
+            hold_end = end_max - f * H
+            hold_start = hold_end - H + 1
+            if hold_start < pre_idx[0]:
+                break
+            gap_start = max(pre_idx[0], hold_start - G)
+            gap_idx = np.arange(gap_start, hold_start) if G > 0 else np.array([], dtype=int)
+            hold_idx = np.arange(hold_start, hold_end + 1)
+            folds.append((gap_idx, hold_idx))
+        return folds
+    
+    # VENTANA MÓVIL: Crear k_folds ventanas que se desplazan desde el inicio hacia el final
+    # Esto simula mejor la predicción futura y evita overfitting al final del PRE
     folds = []
+    
+    # Calcular el espacio disponible para las ventanas
+    max_end = pre_idx[-1]  # Última fecha PRE
+    min_start = pre_idx[0] + min_train  # Primera fecha donde puede empezar una ventana de validación
+    
+    # Distribuir k_folds ventanas uniformemente en el espacio disponible
+    available_span = max_end - min_start - H + 1
+    if available_span < H:
+        # Si no hay espacio suficiente, usar solo 1 fold al final
+        k_folds = 1
+        available_span = H
+    
+    step = max(1, available_span // max(1, k_folds)) if k_folds > 1 else 0
+    
     for f in range(k_folds):
-        hold_end = end_max - f * H
-        hold_start = hold_end - H + 1
-        if hold_start < pre_idx[0]:
-            break
+        # Ventana de validación se mueve desde min_start hacia max_end
+        hold_start = min_start + f * step
+        hold_end = min(hold_start + H - 1, max_end)
+        
+        # Ajustar si la última ventana se sale del rango
+        if hold_end > max_end:
+            hold_end = max_end
+            hold_start = max(min_start, hold_end - H + 1)
+        
+        # Gap antes de la ventana de validación
+        gap_start = max(pre_idx[0], hold_start - G)
+        gap_idx = np.arange(gap_start, hold_start) if G > 0 else np.array([], dtype=int)
+        hold_idx = np.arange(hold_start, hold_end + 1)
+        
+        # Verificar que hay suficiente entrenamiento antes del gap
+        train_available = gap_start - pre_idx[0]
+        if train_available < min_train:
+            continue  # Saltar este fold si no hay suficiente entrenamiento
+        
+        folds.append((gap_idx, hold_idx))
+    
+    if not folds:
+        logging.warning("[CV-ROLLING] No se pudieron crear folds válidos. Usando fold único al final.")
+        # Último recurso: un fold al final
+        hold_end = pre_idx[-1]
+        hold_start = max(pre_idx[0] + min_train + G, hold_end - H + 1)
         gap_start = max(pre_idx[0], hold_start - G)
         gap_idx = np.arange(gap_start, hold_start) if G > 0 else np.array([], dtype=int)
         hold_idx = np.arange(hold_start, hold_end + 1)
         folds.append((gap_idx, hold_idx))
+    
+    logging.info(f"[CV-ROLLING] Creados {len(folds)} folds con ventana móvil (H={H}, G={G})")
     return folds
 
 def _apply_time_mask(M: np.ndarray, gap_idx: np.ndarray, hold_idx: np.ndarray) -> np.ndarray:
@@ -656,15 +730,15 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
         return base_cfg, {"cv_used": False, "score": np.nan, "best": asdict(base_cfg), "method": "optuna"}
 
     U, T = ep.Y.shape
-    # Rango amplio para rank - permitir exploración completa
-    max_rank = int(max(1, min(U - 1, T - 1, 6)))  # Máximo 6 (más opciones)
+    # Limitar rank AGRESIVAMENTE para evitar overfitting
+    max_rank = int(max(1, min(U - 1, T - 1, 3)))  # Máximo 3 (reducido de 4)
 
     s0 = _svd_scale_pre(ep)
-    # Rangos amplios para tau - explorar desde muy bajo hasta moderado
-    tau_lo = float(max(5e-5, 0.005 * s0))   # Mínimo más bajo
-    tau_hi = float(max(tau_lo * 10.0, 0.4 * s0))  # Rango más amplio (10x)
-    # Rangos amplios para alpha - explorar desde muy bajo hasta moderado
-    alpha_lo, alpha_hi = 5e-5, 1e-2  # Rango más amplio
+    # Rangos de tau MUCHO MÁS ALTOS para combatir overfitting severo
+    tau_lo = float(max(5e-3, 0.05 * s0))   # Mínimo 5x más alto
+    tau_hi = float(max(tau_lo * 30.0, 1.0 * s0))  # Máximo hasta 100% del singular mayor
+    # Rangos de alpha MUCHO MÁS ALTOS
+    alpha_lo, alpha_hi = 5e-4, 0.1  # Máximo aumentado a 0.1 (10x más)
 
     pruner = MedianPruner(n_warmup_steps=max(1, len(folds) // 2))
     sampler = optuna.samplers.TPESampler(seed=seed)
@@ -690,17 +764,29 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
                             post_smooth_window=base_cfg.post_smooth_window)
 
         scores = []
-        cv_ratios = []  # Para penalizar contrafactuales planos
+        cv_ratios = []  # Para penalizar contrafactuales planos o muy variables
+        rmspe_train_list = []  # Para detectar overfitting (RMSPE muy bajo en train)
+        
         for step, (gap_idx, hold_idx) in enumerate(folds):
             M_train = _apply_time_mask(ep.M, gap_idx, hold_idx)
             model = GSCModel(cfg_try).fit(ep.Y, M_train, ep.X if cfg_try.include_covariates else None)
             Yhat = model.predict(ep.X if cfg_try.include_covariates else None)
+            
+            # Validación en holdout
             y_true = ep.Y[ep.treated_row, hold_idx]
             y_hat = Yhat[ep.treated_row, hold_idx]
             sc = _finite_or_big(_rmspe(y_true, y_hat))
             scores.append(sc)
             
-            # Calcular ratio de variabilidad para penalizar contrafactuales planos
+            # RMSPE en train (antes del gap) para detectar overfitting
+            train_idx = np.arange(ep.pre_mask.nonzero()[0][0], gap_idx[0] if gap_idx.size > 0 else hold_idx[0])
+            if train_idx.size > 0:
+                y_train = ep.Y[ep.treated_row, train_idx]
+                y_hat_train = Yhat[ep.treated_row, train_idx]
+                rmspe_train = _rmspe(y_train, y_hat_train)
+                rmspe_train_list.append(rmspe_train)
+            
+            # Calcular ratio de variabilidad para penalizar contrafactuales planos/variables
             cv_true = np.std(y_true) / (np.mean(np.abs(y_true)) + 1e-8)
             cv_hat = np.std(y_hat) / (np.mean(np.abs(y_hat)) + 1e-8)
             cv_ratio = cv_hat / (cv_true + 1e-8) if cv_true > 0.05 else 1.0
@@ -712,15 +798,33 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
         
         median_score = float(np.median(scores))
         median_cv_ratio = float(np.median(cv_ratios))
+        median_rmspe_train = float(np.median(rmspe_train_list)) if rmspe_train_list else 1.0
         
-        # Penalizar si el contrafactual es demasiado plano (cv_ratio < 0.3)
-        # o demasiado variable (cv_ratio > 1.5)
-        if median_cv_ratio < 0.3:
-            penalty = (0.3 - median_cv_ratio) * 0.5  # Penalización por ser plano
-            median_score += penalty
-        elif median_cv_ratio > 1.5:
-            penalty = (median_cv_ratio - 1.5) * 0.3  # Penalización por ser muy variable
-            median_score += penalty
+        # PENALIZACIÓN 1: Overfitting (RMSPE train muy bajo)
+        # Si el modelo ajusta casi perfectamente el train, probablemente está sobreajustando
+        if median_rmspe_train < 0.08:
+            overfitting_penalty = (0.08 - median_rmspe_train) * 2.0  # Penalización fuerte
+            median_score += overfitting_penalty
+        
+        # PENALIZACIÓN 2: Contrafactual demasiado plano (cv_ratio < 0.4)
+        # El contrafactual debe tener variabilidad similar al observado
+        if median_cv_ratio < 0.4:
+            flat_penalty = (0.4 - median_cv_ratio) * 0.8  # Penalización moderada
+            median_score += flat_penalty
+        
+        # PENALIZACIÓN 3: Contrafactual demasiado variable (cv_ratio > 1.3)
+        # El contrafactual no debe ser más variable que el observado
+        elif median_cv_ratio > 1.3:
+            variable_penalty = (median_cv_ratio - 1.3) * 0.5  # Penalización moderada
+            median_score += variable_penalty
+        
+        # PENALIZACIÓN 4: Gap train-validation muy grande (signo de overfitting)
+        # Si validation >> train, hay overfitting
+        if median_rmspe_train > 0 and median_score > 0:
+            gap_ratio = median_score / (median_rmspe_train + 1e-8)
+            if gap_ratio > 2.0:  # Validation es más del doble que train
+                gap_penalty = (gap_ratio - 2.0) * 0.3
+                median_score += gap_penalty
             
         return median_score
 
@@ -915,7 +1019,7 @@ def _exp_root(exp_tag: Optional[str]) -> Optional[Path]:
 
 def _discover_episode_files(gsc_dir: Path) -> List[Path]:
     # Excluir archivos de métricas/calidad que no son episodios
-    exclude = {"donor_quality.parquet", "gsc_metrics.parquet"}
+    exclude = {"donor_quality.parquet", "gsc_metrics.parquet", "episodes_index.parquet"}
     files = [p for p in gsc_dir.glob("*.parquet") if p.name not in exclude]
     return sorted(files)
 
@@ -1012,30 +1116,30 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
 
     # ---- Anti-overfit: re‑entrena si PRE ≈ copiado ----
     overfit_refit = False
-    # Detección multi-criterio de overfitting:
-    # 1. RMSPE extremadamente bajo (< 0.05)
-    # 2. Correlación casi perfecta (> 0.99)
-    # 3. Valores casi idénticos (allclose)
+    # Detección multi-criterio de overfitting (UMBRALES ULTRA ESTRICTOS):
+    # 1. RMSPE bajo (< 0.15) - AUMENTADO de 0.10
+    # 2. Correlación muy alta (> 0.95) - REDUCIDO de 0.98
+    # 3. Valores casi idénticos (allclose con tolerancias MUCHO más estrictas)
     corr_pre = np.corrcoef(y_obs_pre, y_hat_pre)[0, 1] if len(y_obs_pre) > 1 else 0.0
-    if (np.isfinite(rmspe_pre) and rmspe_pre < 0.05) or \
-       (np.isfinite(corr_pre) and corr_pre > 0.99) or \
-       np.allclose(y_obs_pre, y_hat_pre, atol=1e-3, rtol=0.05):
+    if (np.isfinite(rmspe_pre) and rmspe_pre < 0.15) or \
+       (np.isfinite(corr_pre) and corr_pre > 0.95) or \
+       np.allclose(y_obs_pre, y_hat_pre, atol=1e-4, rtol=0.01):
         overfit_refit = True
-        logging.warning(f"[{ep_id}] Overfitting detectado (RMSPE_pre={rmspe_pre:.4f} < 0.10). Re‑entrenando con mayor regularización.")
+        logging.warning(f"[{ep_id}] Overfitting detectado (RMSPE_pre={rmspe_pre:.4f}, corr={corr_pre:.4f}). Re‑entrenando con ULTRA regularización.")
         s0 = _svd_scale_pre(epw)
-        # AUMENTAR regularización agresivamente para combatir overfitting
-        # - Reducir rank drásticamente (capacidad del modelo)
-        # - Aumentar tau significativamente (penalización nuclear)
-        # - Aumentar alpha (penalización de covariables)
-        # - Solo calibración de nivel (no tendencia que puede sobreajustar)
+        # AUMENTAR regularización ULTRA AGRESIVAMENTE
+        # - Reducir rank a MÍNIMO (solo 1 componente)
+        # - Aumentar tau MUCHÍSIMO (penalización nuclear muy fuerte)
+        # - Aumentar alpha MUCHÍSIMO (penalización L2 muy fuerte)
+        # - Solo calibración de nivel (no tendencia)
         safer_cfg = GSCConfig(
-            rank=max(1, best_cfg.rank // 3),              # Reducir a 1/3 del original
-            tau=max(best_cfg.tau * 10.0, 0.5 * s0),       # 10x tau o 50% del singular mayor
-            alpha=max(best_cfg.alpha * 5.0, 0.05),        # 5x alpha, mínimo 0.05
+            rank=1,                                       # FORZAR rank=1 (mínimo posible)
+            tau=max(best_cfg.tau * 30.0, 0.8 * s0),       # 30x tau o 80% del singular mayor
+            alpha=max(best_cfg.alpha * 15.0, 0.15),       # 15x alpha, mínimo 0.15 (MUY alto)
             max_inner=best_cfg.max_inner,
             max_outer=best_cfg.max_outer,
             tol=best_cfg.tol,
-            include_covariates=best_cfg.include_covariates,
+            include_covariates=False,                     # DESACTIVAR covariables (más simple)
             random_state=best_cfg.random_state,
             standardize_y=True,
             link=best_cfg.link, link_eps=best_cfg.link_eps,
@@ -1059,15 +1163,15 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
         mae_pre   = _mae(y_obs_pre, y_hat_pre)
     
     # ---- Detección de contrafactuales planos (sobre-regularización) ----
+    # DESACTIVADA TEMPORALMENTE: Esta lógica reduce regularización y puede causar overfitting
+    # TODO: Revisar si es necesaria después de resolver el problema de overfitting
     flat_cf_refit = False
     # Calcular coeficiente de variación del contrafactual en PRE
     y_hat_pre_cv = float(np.nanstd(y_hat_pre) / (np.nanmean(np.abs(y_hat_pre)) + 1e-8))
     y_obs_pre_cv = float(np.nanstd(y_obs_pre) / (np.nanmean(np.abs(y_obs_pre)) + 1e-8))
     
-    # Solo aplicar si NO hubo overfit_refit (para evitar conflictos)
-    # Si el CF tiene mucha menos variabilidad que el observado, está sobre-regularizado
-    # Pero también verificar que RMSPE no sea demasiado bajo (evitar casos de overfit)
-    if not overfit_refit and y_hat_pre_cv < 0.5 * y_obs_pre_cv and y_obs_pre_cv > 0.1 and rmspe_pre > 0.20:
+    # DESACTIVADO: Reducir regularización puede causar overfitting
+    if False and not overfit_refit and y_hat_pre_cv < 0.5 * y_obs_pre_cv and y_obs_pre_cv > 0.1 and rmspe_pre > 0.20:
         flat_cf_refit = True
         logging.warning(f"[{ep_id}] Contrafactual plano detectado (CV_cf={y_hat_pre_cv:.3f} vs CV_obs={y_obs_pre_cv:.3f}). "
                        f"Re-entrenando con MENOR regularización para capturar variabilidad.")
