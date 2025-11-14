@@ -99,6 +99,25 @@ def _prefer_existing(*candidates: Path) -> Optional[Path]:
             pass
     return None
 
+def _hpo_registry_path(exp_tag: Optional[str], learner: str, model_name: str) -> Optional[Path]:
+    if not exp_tag:
+        return None
+    return Path("figures") / str(exp_tag) / "tables" / f"meta_hpo_{learner.lower()}_{model_name.lower()}.json"
+
+def _load_json_silent(p: Path) -> Optional[Dict]:
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _save_json_silent(p: Path, data: Dict) -> None:
+    try:
+        _ensure_dir(p.parent)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
 # =============================================================================
 # Utilidades generales y selección de features (anti-fuga)
 # =============================================================================
@@ -477,6 +496,7 @@ def tune_hyperparams(meta_df: pd.DataFrame, feats: List[str], cfg_model: str,
         return {}
 
     model_name = (cfg_model or "lgbm").lower()
+    warm_params = dict(base_defaults.get("hpo_warm_params", {}) or {})
 
     def objective(trial):
         if model_name == "lgbm":
@@ -508,7 +528,13 @@ def tune_hyperparams(meta_df: pd.DataFrame, feats: List[str], cfg_model: str,
         )
         return _finite_or_big(score)
 
-    study = optuna.create_study(direction="minimize", study_name=f"hpo_{model_name}")
+    sampler = optuna.samplers.TPESampler(seed=int(random_state))
+    study = optuna.create_study(direction="minimize", study_name=f"hpo_{model_name}", sampler=sampler)
+    if warm_params:
+        try:
+            study.enqueue_trial({k: warm_params[k] for k in warm_params})
+        except Exception:
+            pass
     study.optimize(objective, n_trials=int(base_defaults.get("hpo_trials", 100)), show_progress_bar=False)
     best = dict(study.best_params)
     logging.info(f"[HPO] Modelo={model_name} | best_score(RMSPE)={study.best_value:.6f}")
@@ -1283,15 +1309,23 @@ def run_batch(cfg: RunCfg) -> None:
     # --------------------- HPO (Optuna) ---------------------
     if int(cfg.hpo_trials) > 0 and cfg.model.lower() in {"lgbm", "hgbt"}:
         logging.info(f"Iniciando HPO (Optuna) para modelo '{cfg.model}' con {int(cfg.hpo_trials)} trials...")
+        reg_path = _hpo_registry_path(cfg.exp_tag, cfg.learner, cfg.model)
+        warm = {}
+        if reg_path and reg_path.exists():
+            prev = _load_json_silent(reg_path)
+            if isinstance(prev, dict):
+                warm = {k: prev[k] for k in prev.keys()}
         best = tune_hyperparams(
             meta_df, feats, cfg.model, cfg.random_state, cfg.cv_folds, cfg.cv_holdout_days,
-            {"max_iter": cfg.max_iter, "hpo_trials": cfg.hpo_trials}
+            {"max_iter": cfg.max_iter, "hpo_trials": cfg.hpo_trials, "hpo_warm_params": warm}
         )
         if best:
             for k, v in best.items():
                 if hasattr(cfg, k):
                     setattr(cfg, k, v)
             logging.info(f"[HPO] Hiperparámetros aplicados: {best}")
+            if reg_path is not None:
+                _save_json_silent(reg_path, best)
         else:
             logging.info("HPO omitido o sin mejoras.")
     else:

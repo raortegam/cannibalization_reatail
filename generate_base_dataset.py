@@ -58,6 +58,14 @@ def main():
     
     # Configurar exp_tag
     temp_config["exp_tag"] = "A_base"
+
+    # Asegurar 12 donantes por víctima en Step 3 (cuando existan candidatos suficientes)
+    try:
+        if "params" not in temp_config:
+            temp_config["params"] = {}
+        temp_config["params"]["top_k_donors"] = 12
+    except Exception:
+        pass
     
     # NO limpiar outputs (queremos conservarlos)
     temp_config["clean_outputs"] = False
@@ -126,9 +134,11 @@ def main():
         print()
         
         # Verificar outputs
+        exp_tag = temp_config.get("exp_tag", "")
+        exposure_check_path = f".data/processed_data/{exp_tag}/competitive_exposure.csv" if exp_tag else ".data/processed_data/competitive_exposure.csv"
         outputs_to_check = [
             (".data/processed_data/train_filtered.csv", "Step 1: train_filtered.csv"),
-            (".data/processed_data/competitive_exposure.csv", "Step 2: competitive_exposure.csv"),
+            (exposure_check_path, "Step 2: competitive_exposure.csv"),
             (".data/processed_data/_shared_base/pairs_windows.csv", "Step 3: pairs_windows.csv (CENTRAL)"),
             (".data/processed_data/_shared_base/donors_per_victim.csv", "Step 3: donors_per_victim.csv (CENTRAL)"),
             (".data/processed_data/_shared_base/episodes_index.parquet", "Step 3: episodes_index.parquet (CENTRAL)"),

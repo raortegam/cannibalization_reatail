@@ -70,6 +70,17 @@ SPD_DONOR_PRE_MIN_LEVEL    = _env_float("SPD_DONOR_PRE_MIN_LEVEL", 0.0)
 SPD_DONOR_LEVEL_BAND_PCT   = _env_float("SPD_DONOR_LEVEL_BAND_PCT", 0.5)
 SPD_DONOR_COMBO_ALPHA      = _env_float("SPD_DONOR_COMBO_ALPHA", 0.5)
 
+SPD_DONOR_MAX_MEAN_RATIO   = _env_float("SPD_DONOR_MAX_MEAN_RATIO", 4.0)
+SPD_DONOR_P95_RATIO_MAX    = _env_float("SPD_DONOR_P95_RATIO_MAX", 5.0)
+SPD_DONOR_MAX_PEAK_RATIO   = _env_float("SPD_DONOR_MAX_PEAK_RATIO", 8.0)
+
+# Filtros adicionales y más estrictos de escala/variabilidad (pre-period)
+# - Nivel: fuerza a que el pre_mean del donante esté dentro de un ancho relativo del de la víctima
+# - Dispersión: limita el pre_sd del donante relativo al de la víctima
+SPD_DONOR_LEVEL_BAND_HARD_MAX = _env_float("SPD_DONOR_LEVEL_BAND_HARD_MAX", 1.0)  # ±100% del nivel de la víctima
+SPD_DONOR_SD_RATIO_MAX        = _env_float("SPD_DONOR_SD_RATIO_MAX", 3.0)        # sd_donor <= 3x sd_victim
+SPD_DONOR_MIN_KEEP            = _env_int("SPD_DONOR_MIN_KEEP", 3)
+
 # Evitar donantes en la tienda caníbal (misma CLASE) si está disponible esa info
 SPD_AVOID_CANNIBAL_STORE   = _env_bool("SPD_AVOID_CANNIBAL_STORE", True)
 
@@ -191,7 +202,7 @@ def _get_H_group_cache(h_use: str, store_nbr: int, cls: int) -> Dict:
 def _pre_stats_batch(g: Dict, items_list: List[int],
                      pre_start: pd.Timestamp, treat_start: pd.Timestamp) -> pd.DataFrame:
     if g["Hmat"].size == 0 or not items_list:
-        return pd.DataFrame(columns=["item_nbr","pre_mean","pre_sd","pre_min","coverage"])
+        return pd.DataFrame(columns=["item_nbr","pre_mean","pre_sd","pre_min","pre_p95","pre_max","coverage"])
     dates_np = g["dates_np"]; H = g["Hmat"]; all_items = g["items"]
     pre_end = (pd.Timestamp(treat_start) - pd.Timedelta(days=PRE_GAP+1)).normalize()
     s = np.datetime64(pd.Timestamp(pre_start).normalize())
@@ -202,13 +213,13 @@ def _pre_stats_batch(g: Dict, items_list: List[int],
     if i < j:
         mask[i:j] = True
     if not mask.any():
-        return pd.DataFrame(columns=["item_nbr","pre_mean","pre_sd","pre_min","coverage"])
+        return pd.DataFrame(columns=["item_nbr","pre_mean","pre_sd","pre_min","pre_p95","pre_max","coverage"])
 
     pos_map = {int(itm): int(pos) for pos, itm in enumerate(all_items)}
     cols = [pos_map.get(int(x), -1) for x in items_list]
     valid = np.array([c >= 0 for c in cols], dtype=bool)
     if not valid.any():
-        return pd.DataFrame(columns=["item_nbr","pre_mean","pre_sd","pre_min","coverage"])
+        return pd.DataFrame(columns=["item_nbr","pre_mean","pre_sd","pre_min","pre_p95","pre_max","coverage"])
     items_arr = np.array(items_list, dtype=np.int32)[valid]
     col_idx = np.array([c for c in cols if c >= 0], dtype=int)
 
@@ -223,6 +234,12 @@ def _pre_stats_batch(g: Dict, items_list: List[int],
         sds   = np.nanstd(safe,  axis=0)
     mins = np.nanmin(np.where(pre_val, X, np.inf), axis=0)
     mins[n_ok == 0] = np.nan
+    try:
+        p95 = np.nanpercentile(safe, 95, axis=0)
+    except Exception:
+        p95 = np.full_like(means, np.nan, dtype=float)
+    mx = np.nanmax(safe, axis=0)
+    mx[n_ok == 0] = np.nan
     cov  = np.where(n_in > 0, n_ok / float(n_in), 0.0)
 
     return pd.DataFrame({
@@ -230,6 +247,8 @@ def _pre_stats_batch(g: Dict, items_list: List[int],
         "pre_mean": means.astype("float32"),
         "pre_sd":   sds.astype("float32"),
         "pre_min":  mins.astype("float32"),
+        "pre_p95":  p95.astype("float32"),
+        "pre_max":  mx.astype("float32"),
         "coverage": cov.astype("float32")
     })
 
@@ -272,6 +291,9 @@ def _donors_for_episode_worker(ep: Dict) -> List[Dict]:
     g_j = _get_H_group_cache(H_use, s, c)
     st_victim = _pre_stats_batch(g_j, [j], pre_start, treat_start)
     j_pre_mean = None if st_victim.empty else float(st_victim["pre_mean"].iloc[0])
+    j_pre_p95 = None if st_victim.empty or "pre_p95" not in st_victim.columns else float(st_victim["pre_p95"].iloc[0])
+    j_pre_max = None if st_victim.empty or "pre_max" not in st_victim.columns else float(st_victim["pre_max"].iloc[0])
+    j_pre_sd   = None if st_victim.empty or "pre_sd"  not in st_victim.columns else float(st_victim["pre_sd"].iloc[0])
 
     # SAME_ITEM (mismo SKU en otras tiendas)
     cand_si = profiles[profiles["item_nbr"]==j]
@@ -304,6 +326,22 @@ def _donors_for_episode_worker(ep: Dict) -> List[Dict]:
                    (st["pre_sd"]   < SPD_DONOR_PRE_SD_MIN) or \
                    (st["pre_min"]  < SPD_DONOR_PRE_MIN_LEVEL):
                     continue
+                if j_pre_mean is not None and j_pre_mean > 0 and SPD_DONOR_MAX_MEAN_RATIO > 0.0:
+                    if float(st.get("pre_mean", np.inf)) > float(j_pre_mean) * float(SPD_DONOR_MAX_MEAN_RATIO):
+                        continue
+                if j_pre_p95 is not None and j_pre_p95 > 0:
+                    if float(st.get("pre_p95", np.inf)) > float(j_pre_p95) * float(SPD_DONOR_P95_RATIO_MAX):
+                        continue
+                if j_pre_max is not None and j_pre_max > 0:
+                    if float(st.get("pre_max", np.inf)) > float(j_pre_max) * float(SPD_DONOR_MAX_PEAK_RATIO):
+                        continue
+                # Filtros duros adicionales (nivel y dispersión, ambos en PRE)
+                if j_pre_mean is not None and j_pre_mean > 1e-6 and SPD_DONOR_LEVEL_BAND_HARD_MAX > 0:
+                    if abs(float(st.get("pre_mean", np.nan)) - float(j_pre_mean)) > (SPD_DONOR_LEVEL_BAND_HARD_MAX * abs(float(j_pre_mean))):
+                        continue
+                if j_pre_sd is not None and j_pre_sd > 1e-6 and SPD_DONOR_SD_RATIO_MAX > 0:
+                    if float(st.get("pre_sd", np.inf)) > (float(j_pre_sd) * float(SPD_DONOR_SD_RATIO_MAX)):
+                        continue
                 pdist = float(grp["profile_distance"].iloc[0])
                 score, side, dnorm = _score_donor_candidate(float(j_pre_mean), st, pdist)
                 scored.append({
@@ -362,6 +400,21 @@ def _donors_for_episode_worker(ep: Dict) -> List[Dict]:
                                 (merged["pre_min"]  >= SPD_DONOR_PRE_MIN_LEVEL)]
                 if merged.empty:
                     continue
+                if j_pre_mean is not None and j_pre_mean > 0:
+                    mask_ok = np.ones(len(merged), dtype=bool)
+                    if SPD_DONOR_MAX_MEAN_RATIO > 0.0:
+                        mask_ok &= merged["pre_mean"].to_numpy(dtype=float) <= float(j_pre_mean) * float(SPD_DONOR_MAX_MEAN_RATIO)
+                    if j_pre_p95 is not None and j_pre_p95 > 0:
+                        mask_ok &= merged["pre_p95"].to_numpy(dtype=float) <= float(j_pre_p95) * float(SPD_DONOR_P95_RATIO_MAX)
+                    if j_pre_max is not None and j_pre_max > 0:
+                        mask_ok &= merged["pre_max"].to_numpy(dtype=float) <= float(j_pre_max) * float(SPD_DONOR_MAX_PEAK_RATIO)
+                    if SPD_DONOR_LEVEL_BAND_HARD_MAX > 0 and abs(float(j_pre_mean)) > 1e-6:
+                        mask_ok &= np.abs(merged["pre_mean"].to_numpy(dtype=float) - float(j_pre_mean)) <= (SPD_DONOR_LEVEL_BAND_HARD_MAX * abs(float(j_pre_mean)))
+                    if (j_pre_sd is not None) and (j_pre_sd > 1e-6) and (SPD_DONOR_SD_RATIO_MAX > 0):
+                        mask_ok &= merged["pre_sd"].to_numpy(dtype=float) <= (float(j_pre_sd) * float(SPD_DONOR_SD_RATIO_MAX))
+                    merged = merged[mask_ok]
+                    if merged.empty:
+                        continue
                 if j_pre_mean is not None:
                     denom = max(1e-6, abs(float(j_pre_mean)))
                     d_pre_norm = np.abs(merged["pre_mean"].to_numpy(dtype=float) - float(j_pre_mean)) / denom
@@ -399,6 +452,60 @@ def _donors_for_episode_worker(ep: Dict) -> List[Dict]:
                         "rank": rank
                     })
                     rank += 1
+    total = rank - 1
+    need_min = max(0, min(SPD_DONOR_MIN_KEEP, N_DONORS_PER_J) - total)
+    if need_min > 0:
+        chosen = set((int(r["donor_store"]), int(r["donor_item"])) for r in rows)
+        prof_sc_fb = profiles[(profiles["class"]==c) & (profiles["store_nbr"]!=s) & (profiles["item_nbr"]!=j)]
+        if SPD_AVOID_CANNIBAL_STORE and i_store is not None:
+            prof_sc_fb = prof_sc_fb[prof_sc_fb["store_nbr"] != int(i_store)]
+        if not prof_sc_fb.empty:
+            Xc = prof_sc_fb[["h_mean","h_sd","p_any"]].to_numpy(dtype=float, copy=False)
+            dc = np.sqrt(((Xc - tgt) ** 2 * w).sum(axis=1))
+            prof_sc_fb = prof_sc_fb.assign(profile_distance=dc)
+            prof_sc_fb = prof_sc_fb.sort_values("profile_distance")
+            for _, r in prof_sc_fb.iterrows():
+                key = (int(r["store_nbr"]), int(r["item_nbr"]))
+                if key in chosen:
+                    continue
+                rows.append({
+                    "j_store": s, "j_item": j,
+                    "donor_store": int(r["store_nbr"]), "donor_item": int(r["item_nbr"]),
+                    "donor_kind": "same_class",
+                    "distance": float(r["profile_distance"]),
+                    "store_type": str(r.get("type","")), "city": str(r.get("city","")), "state": str(r.get("state","")),
+                    "rank": rank
+                })
+                rank += 1
+                chosen.add(key)
+                if rank - 1 >= min(SPD_DONOR_MIN_KEEP, N_DONORS_PER_J):
+                    break
+        if rank - 1 < min(SPD_DONOR_MIN_KEEP, N_DONORS_PER_J):
+            cand_si_fb = profiles[profiles["item_nbr"]==j]
+            cand_si_fb = cand_si_fb[cand_si_fb["store_nbr"] != s]
+            if SPD_AVOID_CANNIBAL_STORE and i_store is not None:
+                cand_si_fb = cand_si_fb[cand_si_fb["store_nbr"] != int(i_store)]
+            if not cand_si_fb.empty:
+                X = cand_si_fb[["h_mean","h_sd","p_any"]].to_numpy(dtype=float, copy=False)
+                d = np.sqrt(((X - tgt) ** 2 * w).sum(axis=1))
+                cand_si_fb = cand_si_fb.assign(profile_distance=d)
+                cand_si_fb = cand_si_fb.sort_values("profile_distance")
+                for _, r in cand_si_fb.iterrows():
+                    key = (int(r["store_nbr"]), int(j))
+                    if key in chosen:
+                        continue
+                    rows.append({
+                        "j_store": s, "j_item": j,
+                        "donor_store": int(r["store_nbr"]), "donor_item": j,
+                        "donor_kind": "same_item",
+                        "distance": float(r["profile_distance"]),
+                        "store_type": str(r.get("type","")), "city": str(r.get("city","")), "state": str(r.get("state","")),
+                        "rank": rank
+                    })
+                    rank += 1
+                    chosen.add(key)
+                    if rank - 1 >= min(SPD_DONOR_MIN_KEEP, N_DONORS_PER_J):
+                        break
     return rows
 
 # ---------------------------------------------------------------------
@@ -466,7 +573,25 @@ def build_donors_for_pairs(*,
         log.warning("No se hallaron donantes; se generará CSV vacío.")
         donors_df = pd.DataFrame(columns=["j_store","j_item","donor_store","donor_item","donor_kind","distance","store_type","city","state","rank"])
     else:
-        donors_df = donors_df.sort_values(["j_store","j_item","rank"])
+        # Orden inicial por víctima y rank local a cada episodio
+        donors_df = donors_df.sort_values(["j_store","j_item","rank"]).reset_index(drop=True)
+        # Desduplicar a nivel víctima-donante (una víctima puede aparecer en múltiples episodios)
+        donors_df = donors_df.drop_duplicates(subset=["j_store","j_item","donor_store","donor_item","donor_kind"])  # keep='first'
+        # Re‑rank global por víctima priorizando same_item y menor distancia
+        donors_df["_kind_order"] = donors_df["donor_kind"].map({"same_item": 0, "same_class": 1}).fillna(2).astype(int)
+        donors_df = donors_df.sort_values(["j_store","j_item","_kind_order","distance"]).reset_index(drop=True)
+        donors_df["rank"] = donors_df.groupby(["j_store","j_item"]).cumcount() + 1
+        donors_df = donors_df.drop(columns=["_kind_order"])
+        # Mantener top‑K si se definió N_DONORS_PER_J (>0)
+        try:
+            K = int(N_DONORS_PER_J)
+            if K > 0:
+                donors_df = (donors_df
+                             .sort_values(["j_store","j_item","rank"])  # asegurar estabilidad
+                             .groupby(["j_store","j_item"], as_index=False, group_keys=False)
+                             .head(K))
+        except Exception:
+            pass
 
     donors_path = os.path.join(outdir, "donors_per_victim.csv")
     donors_df.to_csv(donors_path, index=False)

@@ -382,6 +382,7 @@ class ParamsConfig:
     gsc_cv_folds: int = 5          # ACTUALIZADO: 3 -> 5 para rolling window
     gsc_cv_holdout: int = 14       # ACTUALIZADO: 21 -> 14 (ventanas más pequeñas)
     gsc_cv_gap: int = 7            # NUEVO: gap de 7 días
+    gsc_train_gap: int = 7         # Embargo previo al tratamiento en el ajuste final
     gsc_eval_n: int = 10
     gsc_eval_selection: str = "head"
     # Hiperparámetros anti-overfitting
@@ -389,6 +390,12 @@ class ParamsConfig:
     gsc_tau: float = 0.01          # ACTUALIZADO: 0.0001 -> 0.01 (100x más regularización)
     gsc_alpha: float = 0.005       # ACTUALIZADO: 0.0 -> 0.005 (regularización L2)
     gsc_hpo_trials: int = 500      # NUEVO: HPO con 500 trials
+    gsc_include_covariates: bool = True
+    gsc_link: str = "log1p"
+    gsc_link_eps: float = 0.0
+    gsc_pred_clip_min: Optional[float] = 0.0
+    gsc_calibrate_victim: str = "level"
+    gsc_post_smooth_window: int = 1
 
     # Meta-learners
     meta_learners: Tuple[str, ...] = ("x",)  # subset de {"t","s","x"}
@@ -652,7 +659,7 @@ def _filter_pairs_and_donors(
     dv = set(df_f[vict_col].unique())
     ddf = pd.read_csv(donors_csv)
     vict_cols_don = [c for c in ddf.columns if any(k in c.lower() for k in
-                    ["victim", "victima", "target_item", "victim_item", "j_id", "victim_id"])]
+                    ["victim", "victima", "j_", "jitem", "target_item", "victim_item", "j_id", "victim_id"])]
     if len(vict_cols_don) == 0:
         raise ValueError("No pude identificar la columna de víctima en donors_per_victim.csv")
     vict_don_col = vict_cols_don[0]
@@ -730,7 +737,9 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
     # # # -------------------- Paso 1: Data Quality --------------------
     step1_outputs = {}
     if cfg.toggles.step1:
-        out_dir = cfg.paths.step1_out_dir or cfg.paths.processed_dir
+        # Forzar salida CENTRAL compartida para Steps 1-3
+        outdir_central_step1 = cfg.params.outdir_pairs_donors / "_shared_base"
+        out_dir = outdir_central_step1
         train_filtered = out_dir / "train_filtered.csv"
         transactions_filtered = out_dir / "transactions_filtered.csv"
         
@@ -747,8 +756,9 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
         else:
             logger.info("Paso 1: Control de calidad y filtrado de datos 'train' y 'transactions'.")
 
-            # assert de scoping de salida
-            _assert_scoped(cfg.paths.processed_dir, exp_tag, "step1.out_dir(processed_dir)", hard=cfg.hard_scope)
+            # assert de scoping: omitir si es _shared_base (carpeta CENTRAL)
+            if "_shared_base" not in str(out_dir):
+                _assert_scoped(out_dir, exp_tag, "step1.out_dir", hard=cfg.hard_scope)
 
             try:
                 dq_path = SRC_DIR / "preprocess_data" / "1. data_quality.py"
@@ -808,7 +818,9 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
             logger.warning("No se pudo extraer rutas filtradas del Paso 1; se usarán las originales.")
 
     # # -------------------- Paso 2: Competitive Exposure + EDA 1 y 2 --------------------
-    exposure_path = cfg.paths.exposure_csv
+    # Guardar SIEMPRE en ubicación CENTRAL compartida
+    outdir_central_step2 = cfg.params.outdir_pairs_donors / "_shared_base"
+    exposure_path = outdir_central_step2 / "competitive_exposure.csv"
     if cfg.toggles.step2:
         # Check if cached output exists
         if cfg.toggles.use_cached_step2 and exposure_path.exists():
@@ -816,8 +828,12 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
             logger.info("   ✓ Cache hit: %s", exposure_path)
         else:
             logger.info("Paso 2: Cálculo de exposición competitiva (H).")
-            _assert_scoped(cfg.paths.exposure_csv.parent, exp_tag, "step2.exposure_dir", hard=cfg.hard_scope)
-            _touch_fingerprint(cfg.paths.exposure_csv.parent, exp_tag)
+            # Omitir scope si es _shared_base; de lo contrario, verificar
+            if "_shared_base" not in str(exposure_path.parent):
+                _assert_scoped(exposure_path.parent, exp_tag, "step2.exposure_dir", hard=cfg.hard_scope)
+                _touch_fingerprint(exposure_path.parent, exp_tag)
+            else:
+                _touch_fingerprint(exposure_path.parent, "_shared_base")
 
             try:
                 ce_path = SRC_DIR / "preprocess_data" / "2. competitive_exposure.py"
@@ -833,7 +849,7 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 compute_competitive_exposure = None  # type: ignore
 
             if compute_competitive_exposure is not None:
-                ensure_dir(cfg.paths.processed_dir)
+                ensure_dir(exposure_path.parent)
                 _ = _safe_call(
                     compute_competitive_exposure,
                     logger,
@@ -885,17 +901,14 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
 
     if cfg.toggles.step3:
         
+        # Alinear número de donantes con configuración del experimento
         try:
-            _env_val = os.environ.get("SPD_N_DONORS_PER_J", "").strip()
-            if _env_val == "":
-                os.environ["SPD_N_DONORS_PER_J"] = "15"
-                logger.info("SPD_N_DONORS_PER_J no definido -> forzado a 15")
-            else:
-                try:
-                    if int(_env_val) != 15:
-                        logger.info("SPD_N_DONORS_PER_J ya definido (%s). No se sobreescribe.", _env_val)
-                except Exception:
-                    pass
+            desired_k = int(cfg.params.top_k_donors) if getattr(cfg.params, "top_k_donors", None) is not None else 10
+            os.environ["SPD_N_DONORS_PER_J"] = str(desired_k)
+            logger.info("SPD_N_DONORS_PER_J establecido a %s desde configuración (top_k_donors)", desired_k)
+            # Forzar mínimo a K para que el selector intente completar hasta K cuando sea posible
+            os.environ["SPD_DONOR_MIN_KEEP"] = str(desired_k)
+            logger.info("SPD_DONOR_MIN_KEEP establecido a %s (relleno mínimo hasta K si hay candidatos)", desired_k)
         except Exception:
             pass
 
@@ -1247,10 +1260,17 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                     cv_folds=cfg.params.gsc_cv_folds,
                     cv_holdout=cfg.params.gsc_cv_holdout,
                     cv_gap=cfg.params.gsc_cv_gap,              # NUEVO: gap para rolling window CV
+                    train_gap=cfg.params.gsc_train_gap,
                     rank=cfg.params.gsc_rank,
                     tau=cfg.params.gsc_tau,
                     alpha=cfg.params.gsc_alpha,
                     hpo_trials=cfg.params.gsc_hpo_trials,      # NUEVO: HPO trials
+                    include_covariates=cfg.params.gsc_include_covariates,
+                    link=cfg.params.gsc_link,
+                    link_eps=cfg.params.gsc_link_eps,
+                    pred_clip_min=cfg.params.gsc_pred_clip_min,
+                    calibrate_victim=cfg.params.gsc_calibrate_victim,
+                    post_smooth_window=cfg.params.gsc_post_smooth_window,
                 )
                 _safe_call(gsc_run_batch, logger, cfg.fail_fast, "5. GSC run_batch", cfg=gsc_cfg)
 

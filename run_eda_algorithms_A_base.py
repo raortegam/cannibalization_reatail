@@ -30,11 +30,11 @@ def main():
     logger.info("=" * 60)
     
     config = EDAConfig(
-        episodes_index=Path(f".data/processed/{exp_tag}/episodes_index.parquet"),
+        episodes_index=Path(f".data/processed_data/{exp_tag}/episodes_index.parquet"),
         gsc_out_dir=Path(f".data/processed_data/{exp_tag}/gsc"),
-        meta_out_root=Path(f".data/processed_data/{exp_tag}/meta_outputs"),
-        meta_learners=("x",),
-        figures_dir=Path(f"figures/{exp_tag}/algorithms"),
+        meta_out_root=Path(f".data/processed_data/{exp_tag}"),
+        meta_learners=(),
+        figures_dir=Path(f"figures/{exp_tag}"),
         orientation="landscape",
         dpi=300,
         font_size=10,

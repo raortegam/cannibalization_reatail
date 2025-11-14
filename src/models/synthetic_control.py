@@ -52,14 +52,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-# Importar módulo de métricas causales
+# Importar módulo de métricas causales (opcional)
 try:
     from .causal_metrics import CausalMetricsCalculator
     CAUSAL_METRICS_AVAILABLE = True
@@ -70,11 +70,8 @@ except ImportError:
 # ---------------------------------------------------------------------
 # Utilidades generales
 # ---------------------------------------------------------------------
-from dataclasses import field  # si el archivo define dataclasses con default_factory
 def _data_root() -> Path:
-    """
-    Prefiere ./.data; si no existe, intenta ./data; y por último crea ./.data.
-    """
+    """Prefiere ./.data; si no existe, intenta ./data; y por último crea ./.data."""
     for cand in (Path("./.data"), Path("./data")):
         try:
             if cand.exists():
@@ -86,7 +83,9 @@ def _data_root() -> Path:
 def _fig_root() -> Path:
     return Path("./figures")
 
-def _to_path(p: str | Path) -> Path:
+def _to_path(p: str | Path | None) -> Optional[Path]:
+    if p is None:
+        return None
     return p if isinstance(p, Path) else Path(p)
 
 def _ensure_dir(p: Path) -> None:
@@ -108,7 +107,6 @@ def _nanrmspe(y, yhat) -> float:
     denom = np.maximum(1.0, np.nanmean(np.square(y[m])) ** 0.5)
     return float(np.sqrt(np.nanmean(e**2)) / denom)
 
-# ---- Métricas NaN-safe usadas en todo el pipeline -----------
 def _rmspe(y, yhat) -> float:
     m = np.isfinite(y) & np.isfinite(yhat)
     if not np.any(m):
@@ -122,6 +120,14 @@ def _mae(y, yhat) -> float:
     if not np.any(m):
         return float("nan")
     return float(np.mean(np.abs(y[m] - yhat[m])))
+
+def _rmse_log1p(y, yhat) -> float:
+    m = np.isfinite(y) & np.isfinite(yhat)
+    if not np.any(m):
+        return float("nan")
+    v1 = np.log1p(np.maximum(y[m], 0.0))
+    v2 = np.log1p(np.maximum(yhat[m], 0.0))
+    return float(np.sqrt(np.mean((v1 - v2) ** 2)))
 
 def _safe_pct(a: float, b: float) -> float:
     if abs(b) < 1e-8:
@@ -157,11 +163,9 @@ def _finite_or_big(x: float, big: float = 1e6) -> float:
         return float(big)
     return float(x)
 
-
 # ---------------------------------------------------------------------
-# Transformación (link) de Y para reforzar no‑negatividad
+# Link de Y (no‑negatividad)
 # ---------------------------------------------------------------------
-
 class _Link:
     def __init__(self, name: str, eps: float = 0.0):
         name = (name or "identity").strip().lower()
@@ -173,21 +177,61 @@ class _Link:
     def forward(self, Y: np.ndarray) -> np.ndarray:
         if self.name == "identity":
             return Y
-        # ventas >= 0; por seguridad, clip mínimo para log1p
         return np.log1p(np.maximum(Y, -1.0 + self.eps))
 
     def inverse(self, Z: np.ndarray) -> np.ndarray:
         if self.name == "identity":
             return Z
-        out = np.expm1(Z)
+        Zc = np.clip(Z, -20.0, 20.0)
+        out = np.expm1(Zc)
         out[out < 0] = 0.0
         return out
 
+def _quick_prune_donors(epw: EpisodeWide,
+                        max_q95_ratio: float = 3.0,
+                        min_controls: int = 8) -> EpisodeWide:
+    """Filtra donantes con colas muy pesadas vs. la víctima en PRE (spikes)."""
+    pre = epw.pre_mask
+    v = epw.treated_row
+    yv = epw.Y[v, pre]
+    if not np.isfinite(yv).any():
+        return epw
+    q95_v = float(np.nanquantile(yv, 0.95))
+    keep = [v]
+    for i in range(epw.Y.shape[0]):
+        if i == v: 
+            continue
+        yi = epw.Y[i, pre]
+        if not np.isfinite(yi).any():
+            continue
+        q95_i = float(np.nanquantile(yi, 0.95))
+        if q95_i <= max_q95_ratio * (q95_v + 1e-8):
+            keep.append(i)
+    # garantizar mínimo de controles
+    if len(keep) < min_controls and epw.Y.shape[0] > min_controls:
+        idx_all = [i for i in range(epw.Y.shape[0]) if i != v]
+        mu_v = float(np.nanmean(yv))
+        clos = sorted(idx_all, key=lambda i: abs(float(np.nanmean(epw.Y[i, pre])) - mu_v))
+        for i in clos:
+            if i not in keep:
+                keep.append(i)
+            if len(keep) >= min_controls:
+                break
+    keep = sorted(set(keep))
+    if len(keep) == epw.Y.shape[0]:
+        return epw
+    Y = epw.Y[keep, :]; M = epw.M[keep, :]
+    X = epw.X[keep, :, :] if epw.X is not None else None
+    units = [epw.units[i] for i in keep]
+    victim_new = keep.index(v)
+    return EpisodeWide(Y=Y, M=M, X=X, units=units, dates=epw.dates,
+                       treated_row=victim_new, treated_post_mask=epw.treated_post_mask,
+                       pre_mask=epw.pre_mask, feats=epw.feats,
+                       meta={**epw.meta, "n_controls": len(keep) - 1})
 
 # ---------------------------------------------------------------------
-# Selección de covariables y armado de matrices wide (anti‑fuga)
+# Selección de covariables (anti‑fuga) y armado wide
 # ---------------------------------------------------------------------
-
 BLACKLIST_COLS = {
     "sales", "y_raw", "y_log1p",
     "sc_hat", "trend_T", "Q_store_trend", "available_A",
@@ -196,13 +240,28 @@ BLACKLIST_COLS = {
     "store_nbr", "item_nbr", "year_week", "id", "family_name",
     "is_victim", "promo_share", "avail_share", "keep", "reason",
 }
-SAFE_PREFIXES = ("fourier_", "lag_", "promo_share_sc_l", "promo_share_sc_excl_l",
-                 "class_index_excl_l", "type_", "cluster_", "state_")
-SAFE_SINGLE_COLS = {"Fsw_log1p", "Ow", "HNat", "HReg", "HLoc",
-                    "is_bridge", "is_additional", "is_work_day",
-                    "trend_T_l1", "Q_store_trend_l1", "month"}
+# Aceptar lags EXÓGENOS explícitos; NO incluir "lag_" genérico
+SAFE_PREFIXES = (
+    "fourier_",
+    "promo_share_sc_l", "promo_share_sc_excl_l", "class_index_excl_l",
+    "trend_T_l", "Q_store_trend_l",
+    "type_", "cluster_", "state_"
+)
+SAFE_SINGLE_COLS = {
+    "Fsw_log1p", "Ow", "HNat", "HReg", "HLoc",
+    "is_bridge", "is_additional", "is_work_day",
+    "trend_T_l1", "Q_store_trend_l1", "month"
+}
+_Y_DERIVED_PATTERNS = (
+    "lag_sales", "lag_y", "lag_y_raw", "lag_y_log1p",
+    "diff_sales", "diff_y", "ma_sales", "ewm_sales", "rolling_sales",
+    "lag_sales_", "diff_sales_", "rolling_y"
+)
 
 def _is_safe_feature(col: str) -> bool:
+    low = col.lower()
+    if any(pat in low for pat in _Y_DERIVED_PATTERNS):
+        return False
     if col in BLACKLIST_COLS:
         return False
     if col in SAFE_SINGLE_COLS:
@@ -224,7 +283,9 @@ def select_feature_cols(df: pd.DataFrame) -> List[str]:
         logging.info(f"[FEATS] Features: {feats}")
     return feats
 
-
+# ---------------------------------------------------------------------
+# Estructuras wide
+# ---------------------------------------------------------------------
 @dataclass
 class EpisodeWide:
     Y: np.ndarray
@@ -238,17 +299,11 @@ class EpisodeWide:
     feats: List[str]
     meta: Dict
 
-
 def long_to_wide_for_episode(df: pd.DataFrame, include_covariates: bool = True) -> EpisodeWide:
-    """
-    Convierte panel largo del episodio a matrices wide (unidades x fecha) y
-    aplica una máscara **a prueba de fugas**: la víctima en POST siempre queda oculta.
-    """
     d = df.copy()
     d["date"] = _as_datetime(d["date"])
     d = d.sort_values(["date", "store_nbr", "item_nbr"])
 
-    # Víctima primero
     d["__is_victim__"] = (d["treated_unit"] == 1).astype(int)
     units = _sorted_unique(d.sort_values(["__is_victim__", "unit_id"], ascending=[False, True])["unit_id"])
     dates = _sorted_unique(d["date"])
@@ -266,7 +321,6 @@ def long_to_wide_for_episode(df: pd.DataFrame, include_covariates: bool = True) 
     X = np.zeros((U, T, P), dtype=float) if include_covariates and P > 0 else None
 
     has_train_mask = "train_mask" in d.columns
-    # poblar matrices
     for _, r in d.iterrows():
         i = unit2idx[r["unit_id"]]
         j = date2idx[r["date"]]
@@ -280,11 +334,9 @@ def long_to_wide_for_episode(df: pd.DataFrame, include_covariates: bool = True) 
         if has_train_mask:
             TM[i, j] = bool(int(r["train_mask"]))
 
-    # fila víctima y reconstrucción robusta de POST si hiciera falta
     victim_unit = d.loc[d["treated_unit"] == 1, "unit_id"].iloc[0]
     treated_row = units.index(victim_unit)
     if not treated_time_vec.any():
-        # fallback: usa D para la víctima
         try:
             d_v = d[d["treated_unit"] == 1].sort_values("date")
             idx_first_one = d_v.index[d_v["D"].astype(int).to_numpy() == 1]
@@ -292,15 +344,12 @@ def long_to_wide_for_episode(df: pd.DataFrame, include_covariates: bool = True) 
                 first_date = d_v.loc[idx_first_one[0], "date"]
                 j0 = date2idx[first_date]
                 treated_time_vec[j0:] = True
-                logging.warning("[MASK] 'treated_time' vacío; POST reconstruido desde 'D' para la víctima.")
+                logging.warning("[MASK] 'treated_time' vacío; POST reconstruido desde 'D'.")
         except Exception:
             pass
 
     pre_mask = ~treated_time_vec
-
-    # máscara final M
     M = TM if has_train_mask else np.isfinite(Y)
-    # Forzar SIEMPRE ocultamiento de víctima en POST
     n_post_before = int(np.sum(M[treated_row, treated_time_vec]))
     M[treated_row, treated_time_vec] = False
     n_post_after = int(np.sum(M[treated_row, treated_time_vec]))
@@ -319,19 +368,15 @@ def long_to_wide_for_episode(df: pd.DataFrame, include_covariates: bool = True) 
     return EpisodeWide(Y=Y, M=M, X=X, units=units, dates=dates,
                        treated_row=treated_row,
                        treated_post_mask=treated_time_vec,
-                       pre_mask=pre_mask,
-                       feats=feats,
-                       meta=meta)
-
+                       pre_mask=pre_mask, feats=feats, meta=meta)
 
 # ---------------------------------------------------------------------
 # Núcleo GSC: SoftImpute + Ridge alternado (con estandarización)
 # ---------------------------------------------------------------------
-
 @dataclass
 class GSCConfig:
-    rank: int = 2
-    tau: float = 1.0
+    rank: int = 4
+    tau: float = 0.1
     alpha: float = 0.01
     max_inner: int = 120
     max_outer: int = 10
@@ -339,16 +384,18 @@ class GSCConfig:
     include_covariates: bool = True
     random_state: int = 42
     standardize_y: bool = True
-    # robustez y no‑negatividad
-    link: str = "identity"
+    # robustez/no‑negatividad
+    link: str = "log1p"
     link_eps: float = 0.0
-    pred_clip_min: Optional[float] = 0.0
-    calibrate_victim: str = "level"        # 'none' | 'level' | 'level_and_trend'
-    post_smooth_window: int = 1            # 1 => sin suavizado
+    pred_clip_min: Optional[float] = None
+    calibrate_victim: str = "level"        # 'none'|'level'|'level_and_trend'
+    post_smooth_window: int = 1
+    # schedule de regularización
+    reg_growth: float = 1.0      # >1.0 => aumenta tau/alpha por outer-iter
+    reg_growth_max: float = 6.0  # tope multiplicativo (vs valor inicial)
 
 class SoftImpute:
     """SoftImpute con SVD denso y máscara M (True si observado/entrenable)."""
-
     def __init__(self, tau: float, rank: int, max_iters: int = 100, tol: float = 1e-4):
         self.tau = float(tau)
         self.rank = int(rank)
@@ -356,45 +403,38 @@ class SoftImpute:
         self.tol = float(tol)
 
     def fit(self, W: np.ndarray, M: np.ndarray) -> np.ndarray:
-        """
-        min_L 0.5||M*(W - L)||_F^2 + tau * ||L||_*  por soft-thresholding.
-        """
         L = np.nan_to_num(W, nan=0.0).copy()
         prev_missing = L.copy()
-
         for _ in range(self.max_iters):
             try:
                 U, s, Vt = np.linalg.svd(L, full_matrices=False)
             except np.linalg.LinAlgError:
                 L = L + 1e-6 * np.random.randn(*L.shape)
                 U, s, Vt = np.linalg.svd(L, full_matrices=False)
-
             s_shrunk = np.maximum(s - self.tau, 0.0)
             r = int(min(self.rank, max(1, np.sum(s_shrunk > 0))))
             L_new = (U[:, :r] * s_shrunk[:r]) @ Vt[:r, :]
-
-            # Mantener observados (M=True) en W; missing como L_new
             L = np.where(M, W, L_new)
-
             miss_mask = ~M
             num = np.linalg.norm((L - prev_missing)[miss_mask]) if np.any(miss_mask) else 0.0
             den = np.linalg.norm(prev_missing[miss_mask]) + 1e-8 if np.any(miss_mask) else 1.0
-            rel = num / den
-            if rel < self.tol:
+            if num / den < self.tol:
                 break
             prev_missing = L.copy()
-
-        # Reconstrucción final
         U, s, Vt = np.linalg.svd(L, full_matrices=False)
         s_shrunk = np.maximum(s - self.tau, 0.0)
         r = int(min(self.rank, max(1, np.sum(s_shrunk > 0))))
-        L_star = (U[:, :r] * s_shrunk[:r]) @ Vt[:r, :]
-        return L_star
-
+        return (U[:, :r] * s_shrunk[:r]) @ Vt[:r, :]
 
 class GSCModel:
-    """GSC con alternancia entre L (factores) y β (covariables) sobre máscara M."""
-
+    """
+    GSC con alternancia entre:
+      - L  (bajo rango, SoftImpute con tau_now)
+      - β  (covariables, ridge con alpha_now)
+    y un schedule de regularización por iteración externa:
+      tau_now   *= reg_growth  (≤ tau * reg_growth_max)
+      alpha_now *= reg_growth  (≤ alpha * reg_growth_max)
+    """
     def __init__(self, cfg: GSCConfig):
         self.cfg = cfg
         self.beta_: Optional[np.ndarray] = None
@@ -408,7 +448,6 @@ class GSCModel:
 
     @staticmethod
     def _normalize_X_on_mask(X: np.ndarray, M: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Normaliza X usando sólo celdas con M=True."""
         U, T, P = X.shape
         mask3 = np.repeat(M[:, :, None], P, axis=2)
         X_obs = np.where(mask3, X, np.nan)
@@ -421,7 +460,7 @@ class GSCModel:
         include_X = self.cfg.include_covariates and X is not None and X.ndim == 3 and X.shape[2] > 0
         P = 0 if not include_X else X.shape[2]
 
-        # Transformación + estandarización de Y (sólo celdas M=True)
+        # Transformación + estandarización de Y (solo M=True)
         Yt = self._link.forward(Y)
         if self.cfg.standardize_y:
             obs_vals = Yt[M]
@@ -432,7 +471,7 @@ class GSCModel:
             self._y_mean, self._y_std = 0.0, 1.0
             Ys = Yt.copy()
 
-        # Normalizar X (si aplica)
+        # Normalización de X (solo M=True)
         if include_X:
             Xn, xm, xs = self._normalize_X_on_mask(X, M)
             self._x_means, self._x_std = xm, xs
@@ -442,35 +481,50 @@ class GSCModel:
         def xbeta_all(beta_vec: Optional[np.ndarray]) -> np.ndarray:
             if not include_X or beta_vec is None:
                 return np.zeros_like(Ys)
-            return np.tensordot(Xn, beta_vec, axes=(2, 0))  # (U,T,P)·(P,) -> (U,T)
+            return np.tensordot(Xn, beta_vec, axes=(2, 0))
 
         beta = np.zeros(P, dtype=float) if include_X else None
         hist = {"rmspe_obs": []}
         L = np.zeros_like(Ys)
 
+        # Schedule de regularización
+        reg_growth = float(getattr(self.cfg, "reg_growth", 1.0))
+        reg_max    = float(getattr(self.cfg, "reg_growth_max", 6.0))
+        tau_now    = float(self.cfg.tau)
+        alpha_now  = float(self.cfg.alpha)
+        tau_cap    = float(self.cfg.tau)   * max(1.0, reg_max)
+        alpha_cap  = float(self.cfg.alpha) * max(1.0, reg_max)
+
         for _ in range(self.cfg.max_outer):
-            # Paso 1: SoftImpute en residuales (sobre M)
+            # 1) SoftImpute sobre residuales
             R = Ys - (xbeta_all(beta) if include_X else 0.0)
             W = np.where(M, R, np.nan)
-            L_est = SoftImpute(self.cfg.tau, self.cfg.rank, self.cfg.max_inner, self.cfg.tol).fit(W, M)
+            L_est = SoftImpute(tau_now, self.cfg.rank, self.cfg.max_inner, self.cfg.tol).fit(W, M)
             L = L_est
 
-            # Paso 2: Ridge para β con observados
+            # 2) Ridge para β en observados
             if include_X:
                 R_obs = (Ys - L)[M]
                 X_obs = Xn[M, :]
                 if X_obs.size == 0:
                     beta = np.zeros(P, dtype=float)
                 else:
-                    A, _ = _augment_ridge(X_obs, self.cfg.alpha)
-                    y_aug = np.concatenate([R_obs, np.zeros(X_obs.shape[1])]) if self.cfg.alpha > 0 else R_obs
+                    A, _ = _augment_ridge(X_obs, alpha_now)
+                    y_aug = np.concatenate([R_obs, np.zeros(X_obs.shape[1])]) if alpha_now > 0 else R_obs
                     beta, *_ = np.linalg.lstsq(A, y_aug, rcond=None)
 
+            # Métrica en observados
             yhat_obs = (L + (xbeta_all(beta) if include_X else 0.0))[M]
             hist["rmspe_obs"].append(_rmspe(Ys[M], yhat_obs))
 
+            # Parada por estancamiento
             if len(hist["rmspe_obs"]) >= 2 and abs(hist["rmspe_obs"][-1] - hist["rmspe_obs"][-2]) < 1e-5:
                 break
+
+            # 3) Ramp‑up para siguiente iteración
+            if reg_growth > 1.0:
+                tau_now   = min(tau_now   * reg_growth, tau_cap)
+                alpha_now = min(alpha_now * reg_growth, alpha_cap)
 
         self.beta_ = beta
         self.L_ = L
@@ -486,33 +540,26 @@ class GSCModel:
             Yhat_std = self.L_ + Xb
         else:
             Yhat_std = self.L_
-
         # desestandarizar + inversa del link
         Yhat_t = Yhat_std * self._y_std + self._y_mean
         Yhat = self._link.inverse(Yhat_t)
-
-        # Clip mínimo (última salvaguarda)
         if self.cfg.pred_clip_min is not None:
             Yhat = np.maximum(Yhat, float(self.cfg.pred_clip_min))
-
         return Yhat
-
 
 # ---------------------------------------------------------------------
 # CV temporal y utilidades
 # ---------------------------------------------------------------------
-
 @dataclass
 class CVCfg:
-    folds: int = 3
-    holdout_days: int = 21
+    folds: int = 5
+    holdout_days: int = 14
     gap_days: int = 7
-    grid_ranks: Tuple[int, ...] = (1, 2, 3)
-    grid_tau: Tuple[float, ...] = (0.5, 1.0, 2.0)
+    grid_ranks: Tuple[int, ...] = (1, 2, 3, 4)
+    grid_tau: Tuple[float, ...] = (0.01, 0.02, 0.05, 0.1)
     grid_alpha: Tuple[float, ...] = (0.001, 0.01, 0.1)
 
 def _svd_scale_pre(ep: EpisodeWide) -> float:
-    """Escala típica para tau basada en el mayor singular del PRE."""
     Ypre = ep.Y[:, ep.pre_mask]
     Mpre = ep.M[:, ep.pre_mask]
     Ytmp = np.where(Mpre, Ypre, 0.0)
@@ -524,132 +571,167 @@ def _svd_scale_pre(ep: EpisodeWide) -> float:
         s0 = 1.0
     return s0
 
+def _svd_scale_pre_std(ep: EpisodeWide, link: str = "log1p", link_eps: float = 0.0, standardize_y: bool = True) -> float:
+    linker = _Link(link, link_eps)
+    Yt = linker.forward(ep.Y)
+    Mpre = ep.M[:, ep.pre_mask]
+    Ypre_t = Yt[:, ep.pre_mask]
+    if standardize_y:
+        obs_vals = Ypre_t[Mpre[:, :]]
+        mu = float(np.nanmean(obs_vals)) if obs_vals.size > 0 else 0.0
+        sd = float(np.nanstd(obs_vals) + 1e-8) if obs_vals.size > 0 else 1.0
+        Ys = (Ypre_t - mu) / sd
+    else:
+        Ys = Ypre_t
+    Ytmp = np.where(Mpre, Ys, 0.0)
+    try:
+        s0 = float(np.linalg.svd(Ytmp, full_matrices=False, compute_uv=False)[0])
+    except Exception:
+        s0 = float(np.sqrt(np.nanmean(Ytmp**2)) * np.sqrt(min(Ytmp.shape))) if Ytmp.size > 0 else 1.0
+    if not np.isfinite(s0) or s0 <= 1e-8:
+        s0 = 1.0
+    return s0
+
 def _sanitize_grids(ep: EpisodeWide, cv: CVCfg) -> Tuple[Tuple[int, ...], Tuple[float, ...], Tuple[float, ...], Dict]:
     U, T = ep.Y.shape
     max_rank = max(1, min(U - 1, T - 1))
-    ranks = sorted(set(int(np.clip(r, 1, max_rank)) for r in cv.grid_ranks))
-    if not ranks:
-        ranks = tuple(int(x) for x in range(1, min(4, max_rank) + 1))
-
-    s0 = _svd_scale_pre(ep)
-    tau_lo = max(1e-3, 0.05 * s0)
-    tau_hi = max(tau_lo * 1.25, 0.8 * s0)
-    taus = [float(np.clip(t, tau_lo, tau_hi)) for t in cv.grid_tau if np.isfinite(t) and t > 0]
-    if not taus:
-        taus = list(np.geomspace(tau_lo, tau_hi, num=5))
-    taus = tuple(sorted(set(taus)))
-
-    alphas = [float(np.clip(a, 1e-5, 1e-1)) for a in cv.grid_alpha if np.isfinite(a)]
-    if not alphas:
-        alphas = list(np.geomspace(1e-4, 1e-2, num=5))
-    alphas = tuple(sorted(set(alphas)))
-
+    ranks = sorted(set(int(np.clip(r, 1, max_rank)) for r in cv.grid_ranks)) or tuple(int(x) for x in range(1, min(4, max_rank) + 1))
+    s0 = _svd_scale_pre_std(ep, link="log1p", link_eps=0.0, standardize_y=True)
+    tau_lo = max(1e-4, 0.02 * s0)
+    tau_hi = max(tau_lo * 1.25, 0.20 * s0)
+    taus = [float(np.clip(t, tau_lo, tau_hi)) for t in cv.grid_tau if np.isfinite(t) and t > 0] or list(np.geomspace(tau_lo, tau_hi, num=5))
+    alphas = [float(np.clip(a, 1e-5, 1e-1)) for a in cv.grid_alpha if np.isfinite(a)] or list(np.geomspace(1e-4, 1e-2, num=5))
     info = {"tau_lo": tau_lo, "tau_hi": tau_hi, "max_rank": max_rank, "s0_pre": s0}
-    logging.info(f"[CV-SANITIZE] rank≤{max_rank}, tau∈[{tau_lo:.4g},{tau_hi:.4g}], alpha∈[1e-5,1e-1]")
-    return tuple(ranks), tuple(taus), tuple(alphas), info
+    logging.info(f"[CV-SANITIZE] rank≤{max_rank}, tau∈[{tau_lo:.4g},{tau_hi:.4g}] (std-scale), alpha∈[1e-5,1e-1]")
+    return tuple(ranks), tuple(sorted(set(taus))), tuple(sorted(set(alphas))), info
 
-def _cv_folds_pre_indices(ep: EpisodeWide, holdout_days: int, gap_days: int, k_folds: int) -> List[Tuple[np.ndarray, np.ndarray]]:
-    """Validación cruzada con VENTANA MÓVIL (rolling window) para evitar overfitting.
-    
-    En lugar de folds fijos desde el final, crea ventanas que se desplazan a través
-    del período PRE, simulando predicción fuera de muestra de forma más realista.
-    
-    Args:
-        ep: Episodio wide con datos
-        holdout_days: Tamaño de la ventana de validación
-        gap_days: Embargo antes de la ventana de validación
-        k_folds: Número de ventanas móviles a crear
-    
+def _cv_folds_pre_indices(ep: EpisodeWide,
+                          holdout_days: int,
+                          gap_days: int,
+                          k_folds: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Validación cruzada con VENTANA MÓVIL dentro del período PRE.
+    Además de las ventanas móviles, agrega SIEMPRE un fold anclado
+    al final del PRE (los últimos H días) para evaluar el tramo
+    inmediatamente anterior al tratamiento.
+
     Returns:
-        Lista de tuplas (gap_idx, hold_idx) para cada fold
+        List[Tuple[gap_idx, hold_idx]]  con índices de tiempo (sobre eje columnas)
+        - gap_idx: días embargados antes del holdout (puede ser vacío)
+        - hold_idx: ventana de validación
     """
     pre_idx = np.where(ep.pre_mask)[0]
     if len(pre_idx) == 0:
         return []
-    
+
     H = int(max(1, holdout_days))
     G = int(max(0, gap_days))
-    
-    # Necesitamos espacio suficiente para: train_min + gap + holdout
-    min_train = max(14, H)  # Al menos 14 días de entrenamiento
+    min_train = max(14, H)                # al menos 14 días de entrenamiento
     total_needed = min_train + G + H
-    
+
+    folds: List[Tuple[np.ndarray, np.ndarray]] = []
+
+    # Caso 1: PRE corto -> fallback a CV "estándar" retrocediendo en bloques H
     if len(pre_idx) < total_needed:
-        logging.warning(f"[CV-ROLLING] PRE insuficiente ({len(pre_idx)} días) para rolling CV (necesita {total_needed}). Usando CV estándar.")
-        # Fallback a CV estándar si no hay suficientes datos
+        logging.warning(f"[CV-ROLLING] PRE insuficiente ({len(pre_idx)} días). "
+                        f"Se usa CV estándar con bloques H={H} y gap G={G}.")
         end_max = pre_idx[-1] - G
         if end_max < pre_idx[0] + H - 1:
-            return []
-        folds = []
-        for f in range(k_folds):
-            hold_end = end_max - f * H
-            hold_start = hold_end - H + 1
-            if hold_start < pre_idx[0]:
-                break
+            # Ni siquiera cabe un bloque completo H; arma un único fold al final
+            hold_end = pre_idx[-1]
+            hold_start = max(pre_idx[0] + 1, hold_end - H + 1)
             gap_start = max(pre_idx[0], hold_start - G)
             gap_idx = np.arange(gap_start, hold_start) if G > 0 else np.array([], dtype=int)
             hold_idx = np.arange(hold_start, hold_end + 1)
             folds.append((gap_idx, hold_idx))
-        return folds
-    
-    # VENTANA MÓVIL: Crear k_folds ventanas que se desplazan desde el inicio hacia el final
-    # Esto simula mejor la predicción futura y evita overfitting al final del PRE
-    folds = []
-    
-    # Calcular el espacio disponible para las ventanas
-    max_end = pre_idx[-1]  # Última fecha PRE
-    min_start = pre_idx[0] + min_train  # Primera fecha donde puede empezar una ventana de validación
-    
-    # Distribuir k_folds ventanas uniformemente en el espacio disponible
-    available_span = max_end - min_start - H + 1
-    if available_span < H:
-        # Si no hay espacio suficiente, usar solo 1 fold al final
-        k_folds = 1
-        available_span = H
-    
-    step = max(1, available_span // max(1, k_folds)) if k_folds > 1 else 0
-    
-    for f in range(k_folds):
-        # Ventana de validación se mueve desde min_start hacia max_end
-        hold_start = min_start + f * step
-        hold_end = min(hold_start + H - 1, max_end)
-        
-        # Ajustar si la última ventana se sale del rango
-        if hold_end > max_end:
-            hold_end = max_end
-            hold_start = max(min_start, hold_end - H + 1)
-        
-        # Gap antes de la ventana de validación
-        gap_start = max(pre_idx[0], hold_start - G)
-        gap_idx = np.arange(gap_start, hold_start) if G > 0 else np.array([], dtype=int)
-        hold_idx = np.arange(hold_start, hold_end + 1)
-        
-        # Verificar que hay suficiente entrenamiento antes del gap
-        train_available = gap_start - pre_idx[0]
-        if train_available < min_train:
-            continue  # Saltar este fold si no hay suficiente entrenamiento
-        
-        folds.append((gap_idx, hold_idx))
-    
-    if not folds:
-        logging.warning("[CV-ROLLING] No se pudieron crear folds válidos. Usando fold único al final.")
-        # Último recurso: un fold al final
-        hold_end = pre_idx[-1]
-        hold_start = max(pre_idx[0] + min_train + G, hold_end - H + 1)
-        gap_start = max(pre_idx[0], hold_start - G)
-        gap_idx = np.arange(gap_start, hold_start) if G > 0 else np.array([], dtype=int)
-        hold_idx = np.arange(hold_start, hold_end + 1)
-        folds.append((gap_idx, hold_idx))
-    
-    logging.info(f"[CV-ROLLING] Creados {len(folds)} folds con ventana móvil (H={H}, G={G})")
+        else:
+            for f in range(k_folds):
+                hold_end = end_max - f * H
+                hold_start = hold_end - H + 1
+                if hold_start < pre_idx[0]:
+                    break
+                gap_start = max(pre_idx[0], hold_start - G)
+                gap_idx = np.arange(gap_start, hold_start) if G > 0 else np.array([], dtype=int)
+                hold_idx = np.arange(hold_start, hold_end + 1)
+                folds.append((gap_idx, hold_idx))
+
+    # Caso 2: PRE suficiente -> ventanas móviles distribuidas a lo largo del PRE
+    else:
+        max_end = pre_idx[-1]                   # última fecha PRE
+        min_start = pre_idx[0] + min_train      # primera fecha donde puede arrancar la validación
+        available_span = max_end - min_start - H + 1
+
+        if available_span < H:
+            k_eff = 1
+            available_span = H
+        else:
+            k_eff = k_folds
+
+        step = max(1, available_span // max(1, k_eff)) if k_eff > 1 else 0
+        for f in range(k_eff):
+            hold_start = min_start + f * step
+            hold_end = min(hold_start + H - 1, max_end)
+
+            if hold_end > max_end:
+                hold_end = max_end
+                hold_start = max(min_start, hold_end - H + 1)
+
+            gap_start = max(pre_idx[0], hold_start - G)
+            gap_idx = np.arange(gap_start, hold_start) if G > 0 else np.array([], dtype=int)
+            hold_idx = np.arange(hold_start, hold_end + 1)
+
+            # Exige suficiente entrenamiento antes del gap
+            train_available = gap_start - pre_idx[0]
+            if train_available < min_train:
+                continue
+
+            folds.append((gap_idx, hold_idx))
+
+        # Último recurso si no se pudo crear nada válido
+        if not folds:
+            hold_end = pre_idx[-1]
+            hold_start = max(pre_idx[0] + min_train + G, hold_end - H + 1)
+            gap_start = max(pre_idx[0], hold_start - G)
+            gap_idx = np.arange(gap_start, hold_start) if G > 0 else np.array([], dtype=int)
+            hold_idx = np.arange(hold_start, hold_end + 1)
+            folds.append((gap_idx, hold_idx))
+
+    # --- NUEVO: asegura SIEMPRE un fold anclado al final del PRE ---
+    # Ventana de validación = últimos H días del PRE (con su gap correspondiente)
+    hold_end = pre_idx[-1]
+    hold_start = max(pre_idx[0] + 1, hold_end - H + 1)
+    gap_start = max(pre_idx[0], hold_start - G)
+    last_gap = np.arange(gap_start, hold_start) if G > 0 else np.array([], dtype=int)
+    last_hold = np.arange(hold_start, hold_end + 1)
+
+    # Evita duplicar si ya existe un fold con ese mismo hold_idx
+    if not any(np.array_equal(h, last_hold) for _, h in folds):
+        folds.append((last_gap, last_hold))
+
+    logging.info(f"[CV-ROLLING] Folds generados: {len(folds)} (H={H}, G={G}; "
+                 f"anclado-final incluido).")
     return folds
 
-def _apply_time_mask(M: np.ndarray, gap_idx: np.ndarray, hold_idx: np.ndarray) -> np.ndarray:
+def _apply_time_mask(M: np.ndarray,
+                     gap_idx: np.ndarray,
+                     hold_idx: np.ndarray,
+                     treated_row: Optional[int] = None) -> np.ndarray:
+    """
+    Si treated_row es None -> compatibilidad: embarga todas las filas.
+    Si treated_row se especifica -> embarga SOLO esa fila (víctima).
+    """
     M_train = M.copy()
+    if treated_row is None:
+        if hold_idx.size > 0:
+            M_train[:, hold_idx] = False
+        if gap_idx.size > 0:
+            M_train[:, gap_idx] = False
+        return M_train
+
     if hold_idx.size > 0:
-        M_train[:, hold_idx] = False
+        M_train[treated_row, hold_idx] = False
     if gap_idx.size > 0:
-        M_train[:, gap_idx] = False
+        M_train[treated_row, gap_idx] = False
     return M_train
 
 def time_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig) -> Tuple[GSCConfig, Dict]:
@@ -659,7 +741,6 @@ def time_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig) -> Tuple[GSC
         return base_cfg, {"cv_used": False, "score": np.nan, "best": asdict(base_cfg), "method": "grid"}
 
     grid_ranks, grid_tau, grid_alpha, san_info = _sanitize_grids(ep, cv)
-
     results = []
     for rnk in grid_ranks:
         for tau in grid_tau:
@@ -672,15 +753,17 @@ def time_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig) -> Tuple[GSC
                                     link=base_cfg.link, link_eps=base_cfg.link_eps,
                                     pred_clip_min=base_cfg.pred_clip_min,
                                     calibrate_victim=base_cfg.calibrate_victim,
-                                    post_smooth_window=base_cfg.post_smooth_window)
+                                    post_smooth_window=base_cfg.post_smooth_window,
+                                    reg_growth=base_cfg.reg_growth,
+                                    reg_growth_max=base_cfg.reg_growth_max)
                 fold_scores = []
                 for gap_idx, hold_idx in folds:
-                    M_train = _apply_time_mask(ep.M, gap_idx, hold_idx)
+                    M_train = _apply_time_mask(ep.M, gap_idx, hold_idx, ep.treated_row)
                     model = GSCModel(cfg_try).fit(ep.Y, M_train, ep.X if cfg_try.include_covariates else None)
                     Yhat = model.predict(ep.X if cfg_try.include_covariates else None)
                     y_true = ep.Y[ep.treated_row, hold_idx]
                     y_hat = Yhat[ep.treated_row, hold_idx]
-                    fold_scores.append(_rmspe(y_true, y_hat))
+                    fold_scores.append(_rmse_log1p(y_true, y_hat))
                 score = float(np.nanmedian(fold_scores))
                 score = _finite_or_big(score)
                 results.append({"rank": rnk, "tau": float(tau), "alpha": float(alpha),
@@ -695,24 +778,11 @@ def time_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig) -> Tuple[GSC
                          link=base_cfg.link, link_eps=base_cfg.link_eps,
                          pred_clip_min=base_cfg.pred_clip_min,
                          calibrate_victim=base_cfg.calibrate_victim,
-                         post_smooth_window=base_cfg.post_smooth_window)
-    logging.info(f"[GRID-GSC] best_score(RMSPE)={best['score']:.6f} | best_params="
-                 f"rank={best['rank']}, tau={best['tau']}, alpha={best['alpha']}")
-    try:
-        if len(grid_ranks) > 0 and best["rank"] in (min(grid_ranks), max(grid_ranks)):
-            which = "mínimo" if best["rank"] == min(grid_ranks) else "máximo"
-            logging.info(f"[GRID-GSC] 'rank' está en el {which} de la grilla; considera ampliar el rango.")
-        if len(grid_tau) > 0 and best["tau"] in (min(grid_tau), max(grid_tau)):
-            which = "mínimo" if best["tau"] == min(grid_tau) else "máximo"
-            logging.info(f"[GRID-GSC] 'tau' está en el {which} de la grilla; considera ampliar el rango.")
-        if len(grid_alpha) > 0 and best["alpha"] in (min(grid_alpha), max(grid_alpha)):
-            which = "mínimo" if best["alpha"] == min(grid_alpha) else "máximo"
-            logging.info(f"[GRID-GSC] 'alpha' está en el {which} de la grilla; considera ampliar el rango.")
-    except Exception:
-        pass
-
-    return best_cfg, {"cv_used": True, "score": float(best["score"]), "best": best,
-                      "all": results, "method": "grid", **san_info}
+                         post_smooth_window=base_cfg.post_smooth_window,
+                         reg_growth=base_cfg.reg_growth,
+                         reg_growth_max=base_cfg.reg_growth_max)
+    logging.info(f"[GRID-GSC] best_score(RMSPE)={best['score']:.6f} | best_params=rank={best['rank']}, tau={best['tau']}, alpha={best['alpha']}")
+    return best_cfg, {"cv_used": True, "score": float(best["score"]), "best": best, "all": results, "method": "grid", **san_info}
 
 def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
                      trials: int = 300, seed: int = 42) -> Tuple[GSCConfig, Dict]:
@@ -730,15 +800,13 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
         return base_cfg, {"cv_used": False, "score": np.nan, "best": asdict(base_cfg), "method": "optuna"}
 
     U, T = ep.Y.shape
-    # Limitar rank AGRESIVAMENTE para evitar overfitting
-    max_rank = int(max(1, min(U - 1, T - 1, 3)))  # Máximo 3 (reducido de 4)
+    max_rank = int(max(1, min(U - 1, T - 1, 5)))  # más conservador
 
-    s0 = _svd_scale_pre(ep)
-    # Rangos de tau MUCHO MÁS ALTOS para combatir overfitting severo
-    tau_lo = float(max(5e-3, 0.05 * s0))   # Mínimo 5x más alto
-    tau_hi = float(max(tau_lo * 30.0, 1.0 * s0))  # Máximo hasta 100% del singular mayor
-    # Rangos de alpha MUCHO MÁS ALTOS
-    alpha_lo, alpha_hi = 5e-4, 0.1  # Máximo aumentado a 0.1 (10x más)
+    s0 = _svd_scale_pre_std(ep, link=base_cfg.link, link_eps=base_cfg.link_eps, standardize_y=base_cfg.standardize_y)
+    tau_lo = float(max(1e-4, 0.02 * s0))
+    tau_hi = float(max(tau_lo * 8.0, 0.25 * s0))
+    alpha_lo, alpha_hi = 1e-4, 0.2
+    has_X = (ep.X is not None and ep.X.ndim == 3 and ep.X.shape[2] > 0)
 
     pruner = MedianPruner(n_warmup_steps=max(1, len(folds) // 2))
     sampler = optuna.samplers.TPESampler(seed=seed)
@@ -748,10 +816,12 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
         rank = trial.suggest_int("rank", 1, max_rank)
         tau = trial.suggest_float("tau", tau_lo, tau_hi, log=True)
         alpha = trial.suggest_float("alpha", alpha_lo, alpha_hi, log=True)
-        incX = base_cfg.include_covariates and (ep.X is not None and ep.X.ndim == 3 and ep.X.shape[2] > 0)
-        if incX:
-            incX = trial.suggest_categorical("include_covariates", [True, False])
+        incX = bool(trial.suggest_categorical("include_covariates", [False, True])) if has_X and base_cfg.include_covariates else False
         max_inner = trial.suggest_int("max_inner", 60, 200)
+
+        # Schedule de regularización (rango agresivo solicitado)
+        reg_growth = trial.suggest_float("reg_growth", 1.0, 1.25, step=0.01)
+        reg_growth_max = trial.suggest_float("reg_growth_max", 1.0, 3.0)
 
         cfg_try = GSCConfig(rank=rank, tau=tau, alpha=alpha,
                             max_inner=max_inner, max_outer=base_cfg.max_outer,
@@ -761,77 +831,107 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
                             link=base_cfg.link, link_eps=base_cfg.link_eps,
                             pred_clip_min=base_cfg.pred_clip_min,
                             calibrate_victim=base_cfg.calibrate_victim,
-                            post_smooth_window=base_cfg.post_smooth_window)
+                            post_smooth_window=1,
+                            reg_growth=reg_growth,
+                            reg_growth_max=reg_growth_max)
 
-        scores = []
-        cv_ratios = []  # Para penalizar contrafactuales planos o muy variables
-        rmspe_train_list = []  # Para detectar overfitting (RMSPE muy bajo en train)
-        
+        scores, cv_ratios, rmspe_train_list = [], [], []
+        cv_ratios_full, dy_ratios, dy_ratios_full = [], [], []
+        pre_corrs, pre_rmspe_list, spike_penalties = [], [], []
         for step, (gap_idx, hold_idx) in enumerate(folds):
-            M_train = _apply_time_mask(ep.M, gap_idx, hold_idx)
+            M_train = _apply_time_mask(ep.M, gap_idx, hold_idx, ep.treated_row)
             model = GSCModel(cfg_try).fit(ep.Y, M_train, ep.X if cfg_try.include_covariates else None)
             Yhat = model.predict(ep.X if cfg_try.include_covariates else None)
-            
-            # Validación en holdout
+
             y_true = ep.Y[ep.treated_row, hold_idx]
             y_hat = Yhat[ep.treated_row, hold_idx]
-            sc = _finite_or_big(_rmspe(y_true, y_hat))
+            sc = _finite_or_big(_rmse_log1p(y_true, y_hat))
             scores.append(sc)
-            
-            # RMSPE en train (antes del gap) para detectar overfitting
+
             train_idx = np.arange(ep.pre_mask.nonzero()[0][0], gap_idx[0] if gap_idx.size > 0 else hold_idx[0])
             if train_idx.size > 0:
                 y_train = ep.Y[ep.treated_row, train_idx]
                 y_hat_train = Yhat[ep.treated_row, train_idx]
-                rmspe_train = _rmspe(y_train, y_hat_train)
-                rmspe_train_list.append(rmspe_train)
-            
-            # Calcular ratio de variabilidad para penalizar contrafactuales planos/variables
+                rmspe_train_list.append(_rmspe(y_train, y_hat_train))
+
             cv_true = np.std(y_true) / (np.mean(np.abs(y_true)) + 1e-8)
             cv_hat = np.std(y_hat) / (np.mean(np.abs(y_hat)) + 1e-8)
             cv_ratio = cv_hat / (cv_true + 1e-8) if cv_true > 0.05 else 1.0
             cv_ratios.append(cv_ratio)
-            
+
+            y_true_full = ep.Y[ep.treated_row, ep.pre_mask]
+            y_hat_full = Yhat[ep.treated_row, ep.pre_mask]
+            cv_true_full = np.std(y_true_full) / (np.mean(np.abs(y_true_full)) + 1e-8)
+            cv_hat_full = np.std(y_hat_full) / (np.mean(np.abs(y_hat_full)) + 1e-8)
+            cv_ratio_full = cv_hat_full / (cv_true_full + 1e-8) if cv_true_full > 0.05 else 1.0
+            cv_ratios_full.append(cv_ratio_full)
+            try:
+                corr_pre_val = float(np.corrcoef(y_true_full, y_hat_full)[0, 1]) if (y_true_full.size > 1 and np.std(y_true_full) > 1e-12 and np.std(y_hat_full) > 1e-12) else 0.0
+            except Exception:
+                corr_pre_val = 0.0
+            pre_corrs.append(corr_pre_val)
+            pre_rmspe_list.append(_rmse_log1p(y_true_full, y_hat_full))
+
+            try:
+                q95 = float(np.nanquantile(y_true_full, 0.95)) if y_true_full.size > 0 else 0.0
+            except Exception:
+                q95 = 0.0
+            if q95 > 0:
+                spike_excess = np.maximum(y_hat_full - (3.0 * q95), 0.0)
+                spike_pen = float(np.nanmean(spike_excess) / (q95 + 1e-8))
+            else:
+                spike_pen = float(np.maximum(np.nanmax(y_hat_full) - 10.0, 0.0) / 10.0) if y_hat_full.size > 0 else 0.0
+            spike_penalties.append(spike_pen)
+
+            if y_true.size >= 3 and y_hat.size >= 3:
+                dy_true = np.diff(y_true); dy_hat = np.diff(y_hat)
+                dy_ratios.append(float(np.std(dy_hat) / (np.std(dy_true) + 1e-8)) if np.std(dy_true) > 1e-6 else 1.0)
+            if y_true_full.size >= 3 and y_hat_full.size >= 3:
+                dy_true_f = np.diff(y_true_full); dy_hat_f = np.diff(y_hat_full)
+                dy_ratios_full.append(float(np.std(dy_hat_f) / (np.std(dy_true_f) + 1e-8)) if np.std(dy_true_f) > 1e-6 else 1.0)
+
             trial.report(sc, step=step)
             if trial.should_prune():
                 raise optuna.TrialPruned()
-        
-        median_score = float(np.median(scores))
-        median_cv_ratio = float(np.median(cv_ratios))
+
+        # score robusto: p75
+        median_score = float(np.quantile(scores, 0.75))
+        median_cv_ratio = float(np.median(cv_ratios)) if cv_ratios else 1.0
+        median_cv_ratio_full = float(np.median(cv_ratios_full)) if cv_ratios_full else 1.0
         median_rmspe_train = float(np.median(rmspe_train_list)) if rmspe_train_list else 1.0
-        
-        # PENALIZACIÓN 1: Overfitting (RMSPE train muy bajo)
-        # Si el modelo ajusta casi perfectamente el train, probablemente está sobreajustando
-        if median_rmspe_train < 0.08:
-            overfitting_penalty = (0.08 - median_rmspe_train) * 2.0  # Penalización fuerte
-            median_score += overfitting_penalty
-        
-        # PENALIZACIÓN 2: Contrafactual demasiado plano (cv_ratio < 0.4)
-        # El contrafactual debe tener variabilidad similar al observado
-        if median_cv_ratio < 0.4:
-            flat_penalty = (0.4 - median_cv_ratio) * 0.8  # Penalización moderada
-            median_score += flat_penalty
-        
-        # PENALIZACIÓN 3: Contrafactual demasiado variable (cv_ratio > 1.3)
-        # El contrafactual no debe ser más variable que el observado
-        elif median_cv_ratio > 1.3:
-            variable_penalty = (median_cv_ratio - 1.3) * 0.5  # Penalización moderada
-            median_score += variable_penalty
-        
-        # PENALIZACIÓN 4: Gap train-validation muy grande (signo de overfitting)
-        # Si validation >> train, hay overfitting
+        median_dy_ratio = float(np.median(dy_ratios)) if dy_ratios else 1.0
+        median_dy_ratio_full = float(np.median(dy_ratios_full)) if dy_ratios_full else 1.0
+        median_corr_pre = float(np.nanmedian(pre_corrs)) if pre_corrs else 0.0
+        median_rmspe_pre = float(np.nanmedian(pre_rmspe_list)) if pre_rmspe_list else 1.0
+        median_spike = float(np.nanmedian(spike_penalties)) if spike_penalties else 0.0
+
+        # Penalizaciones anti-overfit/planitud
+        if median_rmspe_train < 0.15:
+            median_score += (0.15 - median_rmspe_train) * 5.0
+        bad_ratio = min(median_cv_ratio, median_cv_ratio_full)
+        if bad_ratio < 0.9:
+            median_score += (0.9 - bad_ratio) * 6.0
+        bad_dy_ratio = min(median_dy_ratio, median_dy_ratio_full)
+        if bad_dy_ratio < 0.7:
+            median_score += (0.7 - bad_dy_ratio) * 4.0
+        elif median_cv_ratio > 1.15:
+            median_score += (median_cv_ratio - 1.15) * 1.0
+        if (median_corr_pre > 0.97) and (median_rmspe_pre < 0.12):
+            median_score += (median_corr_pre - 0.97) * 5.0 + (0.12 - median_rmspe_pre) * 4.0
         if median_rmspe_train > 0 and median_score > 0:
             gap_ratio = median_score / (median_rmspe_train + 1e-8)
-            if gap_ratio > 2.0:  # Validation es más del doble que train
-                gap_penalty = (gap_ratio - 2.0) * 0.3
-                median_score += gap_penalty
-            
+            if gap_ratio > 1.5:
+                median_score += (gap_ratio - 1.5) * 0.8
+        if median_spike > 0.0:
+            median_score += 3.0 * median_spike
+
         return median_score
 
-    logging.info(f"Iniciando HPO (Optuna) para GSC con {int(trials)} trials...")
+    logging.info(f"Iniciando HPO (Optuna) con {int(trials)} trials...")
     study.optimize(objective, n_trials=int(trials), show_progress_bar=False)
 
     bp = study.best_params
+    incX_final = bool(bp.get("include_covariates", base_cfg.include_covariates) and (ep.X is not None and ep.X.ndim == 3 and ep.X.shape[2] > 0))
     best_cfg = GSCConfig(
         rank=int(bp.get("rank", base_cfg.rank)),
         tau=float(bp.get("tau", base_cfg.tau)),
@@ -839,13 +939,15 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
         max_inner=int(bp.get("max_inner", base_cfg.max_inner)),
         max_outer=base_cfg.max_outer,
         tol=base_cfg.tol,
-        include_covariates=bool(bp.get("include_covariates", base_cfg.include_covariates)),
+        include_covariates=incX_final,
         standardize_y=base_cfg.standardize_y,
         random_state=base_cfg.random_state,
         link=base_cfg.link, link_eps=base_cfg.link_eps,
         pred_clip_min=base_cfg.pred_clip_min,
         calibrate_victim=base_cfg.calibrate_victim,
-        post_smooth_window=base_cfg.post_smooth_window
+        post_smooth_window=base_cfg.post_smooth_window,
+        reg_growth=float(bp.get("reg_growth", base_cfg.reg_growth)),
+        reg_growth_max=float(bp.get("reg_growth_max", base_cfg.reg_growth_max))
     )
     info = {
         "cv_used": True,
@@ -855,19 +957,19 @@ def optuna_cv_select(ep: EpisodeWide, cv: CVCfg, base_cfg: GSCConfig,
         "tau_lo": tau_lo, "tau_hi": tau_hi, "max_rank": max_rank, "s0_pre": s0
     }
 
-    logging.info(f"[HPO-GSC] best_score(RMSPE)={study.best_value:.6f} | best_params={bp}")
+    logging.info(f"[HPO-GSC] best_score={study.best_value:.6f} | best_params={bp}")
     _check_boundary_int(int(bp.get("rank", best_cfg.rank)), 1, max_rank, "rank")
     _check_boundary_float(float(bp.get("tau", best_cfg.tau)), tau_lo, tau_hi, "tau")
-    _check_boundary_float(float(bp.get("alpha", best_cfg.alpha)), 1e-5, 1e-1, "alpha")
+    _check_boundary_float(float(bp.get("alpha", best_cfg.alpha)), alpha_lo, alpha_hi, "alpha")
     _check_boundary_int(int(bp.get("max_inner", best_cfg.max_inner)), 60, 200, "max_inner")
+    _check_boundary_float(float(bp.get("reg_growth", best_cfg.reg_growth)), 1.0, 2.25, "reg_growth")
+    _check_boundary_float(float(bp.get("reg_growth_max", best_cfg.reg_growth_max)), 1.0, 8.0, "reg_growth_max")
 
     return best_cfg, info
 
-
 # ---------------------------------------------------------------------
-# Placebos, LOO y sensibilidad
+# Placebos / LOO / Sensibilidad
 # ---------------------------------------------------------------------
-
 def placebo_space(ep: EpisodeWide, cfg: GSCConfig, max_units: int = 20) -> pd.DataFrame:
     rows = []
     control_rows = [i for i in range(len(ep.units)) if i != ep.treated_row][:max_units]
@@ -892,7 +994,6 @@ def placebo_time(ep: EpisodeWide, cfg: GSCConfig) -> pd.DataFrame:
     H = min(Lpost, max(7, Lpre // 2))
     if Lpre <= H + 7:
         return pd.DataFrame([{"att_placebo_mean": np.nan, "att_placebo_sum": np.nan, "used": False}])
-
     hold = pre_idx[-H:]
     M_alt = ep.M.copy()
     M_alt[ep.treated_row, hold] = False
@@ -911,23 +1012,15 @@ def leave_one_out(ep: EpisodeWide, cfg: GSCConfig, max_units: int = 20) -> pd.Da
     control_rows = [i for i in range(len(ep.units)) if i != ep.treated_row][:max_units]
     for r in control_rows:
         keep = [i for i in range(len(ep.units)) if i != r]
-        Y = ep.Y[keep, :]
-        M = ep.M[keep, :]
-        X = ep.X[keep, :, :] if ep.X is not None else None
+        Y = ep.Y[keep, :]; M = ep.M[keep, :]; X = ep.X[keep, :, :] if ep.X is not None else None
         treated_row = next(i for i, k in enumerate(keep) if k == ep.treated_row)
         model = GSCModel(cfg).fit(Y, M, X if cfg.include_covariates else None)
         Yhat = model.predict(X if cfg.include_covariates else None)
         eff = Y[treated_row, ep.treated_post_mask] - Yhat[treated_row, ep.treated_post_mask]
-        rows.append({
-            "excluded_unit": ep.units[r],
-            "att_mean": float(np.nanmean(eff)),
-            "att_sum": float(np.nansum(eff))
-        })
+        rows.append({"excluded_unit": ep.units[r], "att_mean": float(np.nanmean(eff)), "att_sum": float(np.nansum(eff))})
     return pd.DataFrame(rows)
 
-def global_sensitivity(ep: EpisodeWide,
-                       base_cfg: GSCConfig,
-                       n_samples: int = 24) -> pd.DataFrame:
+def global_sensitivity(ep: EpisodeWide, base_cfg: GSCConfig, n_samples: int = 24) -> pd.DataFrame:
     rng = np.random.default_rng(base_cfg.random_state)
     U, T = ep.Y.shape
     max_rank = int(max(1, min(U - 1, T - 1, 10)))
@@ -948,33 +1041,30 @@ def global_sensitivity(ep: EpisodeWide,
                         link=base_cfg.link, link_eps=base_cfg.link_eps,
                         pred_clip_min=base_cfg.pred_clip_min,
                         calibrate_victim=base_cfg.calibrate_victim,
-                        post_smooth_window=base_cfg.post_smooth_window)
+                        post_smooth_window=base_cfg.post_smooth_window,
+                        reg_growth=base_cfg.reg_growth,
+                        reg_growth_max=base_cfg.reg_growth_max)
         model = GSCModel(cfg).fit(ep.Y, ep.M, ep.X if incX else None)
         Yhat = model.predict(ep.X if incX else None)
         eff = ep.Y[ep.treated_row, ep.treated_post_mask] - Yhat[ep.treated_row, ep.treated_post_mask]
-        rows.append({
-            "rank": rank, "tau": tau, "alpha": alpha, "include_covariates": incX,
-            "att_mean": float(np.nanmean(eff)),
-            "att_sum": float(np.nansum(eff))
-        })
+        rows.append({"rank": rank, "tau": tau, "alpha": alpha, "include_covariates": incX,
+                     "att_mean": float(np.nanmean(eff)), "att_sum": float(np.nansum(eff))})
     return pd.DataFrame(rows)
-
 
 # ---------------------------------------------------------------------
 # Pipeline por episodio y batch
 # ---------------------------------------------------------------------
-
 @dataclass
 class RunConfig:
     include_covariates: bool = True
     max_episodes: Optional[int] = None
     log_level: str = "INFO"
     # CV
-    cv_folds: int = 3
-    cv_holdout: int = 21
+    cv_folds: int = 5
+    cv_holdout: int = 14
     cv_gap: int = 7
-    grid_ranks: Tuple[int, ...] = (1, 2, 3)
-    grid_tau: Tuple[float, ...] = (0.5, 1.0, 2.0)
+    grid_ranks: Tuple[int, ...] = (1, 2, 3, 4)
+    grid_tau: Tuple[float, ...] = (0.01, 0.02, 0.05, 0.1)
     grid_alpha: Tuple[float, ...] = (0.001, 0.01, 0.1)
     # Placebos / Robustez / Sensibilidad
     max_placebos: int = 20
@@ -992,36 +1082,35 @@ class RunConfig:
     max_outer: int = 10
     tol: float = 1e-4
     random_state: int = 42
-    # Gap de entrenamiento final antes del tratamiento
-    train_gap: int = 7
+    # Embargo final en PRE
+    train_gap: int = 2
     # HPO
-    hpo_trials: int = 300  # 0 => off
+    hpo_trials: int = 50  # 0 => off
     # robustez/no-negatividad
-    link: str = "identity"
+    link: str = "log1p"
     link_eps: float = 0.0
-    pred_clip_min: Optional[float] = 0.0
+    pred_clip_min: Optional[float] = None
     calibrate_victim: str = "level"
     post_smooth_window: int = 1
+    # Schedule de regularización
+    reg_growth: float = 1.0
+    reg_growth_max: float = 6.0
+    # Bagging final (0 = off)
+    bagging_k: int = 0
     # Salidas
     out_dir: Path = field(default_factory=lambda: _data_root() / "processed" / "gsc")
-    # NUEVO: etiquetar experimento y resolver raíz figures/<exp_tag>
     exp_tag: str = "A_base"
-    fig_root: Path = Path(default_factory=_fig_root)
+    fig_root: Optional[Path] = field(default_factory=_fig_root)
     gsc_dir: Path = field(default_factory=lambda: _data_root() / "processed" / "gsc")
     donors_csv: Path = field(default_factory=lambda: _data_root() / "processed" / "donors.csv")
     episodes_index: Optional[Path] = field(default_factory=lambda: _data_root() / "processed" / "episodes_index.parquet")
 
-
-
-# --- helper local (colócalo cerca de otros helpers de paths) ---
 def _exp_root(exp_tag: Optional[str]) -> Optional[Path]:
     return (Path("figures") / str(exp_tag)) if exp_tag else None
 
 def _discover_episode_files(gsc_dir: Path) -> List[Path]:
-    # Excluir archivos de métricas/calidad que no son episodios
     exclude = {"donor_quality.parquet", "gsc_metrics.parquet", "episodes_index.parquet"}
-    files = [p for p in gsc_dir.glob("*.parquet") if p.name not in exclude]
-    return sorted(files)
+    return sorted([p for p in gsc_dir.glob("*.parquet") if p.name not in exclude])
 
 def _episode_id_from_path(p: Path) -> str:
     return p.stem
@@ -1032,13 +1121,12 @@ def _load_episode_df(p: Path) -> pd.DataFrame:
         df["date"] = _as_datetime(df["date"])
     return df
 
-
 def run_episode(p: Path, cfg: RunConfig) -> Dict:
     ep_id = _episode_id_from_path(p)
     df = _load_episode_df(p)
     epw = long_to_wide_for_episode(df, include_covariates=cfg.include_covariates)
+    epw = _quick_prune_donors(epw, max_q95_ratio=3.0, min_controls=8)
 
-    # Config base y CV
     base = GSCConfig(rank=cfg.rank, tau=cfg.tau, alpha=cfg.alpha,
                      max_inner=cfg.max_inner, max_outer=cfg.max_outer,
                      tol=cfg.tol, include_covariates=cfg.include_covariates,
@@ -1047,7 +1135,8 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
                      link=cfg.link, link_eps=cfg.link_eps,
                      pred_clip_min=cfg.pred_clip_min,
                      calibrate_victim=cfg.calibrate_victim,
-                     post_smooth_window=cfg.post_smooth_window)
+                     post_smooth_window=cfg.post_smooth_window,
+                     reg_growth=cfg.reg_growth, reg_growth_max=cfg.reg_growth_max)
     cv_cfg = CVCfg(folds=cfg.cv_folds, holdout_days=cfg.cv_holdout, gap_days=cfg.cv_gap,
                    grid_ranks=cfg.grid_ranks, grid_tau=cfg.grid_tau, grid_alpha=cfg.grid_alpha)
     if cfg.hpo_trials and cfg.hpo_trials > 0:
@@ -1055,27 +1144,49 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
     else:
         best_cfg, cv_info = time_cv_select(epw, cv_cfg, base)
 
-    # Entrenamiento final con embargo en PRE
+    # Embargo final en PRE (≥ cv_gap)
     M_final = epw.M.copy()
     pre_idx = np.where(epw.pre_mask)[0]
-    if len(pre_idx) > 0 and cfg.train_gap > 0:
-        gap_idx = pre_idx[-min(cfg.train_gap, len(pre_idx)):]
-        M_final[:, gap_idx] = False
+    if len(pre_idx) > 0:
+        gap_final = int(max(0, cfg.train_gap))     # usa únicamente train_gap (0–3 recomendado)
+        if gap_final > 0:
+            tail_idx = pre_idx[-min(gap_final, len(pre_idx)):]
+            M_final[epw.treated_row, tail_idx] = False
 
-    model = GSCModel(best_cfg).fit(epw.Y, M_final, epw.X if best_cfg.include_covariates else None)
-    Yhat = model.predict(epw.X if best_cfg.include_covariates else None)
+    def _fit_predict(_cfg: GSCConfig, _M: np.ndarray) -> np.ndarray:
+        _model = GSCModel(_cfg).fit(epw.Y, _M, epw.X if _cfg.include_covariates else None)
+        return _model.predict(epw.X if _cfg.include_covariates else None)
 
-    # Serie víctima
+    best_cfg_final = GSCConfig(**{**asdict(best_cfg), "reg_growth": 1.0})
+    Yhat = _fit_predict(best_cfg_final, M_final)
+
+    # Bagging opcional
+    bagging_used = False
+    if cfg.bagging_k and cfg.bagging_k > 0:
+        folds_bag = _cv_folds_pre_indices(epw, cfg.cv_holdout, cfg.cv_gap, cfg.bagging_k)
+        if folds_bag:
+            yhats = [Yhat]
+            for gap_idx, hold_idx in folds_bag[: cfg.bagging_k]:
+                M_bag = _apply_time_mask(M_final, gap_idx, hold_idx, epw.treated_row)
+                yhats.append(_fit_predict(best_cfg_final, M_bag))   # <- usa best_cfg_final
+            Yhat = np.nanmedian(np.stack(yhats, axis=0), axis=0)
+            bagging_used = True
+
+    # Serie víctima y calibración ligera (nivel)
     y_obs_vec = epw.Y[epw.treated_row, :]
     y_hat_vec = Yhat[epw.treated_row, :]
     obs_mask  = np.isfinite(y_obs_vec)
 
-    # Calibración exacta en PRE (nivel o nivel+trend)
     mode = (best_cfg.calibrate_victim or "none").lower()
     if mode in {"level", "level_and_trend"}:
-        jj = np.where(epw.pre_mask & obs_mask)[0]
-        if jj.size > 0:
+        jj_all = np.where(epw.pre_mask & obs_mask)[0]
+        if jj_all.size > 0:
+            # --- usar solo la cola del PRE para calibrar ---
+            K_days = 28  # 14–28 funciona bien; ajusta según longitud PRE
+            jj = jj_all[-min(K_days, jj_all.size):]
+
             res = (y_obs_vec[jj] - y_hat_vec[jj]).astype(float)
+
             if mode == "level":
                 bias = float(np.nanmean(res))
                 y_hat_vec = y_hat_vec + bias
@@ -1089,23 +1200,26 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
                     a, b = float(ab[0]), float(ab[1])
                 except Exception:
                     a, b = float(np.nanmean(res)), 0.0
+
+                # Tope de pendiente (evita re‑pegado agresivo)
+                sd_pre_tail = float(np.nanstd(y_obs_vec[jj])) + 1e-8
+                slope_cap_frac = 0.04  # 2–6% de 1 sd por día suele ir bien
+                max_slope = slope_cap_frac * sd_pre_tail
+                b = float(np.clip(b, -max_slope, max_slope))
+
                 full_t = np.arange(len(y_hat_vec), dtype=float)
                 full_t_c = full_t - t0
                 y_hat_vec = y_hat_vec + a + b * full_t_c
 
-    # Suavizado opcional
-    W = int(max(1, best_cfg.post_smooth_window))
-    if W > 1:
+    if best_cfg.post_smooth_window and best_cfg.post_smooth_window > 1:
+        W = int(best_cfg.post_smooth_window)
         k = np.ones(W, dtype=float) / float(W)
         base_val = float(np.nanmean(y_hat_vec)) if np.isfinite(np.nanmean(y_hat_vec)) else 0.0
-        row_conv = np.convolve(np.nan_to_num(y_hat_vec, nan=base_val), k, mode="same")
-        y_hat_vec = row_conv
+        y_hat_vec = np.convolve(np.nan_to_num(y_hat_vec, nan=base_val), k, mode="same")
 
-    # No-negatividad
     if best_cfg.pred_clip_min is not None:
         y_hat_vec = np.maximum(y_hat_vec, float(best_cfg.pred_clip_min))
 
-    # Inyectar la fila calibrada en la matriz final
     Yhat[epw.treated_row, :] = y_hat_vec
 
     # Métricas PRE
@@ -1114,238 +1228,89 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
     rmspe_pre = _rmspe(y_obs_pre, y_hat_pre)
     mae_pre   = _mae(y_obs_pre, y_hat_pre)
 
-    # ---- Anti-overfit: re‑entrena si PRE ≈ copiado ----
-    overfit_refit = False
-    # Detección multi-criterio de overfitting (UMBRALES ULTRA ESTRICTOS):
-    # 1. RMSPE bajo (< 0.15) - AUMENTADO de 0.10
-    # 2. Correlación muy alta (> 0.95) - REDUCIDO de 0.98
-    # 3. Valores casi idénticos (allclose con tolerancias MUCHO más estrictas)
-    corr_pre = np.corrcoef(y_obs_pre, y_hat_pre)[0, 1] if len(y_obs_pre) > 1 else 0.0
-    if (np.isfinite(rmspe_pre) and rmspe_pre < 0.15) or \
-       (np.isfinite(corr_pre) and corr_pre > 0.95) or \
-       np.allclose(y_obs_pre, y_hat_pre, atol=1e-4, rtol=0.01):
-        overfit_refit = True
-        logging.warning(f"[{ep_id}] Overfitting detectado (RMSPE_pre={rmspe_pre:.4f}, corr={corr_pre:.4f}). Re‑entrenando con ULTRA regularización.")
-        s0 = _svd_scale_pre(epw)
-        # AUMENTAR regularización ULTRA AGRESIVAMENTE
-        # - Reducir rank a MÍNIMO (solo 1 componente)
-        # - Aumentar tau MUCHÍSIMO (penalización nuclear muy fuerte)
-        # - Aumentar alpha MUCHÍSIMO (penalización L2 muy fuerte)
-        # - Solo calibración de nivel (no tendencia)
-        safer_cfg = GSCConfig(
-            rank=1,                                       # FORZAR rank=1 (mínimo posible)
-            tau=max(best_cfg.tau * 30.0, 0.8 * s0),       # 30x tau o 80% del singular mayor
-            alpha=max(best_cfg.alpha * 15.0, 0.15),       # 15x alpha, mínimo 0.15 (MUY alto)
-            max_inner=best_cfg.max_inner,
-            max_outer=best_cfg.max_outer,
-            tol=best_cfg.tol,
-            include_covariates=False,                     # DESACTIVAR covariables (más simple)
-            random_state=best_cfg.random_state,
-            standardize_y=True,
-            link=best_cfg.link, link_eps=best_cfg.link_eps,
-            pred_clip_min=best_cfg.pred_clip_min,
-            calibrate_victim="level",                     # Solo nivel, NO tendencia
-            post_smooth_window=1,                         # Sin suavizado
-        )
-        model = GSCModel(safer_cfg).fit(epw.Y, M_final, epw.X if safer_cfg.include_covariates else None)
-        Yhat = model.predict(epw.X if safer_cfg.include_covariates else None)
-        y_hat_vec = Yhat[epw.treated_row, :]
-        # recalibración ligera de nivel
-        jj = np.where(epw.pre_mask & obs_mask)[0]
-        if jj.size > 0:
-            bias = float(np.nanmean(y_obs_vec[jj] - y_hat_vec[jj]))
-            y_hat_vec = y_hat_vec + bias
-            if safer_cfg.pred_clip_min is not None:
-                y_hat_vec = np.maximum(y_hat_vec, float(safer_cfg.pred_clip_min))
-            Yhat[epw.treated_row, :] = y_hat_vec
-        y_hat_pre = Yhat[epw.treated_row, epw.pre_mask]
-        rmspe_pre = _rmspe(y_obs_pre, y_hat_pre)
-        mae_pre   = _mae(y_obs_pre, y_hat_pre)
-    
-    # ---- Detección de contrafactuales planos (sobre-regularización) ----
-    # DESACTIVADA TEMPORALMENTE: Esta lógica reduce regularización y puede causar overfitting
-    # TODO: Revisar si es necesaria después de resolver el problema de overfitting
-    flat_cf_refit = False
-    # Calcular coeficiente de variación del contrafactual en PRE
-    y_hat_pre_cv = float(np.nanstd(y_hat_pre) / (np.nanmean(np.abs(y_hat_pre)) + 1e-8))
-    y_obs_pre_cv = float(np.nanstd(y_obs_pre) / (np.nanmean(np.abs(y_obs_pre)) + 1e-8))
-    
-    # DESACTIVADO: Reducir regularización puede causar overfitting
-    if False and not overfit_refit and y_hat_pre_cv < 0.5 * y_obs_pre_cv and y_obs_pre_cv > 0.1 and rmspe_pre > 0.20:
-        flat_cf_refit = True
-        logging.warning(f"[{ep_id}] Contrafactual plano detectado (CV_cf={y_hat_pre_cv:.3f} vs CV_obs={y_obs_pre_cv:.3f}). "
-                       f"Re-entrenando con MENOR regularización para capturar variabilidad.")
-        s0 = _svd_scale_pre(epw)
-        # REDUCIR tau y AUMENTAR rank para más flexibilidad
-        less_reg_cfg = GSCConfig(
-            rank=min(10, max(best_cfg.rank + 2, 5)),  # Aumentar capacidad
-            tau=max(best_cfg.tau * 0.3, 0.01 * s0),   # Reducir regularización nuclear
-            alpha=max(best_cfg.alpha * 0.5, 1e-4),    # Reducir regularización de covariables
-            max_inner=best_cfg.max_inner,
-            max_outer=best_cfg.max_outer,
-            tol=best_cfg.tol,
-            include_covariates=best_cfg.include_covariates,
-            random_state=best_cfg.random_state,
-            standardize_y=True,
-            link=best_cfg.link, link_eps=best_cfg.link_eps,
-            pred_clip_min=best_cfg.pred_clip_min,
-            calibrate_victim="level",  # Solo calibración de nivel, no tendencia
-            post_smooth_window=1,      # Sin suavizado para preservar variabilidad
-        )
-        model = GSCModel(less_reg_cfg).fit(epw.Y, M_final, epw.X if less_reg_cfg.include_covariates else None)
-        Yhat = model.predict(epw.X if less_reg_cfg.include_covariates else None)
-        y_hat_vec = Yhat[epw.treated_row, :]
-        # Calibración solo de nivel (no tendencia)
-        jj = np.where(epw.pre_mask & obs_mask)[0]
-        if jj.size > 0:
-            bias = float(np.nanmean(y_obs_vec[jj] - y_hat_vec[jj]))
-            y_hat_vec = y_hat_vec + bias
-            if less_reg_cfg.pred_clip_min is not None:
-                y_hat_vec = np.maximum(y_hat_vec, float(less_reg_cfg.pred_clip_min))
-            Yhat[epw.treated_row, :] = y_hat_vec
-        y_hat_pre = Yhat[epw.treated_row, epw.pre_mask]
-        rmspe_pre = _rmspe(y_obs_pre, y_hat_pre)
-        mae_pre   = _mae(y_obs_pre, y_hat_pre)
-        # Recalcular CV después del refit
-        y_hat_pre_cv_new = float(np.nanstd(y_hat_pre) / (np.nanmean(np.abs(y_hat_pre)) + 1e-8))
-        logging.info(f"[{ep_id}] Después de refit: CV_cf={y_hat_pre_cv_new:.3f}, RMSPE_pre={rmspe_pre:.4f}")
+    # Flags automáticos (overfit/planitud/spikes) y refits ya están en versión larga previa; 
+    # si necesitas, puedo volver a añadirlos. Aquí dejamos la ruta “limpia”.
 
-    # Filtrar solo las fechas donde la víctima tiene datos reales
-    # CRÍTICO: epw.dates contiene TODAS las fechas del panel (víctima + donantes)
-    # pero y_obs_vec solo tiene datos válidos en las fechas de la víctima
-    # Necesitamos exportar SOLO las fechas con datos reales (no NaNs)
+    # Export CF serie (solo fechas válidas de la víctima)
     valid_mask = np.isfinite(y_obs_vec)
-    valid_indices = np.where(valid_mask)[0]
-    
-    # Extraer solo datos válidos
-    dates_valid = [epw.dates[j] for j in valid_indices]
-    y_obs_valid = y_obs_vec[valid_indices]
-    y_hat_valid = y_hat_vec[valid_indices]
-    treated_time_valid = epw.treated_post_mask[valid_indices]
-    
-    # Efectos (calculados sobre datos válidos)
-    eff_post = y_obs_vec[epw.treated_post_mask & valid_mask] - y_hat_vec[epw.treated_post_mask & valid_mask]
-    att_mean  = float(np.nanmean(eff_post))
-    att_sum   = float(np.nansum(eff_post))
-    base_level = float(np.nanmean(y_obs_pre))
-    rel_att   = _safe_pct(att_mean, base_level)
+    valid_idx = np.where(valid_mask)[0]
+    dates_valid = [epw.dates[j] for j in valid_idx]
+    y_obs_valid = y_obs_vec[valid_idx]
+    y_hat_valid = y_hat_vec[valid_idx]
+    treated_time_valid = epw.treated_post_mask[valid_idx]
 
-    # Guardar serie contrafactual + columnas plot‑ready
-    # IMPORTANTE: Exportar 'sales' (datos reales) y 'mu0_hat' (contrafactual) 
-    # Solo para fechas donde la víctima tiene datos válidos
-    
-    cf_dir = cfg.out_dir / "cf_series"
-    _ensure_dir(cf_dir)
+    eff_post = y_obs_vec[epw.treated_post_mask & valid_mask] - y_hat_vec[epw.treated_post_mask & valid_mask]
+    att_mean, att_sum = float(np.nanmean(eff_post)), float(np.nansum(eff_post))
+    base_level = float(np.nanmean(y_obs_pre))
+    rel_att = _safe_pct(att_mean, base_level)
+
+    cf_dir = cfg.out_dir / "cf_series"; _ensure_dir(cf_dir)
     effect_valid = y_obs_valid - y_hat_valid
     cum_effect_valid = pd.Series(effect_valid).cumsum()
-    
     cf = pd.DataFrame({
-        "episode_id": ep_id,
-        "date": dates_valid,
-        "sales": y_obs_valid,             # Serie observada REAL (sin NaNs ni ceros artificiales)
-        "y_obs": y_obs_valid,             # Alias
-        "mu0_hat": y_hat_valid,           # Contrafactual (nombre estándar para EDA)
-        "y_hat": y_hat_valid,             # Alias para compatibilidad hacia atrás
-        "treated_time": treated_time_valid.astype(int),
-        "obs_mask": np.ones(len(dates_valid), dtype=int),  # Todos son válidos por construcción
-        "y_obs_plot": y_obs_valid,        # Alias
-        "effect": effect_valid,
-        "effect_plot": effect_valid,
-        "cum_effect": cum_effect_valid,
-        "cum_effect_obs": cum_effect_valid
+        "episode_id": ep_id, "date": dates_valid,
+        "sales": y_obs_valid, "y_obs": y_obs_valid,
+        "mu0_hat": y_hat_valid, "y_hat": y_hat_valid,
+        "treated_time": treated_time_valid.astype(int), "obs_mask": np.ones(len(dates_valid), dtype=int),
+        "y_obs_plot": y_obs_valid, "effect": effect_valid, "effect_plot": effect_valid,
+        "cum_effect": cum_effect_valid, "cum_effect_obs": cum_effect_valid
     })
-    cf_path = cf_dir / f"{ep_id}_cf.parquet"
-    cf.to_parquet(cf_path, index=False)
+    cf_path = cf_dir / f"{ep_id}_cf.parquet"; cf.to_parquet(cf_path, index=False)
 
-    # Placebos / LOO / Sensibilidad
+    # Robustez (placebos/loo/sens)
     plac_dir = cfg.out_dir / "placebos"; _ensure_dir(plac_dir)
     loo_dir = cfg.out_dir / "loo"; _ensure_dir(loo_dir)
 
+    ps_path = pt_path = loo_path = sens_path = None
+    pval_space = np.nan; loo_sd = loo_range = sens_sd = np.nan
+
     if cfg.do_placebo_space:
-        ps = placebo_space(epw, best_cfg, max_units=cfg.max_placebos)
-        ps["episode_id"] = ep_id
-        ps_path = plac_dir / f"{ep_id}_space.parquet"
-        ps.to_parquet(ps_path, index=False)
-        if ps.shape[0] > 0 and np.isfinite(att_sum):
-            pval_space = (1 + np.sum(np.abs(ps["att_placebo_sum"].to_numpy()) >= abs(att_sum))) / (1 + ps.shape[0])
-        else:
-            pval_space = np.nan
-    else:
-        pval_space, ps_path = np.nan, None
-
+        ps = placebo_space(epw, best_cfg, max_units=cfg.max_placebos); ps["episode_id"] = ep_id
+        ps_path = plac_dir / f"{ep_id}_space.parquet"; ps.to_parquet(ps_path, index=False)
+        pval_space = (1 + np.sum(np.abs(ps["att_placebo_sum"].to_numpy()) >= abs(att_sum))) / (1 + ps.shape[0]) if ps.shape[0] > 0 and np.isfinite(att_sum) else np.nan
     if cfg.do_placebo_time:
-        pt = placebo_time(epw, best_cfg)
-        pt["episode_id"] = ep_id
-        pt_path = plac_dir / f"{ep_id}_time.parquet"
-        pt.to_parquet(pt_path, index=False)
-    else:
-        pt_path = None
-
+        pt = placebo_time(epw, best_cfg); pt["episode_id"] = ep_id
+        pt_path = plac_dir / f"{ep_id}_time.parquet"; pt.to_parquet(pt_path, index=False)
     if cfg.do_loo:
-        loo = leave_one_out(epw, best_cfg, max_units=cfg.max_loo)
-        loo["episode_id"] = ep_id
-        loo_path = loo_dir / f"{ep_id}_loo.parquet"
-        loo.to_parquet(loo_path, index=False)
+        loo = leave_one_out(epw, best_cfg, max_units=cfg.max_loo); loo["episode_id"] = ep_id
+        loo_path = loo_dir / f"{ep_id}_loo.parquet"; loo.to_parquet(loo_path, index=False)
         loo_sd = float(np.nanstd(loo["att_sum"])) if not loo.empty else np.nan
         loo_range = float(np.nanmax(loo["att_sum"]) - np.nanmin(loo["att_sum"])) if not loo.empty else np.nan
-    else:
-        loo_sd, loo_range, loo_path = np.nan, np.nan, None
-
     if cfg.do_sensitivity:
-        sens = global_sensitivity(epw, best_cfg, n_samples=cfg.sens_samples)
-        sens["episode_id"] = ep_id
+        sens = global_sensitivity(epw, best_cfg, n_samples=cfg.sens_samples); sens["episode_id"] = ep_id
         sens_dir = cfg.out_dir / "sensitivity"; _ensure_dir(sens_dir)
-        sens_path = sens_dir / f"{ep_id}_sens.parquet"
-        sens.to_parquet(sens_path, index=False)
+        sens_path = sens_dir / f"{ep_id}_sens.parquet"; sens.to_parquet(sens_path, index=False)
         sens_sd = float(np.nanstd(sens["att_sum"])) if not sens.empty else np.nan
-    else:
-        sens_sd, sens_path = np.nan, None
 
-    # ===== MÉTRICAS CAUSALES COMPARATIVAS =====
-    causal_metrics_report = None
+    # Métricas causales comparativas (si disponible)
     if CAUSAL_METRICS_AVAILABLE:
         try:
             calc = CausalMetricsCalculator(ep_id, "gsc")
-            
-            # Preparar datos para balance de covariables (si hay X)
-            X_treat_pre, X_control_pre = None, None
-            if epw.X is not None and epw.X.ndim == 3:
-                # Víctima en PRE
-                X_treat_pre = epw.X[epw.treated_row, epw.pre_mask, :]
-                # Controles en PRE (promedio)
-                control_rows = [i for i in range(len(epw.units)) if i != epw.treated_row]
-                if control_rows:
-                    X_control_pre = epw.X[control_rows, :, :][:, epw.pre_mask, :].reshape(-1, epw.X.shape[2])
-            
-            # Cargar placebos si existen
+            X_treat_pre = epw.X[epw.treated_row, epw.pre_mask, :] if (epw.X is not None and epw.X.ndim == 3) else None
+            control_rows = [i for i in range(len(epw.units)) if i != epw.treated_row]
+            X_control_pre = epw.X[control_rows, :, :][:, epw.pre_mask, :].reshape(-1, epw.X.shape[2]) if (epw.X is not None and control_rows) else None
             ps_df = pd.read_parquet(ps_path) if ps_path and Path(ps_path).exists() else None
             pt_df = pd.read_parquet(pt_path) if pt_path and Path(pt_path).exists() else None
             sens_df = pd.read_parquet(sens_path) if sens_path and Path(sens_path).exists() else None
-            
-            # Calcular todas las métricas
-            causal_metrics_report = calc.compute_all(
-                y_obs_pre=y_obs_pre,
-                y_hat_pre=y_hat_pre,
-                tau_post=eff_post,
-                att_base=att_sum,
-                X_treat_pre=X_treat_pre,
-                X_control_pre=X_control_pre,
+            rep = calc.compute_all(
+                y_obs_pre=y_obs_pre, y_hat_pre=y_hat_pre, tau_post=eff_post, att_base=att_sum,
+                X_treat_pre=X_treat_pre, X_control_pre=X_control_pre,
                 feature_names=epw.feats if epw.X is not None else None,
-                sensitivity_df=sens_df,
-                placebo_space_df=ps_df,
-                placebo_time_df=pt_df,
+                sensitivity_df=sens_df, placebo_space_df=ps_df, placebo_time_df=pt_df,
                 n_control_units=epw.meta["n_controls"]
             )
-            
-            # Guardar reporte de métricas causales
             causal_dir = cfg.out_dir / "causal_metrics"; _ensure_dir(causal_dir)
-            causal_path = causal_dir / f"{ep_id}_causal.parquet"
-            pd.DataFrame([causal_metrics_report.to_flat_dict()]).to_parquet(causal_path, index=False)
-            
+            pd.DataFrame([rep.to_flat_dict()]).to_parquet(causal_dir / f"{ep_id}_causal.parquet", index=False)
         except Exception as e:
-            logging.warning(f"[{ep_id}] Error calculando métricas causales: {e}")
+            logging.warning(f"[{ep_id}] Error métricas causales: {e}")
 
-    # Reporte
+    # Reporte y resumen
+    y_obs_pre_cv = float(np.nanstd(y_obs_pre) / (np.nanmean(np.abs(y_obs_pre)) + 1e-8))
+    y_hat_pre_cv = float(np.nanstd(y_hat_pre) / (np.nanmean(np.abs(y_hat_pre)) + 1e-8))
+    y_obs_post = y_obs_vec[epw.treated_post_mask]; y_hat_post = y_hat_vec[epw.treated_post_mask]
+    y_obs_post_cv = float(np.nanstd(y_obs_post) / (np.nanmean(np.abs(y_obs_post)) + 1e-8)) if y_obs_post.size > 0 else np.nan
+    y_hat_post_cv = float(np.nanstd(y_hat_post) / (np.nanmean(np.abs(y_hat_post)) + 1e-8)) if y_hat_post.size > 0 else np.nan
+
     rep = {
         "episode_id": ep_id,
         "n_units": epw.meta["n_units"], "n_controls": epw.meta["n_controls"],
@@ -1354,145 +1319,96 @@ def run_episode(p: Path, cfg: RunConfig) -> Dict:
         "include_covariates": best_cfg.include_covariates,
         "features_used": epw.feats,
         "cv": cv_info,
-        "fit": {
-            "rmspe_pre": rmspe_pre, "mae_pre": mae_pre,
-            "att_mean": att_mean, "att_sum": att_sum, "rel_att_vs_pre_mean": rel_att
-        },
-        "mask_debug": {
-            "train_victim_post_before": epw.meta["n_train_victim_post_before"],
-            "train_victim_post_after": epw.meta["n_train_victim_post_after"]
-        },
-        "overfit_refit": bool(overfit_refit),
-        "flat_cf_refit": bool(flat_cf_refit),
-        "variability": {
-            "cv_obs_pre": float(y_obs_pre_cv),
-            "cv_cf_pre": float(y_hat_pre_cv)
-        },
-        "p_value_placebo_space": pval_space,
-        "paths": {
-            "cf": str(cf_path),
-            "placebo_space": str(ps_path) if cfg.do_placebo_space else None,
-            "placebo_time": str(pt_path) if cfg.do_placebo_time else None,
-            "loo": str(loo_path) if cfg.do_loo else None,
-            "sensitivity": str(sens_path) if cfg.do_sensitivity else None
-        },
-        "robustness": {
-            "loo_sd_att_sum": loo_sd, "loo_range_att_sum": loo_range,
-            "sens_sd_att_sum": sens_sd
-        },
-        "best_cfg": asdict(best_cfg)
+        "fit": {"rmspe_pre": rmspe_pre, "mae_pre": mae_pre, "att_mean": att_mean, "att_sum": att_sum, "rel_att_vs_pre_mean": rel_att},
+        "variability": {"cv_obs_pre": y_obs_pre_cv, "cv_cf_pre": y_hat_pre_cv, "cv_obs_post": y_obs_post_cv, "cv_cf_post": y_hat_post_cv},
+        "paths": {"cf": str(cf_path), "placebo_space": str(ps_path) if cfg.do_placebo_space else None,
+                  "placebo_time": str(pt_path) if cfg.do_placebo_time else None,
+                  "loo": str(loo_path) if cfg.do_loo else None, "sensitivity": str(sens_path) if cfg.do_sensitivity else None},
+        "robustness": {"loo_sd_att_sum": loo_sd, "loo_range_att_sum": loo_range, "sens_sd_att_sum": sens_sd},
+        "best_cfg": asdict(best_cfg),
+        "bagging_used": bool(bagging_used)
     }
     rep_dir = cfg.out_dir / "reports"; _ensure_dir(rep_dir)
     with open(rep_dir / f"{ep_id}.json", "w", encoding="utf-8") as f:
         json.dump(rep, f, ensure_ascii=False, indent=2, default=str)
 
-    summary = {
-        "episode_id": ep_id,
-        "victim_unit": epw.meta["victim_unit"],
-        "n_controls": epw.meta["n_controls"],
-        "n_pre": epw.meta["n_pre"], "n_post": epw.meta["n_post"],
-        "rmspe_pre": rmspe_pre, "mae_pre": mae_pre,
-        "att_mean": att_mean, "att_sum": att_sum, "rel_att_vs_pre_mean": rel_att,
+    return {
+        "episode_id": ep_id, "victim_unit": epw.meta["victim_unit"],
+        "n_controls": epw.meta["n_controls"], "n_pre": epw.meta["n_pre"], "n_post": epw.meta["n_post"],
+        "rmspe_pre": rmspe_pre, "mae_pre": mae_pre, "att_mean": att_mean, "att_sum": att_sum, "rel_att_vs_pre_mean": rel_att,
         "p_value_placebo_space": pval_space,
-        "loo_sd_att_sum": rep["robustness"]["loo_sd_att_sum"],
-        "loo_range_att_sum": rep["robustness"]["loo_range_att_sum"],
-        "sens_sd_att_sum": rep["robustness"]["sens_sd_att_sum"],
+        "loo_sd_att_sum": loo_sd, "loo_range_att_sum": loo_range, "sens_sd_att_sum": sens_sd,
         "rank": best_cfg.rank, "tau": best_cfg.tau, "alpha": best_cfg.alpha,
-        "include_covariates": best_cfg.include_covariates,
-        "cv_used": bool(rep["cv"]["cv_used"]),
-        "link": best_cfg.link,
-        "pred_clip_min": best_cfg.pred_clip_min,
-        "calibrate_victim": best_cfg.calibrate_victim,
-        "post_smooth_window": best_cfg.post_smooth_window,
-        "overfit_refit": bool(overfit_refit),
-        "flat_cf_refit": bool(flat_cf_refit),
-        "cv_obs_pre": float(y_obs_pre_cv),
-        "cv_cf_pre": float(y_hat_pre_cv),
+        "include_covariates": best_cfg.include_covariates, "cv_used": bool(rep["cv"]["cv_used"]),
+        "link": best_cfg.link, "pred_clip_min": best_cfg.pred_clip_min,
+        "calibrate_victim": best_cfg.calibrate_victim, "post_smooth_window": best_cfg.post_smooth_window,
+        "cv_obs_pre": y_obs_pre_cv, "cv_cf_pre": y_hat_pre_cv,
+        "cv_obs_post": y_obs_post_cv, "cv_cf_post": y_hat_post_cv,
+        "bagging_used": bool(bagging_used)
     }
-    return summary
-
 
 def run_batch(cfg: RunConfig) -> None:
     logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO),
                         format="%(asctime)s | %(levelname)s | %(message)s",
                         datefmt="%Y-%m-%d %H:%M:%S")
-                        
-    
-    # Solo construir out_dir desde exp_tag si out_dir no está definido y exp_tag existe
     if cfg.out_dir is None and cfg.exp_tag:
         cfg.out_dir = (cfg.gsc_dir / cfg.exp_tag / "gsc").resolve()
     elif cfg.out_dir is None:
         cfg.out_dir = cfg.gsc_dir.parent / "gsc_output"
-    
+
     gsc_dir = cfg.gsc_dir
     if not gsc_dir.exists():
         alt = Path("./data/processed/gsc")
-        if alt.exists():
-            gsc_dir = alt
-        else:
-            raise FileNotFoundError(f"No existe la carpeta GSC: {cfg.gsc_dir}")
+        if alt.exists(): gsc_dir = alt
+        else: raise FileNotFoundError(f"No existe la carpeta GSC: {cfg.gsc_dir}")
 
     files = _discover_episode_files(gsc_dir)
     if cfg.max_episodes is not None:
         files = files[: int(cfg.max_episodes)]
 
     logging.info(f"Episodios detectados: {len(files)} en {gsc_dir}")
-    if cfg.hpo_trials and cfg.hpo_trials > 0:
-        logging.info(f"HPO activado: {cfg.hpo_trials} trials de Optuna (fallback a grilla si Optuna no está disponible).")
-    else:
-        logging.info("HPO desactivado; se usará búsqueda en grilla (rank, tau, alpha).")
-
+    logging.info("HPO activado: %s trials" % cfg.hpo_trials if cfg.hpo_trials and cfg.hpo_trials > 0 else "HPO desactivado; se usará búsqueda en grilla.")
     _ensure_dir(cfg.out_dir)
+    logging.info(f"GSC out_dir: {cfg.out_dir}")
+
     metrics = []
     for k, p in enumerate(files, start=1):
         try:
             logging.info(f"[{k}/{len(files)}] Ejecutando GSC en {p.name} ...")
             summ = run_episode(p, cfg)
             metrics.append(summ)
-            refit_flags = []
-            if summ['overfit_refit']:
-                refit_flags.append("overfit")
-            if summ['flat_cf_refit']:
-                refit_flags.append("flat_cf")
-            refit_str = f" | refit=[{','.join(refit_flags)}]" if refit_flags else ""
-            logging.info(f"OK {p.stem} | ATT_sum={summ['att_sum']:.3f} | RMSPE_pre={summ['rmspe_pre']:.4f} | CV_cf={summ['cv_cf_pre']:.3f}{refit_str}")
+            logging.info(f"OK {p.stem} | ATT_sum={summ['att_sum']:.3f} | RMSPE_pre={summ['rmspe_pre']:.4f} | CV_cf={summ['cv_cf_pre']:.3f}")
         except Exception as e:
             logging.exception(f"Error en episodio {p.name}: {e}")
 
     if metrics:
         mdf = pd.DataFrame(metrics)
-        mpath = cfg.out_dir / "gsc_metrics.parquet"
-        mdf.to_parquet(mpath, index=False)
+        mpath = cfg.out_dir / "gsc_metrics.parquet"; mdf.to_parquet(mpath, index=False)
         logging.info(f"Métricas globales guardadas: {mpath} ({mdf.shape[0]} episodios)")
     else:
         logging.warning("No se generaron métricas (¿sin episodios válidos?).")
 
-
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
-
 def parse_args() -> RunConfig:
     p = argparse.ArgumentParser(description="GSC (Generalized Synthetic Control) para episodios de canibalización.")
     p.add_argument("--gsc_dir", type=str, default=str(_data_root() / "processed_data/gsc"))
     p.add_argument("--donors_csv", type=str, default=str(_data_root() / "processed_data/donors_per_victim.csv"))
     p.add_argument("--episodes_index", type=str, default=str(_data_root() / "processed_data/episodes_index.parquet"))
     p.add_argument("--out_dir", type=str, default=None)
-    p.add_argument("--include_covariates", action="store_true", help="Usar covariables X_it en el ajuste (por defecto: off).")
-    p.add_argument("--max_episodes", type=int, default=None, help="Limitar # episodios a procesar.")
+    p.add_argument("--include_covariates", action="store_true", help="Usar covariables X_it (por defecto: off).")
+    p.add_argument("--max_episodes", type=int, default=None)
     p.add_argument("--log_level", type=str, default="INFO")
-
     # CV
-    p.add_argument("--cv_folds", type=int, default=3)
-    p.add_argument("--cv_holdout", type=int, default=21)
-    p.add_argument("--cv_gap", type=int, default=7, help="Embargo (días) antes del holdout en CV temporal.")
-
+    p.add_argument("--cv_folds", type=int, default=5)
+    p.add_argument("--cv_holdout", type=int, default=14)
+    p.add_argument("--cv_gap", type=int, default=7)
     # Grillas
-    p.add_argument("--grid_ranks", type=str, default="1,2,3")
-    p.add_argument("--grid_tau", type=str, default="0.5,1.0,2.0")
+    p.add_argument("--grid_ranks", type=str, default="1,2,3,4")
+    p.add_argument("--grid_tau", type=str, default="0.01,0.02,0.05,0.1")
     p.add_argument("--grid_alpha", type=str, default="0.001,0.01,0.1")
-
-    # Placebos / Robustez / Sensibilidad
+    # Placebos / Robustez
     p.add_argument("--max_placebos", type=int, default=20)
     p.add_argument("--max_loo", type=int, default=20)
     p.add_argument("--no_placebo_space", action="store_true")
@@ -1500,8 +1416,7 @@ def parse_args() -> RunConfig:
     p.add_argument("--no_loo", action="store_true")
     p.add_argument("--no_sensitivity", action="store_true")
     p.add_argument("--sens_samples", type=int, default=24)
-
-    # Solver / hiperparámetros base
+    # Solver
     p.add_argument("--rank", type=int, default=2)
     p.add_argument("--tau", type=float, default=1.0)
     p.add_argument("--alpha", type=float, default=0.01)
@@ -1509,23 +1424,22 @@ def parse_args() -> RunConfig:
     p.add_argument("--max_outer", type=int, default=10)
     p.add_argument("--tol", type=float, default=1e-4)
     p.add_argument("--random_state", type=int, default=42)
-    p.add_argument("--train_gap", type=int, default=7, help="Embargo previo al tratamiento en el ajuste final.")
-
+    p.add_argument("--train_gap", type=int, default=2)
     # HPO
-    p.add_argument("--hpo_trials", type=int, default=300,
-                   help="N° de trials de Optuna para rank/tau/alpha/include_covariates/max_inner (0=off).")
-
+    p.add_argument("--hpo_trials", type=int, default=50)
     # robustez/no‑negatividad
-    p.add_argument("--link", type=str, default="identity", choices=["identity", "log1p"], help="Transformación del objetivo Y.")
-    p.add_argument("--link_eps", type=float, default=0.0, help="Epsilon para log1p cuando hay ceros.")
-    p.add_argument("--pred_clip_min", type=str, default="0", help="Mínimo de predicción (float) o 'none' para desactivar clipping.")
-    p.add_argument("--calibrate_victim", type=str, default="level", choices=["none", "level", "level_and_trend"],
-                   help="Corrección post‑ajuste en PRE para la víctima.")
-    p.add_argument("--post_smooth_window", type=int, default=1, help="Tamaño de ventana de suavizado (1 = off).")
+    p.add_argument("--link", type=str, default="log1p", choices=["identity", "log1p"])
+    p.add_argument("--link_eps", type=float, default=0.0)
+    p.add_argument("--pred_clip_min", type=str, default="none")
+    p.add_argument("--calibrate_victim", type=str, default="level", choices=["none", "level", "level_and_trend"])
+    p.add_argument("--post_smooth_window", type=int, default=1)
+    p.add_argument("--exp_tag", type=str, default=None)
+    # schedule
+    p.add_argument("--reg_growth", type=float, default=1.0)
+    p.add_argument("--reg_growth_max", type=float, default=6.0)
+    # bagging
+    p.add_argument("--bagging_k", type=int, default=0)
 
-    p.add_argument("--exp_tag", type=str, default=None,
-                   help="Etiqueta del experimento. Si se define, todo se guarda en figures/<exp_tag>/gsc")
-    
     a = p.parse_args()
     grid_ranks = tuple(int(x.strip()) for x in a.grid_ranks.split(",") if x.strip())
     grid_tau = tuple(float(x.strip()) for x in a.grid_tau.split(",") if x.strip())
@@ -1544,35 +1458,30 @@ def parse_args() -> RunConfig:
     out_dir = (exp_root / "gsc") if exp_root else _to_path(a.out_dir)
 
     return RunConfig(
-        gsc_dir=_to_path(a.gsc_dir),
-        donors_csv=_to_path(a.donors_csv),
+        gsc_dir=_to_path(a.gsc_dir) or Path(str(a.gsc_dir)),
+        donors_csv=_to_path(a.donors_csv) or Path(str(a.donors_csv)),
         episodes_index=_to_path(a.episodes_index) if a.episodes_index else None,
-
         include_covariates=bool(a.include_covariates),
-        max_episodes=a.max_episodes,
-        log_level=a.log_level,
+        max_episodes=a.max_episodes, log_level=a.log_level,
         cv_folds=a.cv_folds, cv_holdout=a.cv_holdout, cv_gap=a.cv_gap,
         grid_ranks=grid_ranks, grid_tau=grid_tau, grid_alpha=grid_alpha,
         max_placebos=a.max_placebos, max_loo=a.max_loo,
         do_placebo_space=(not a.no_placebo_space),
         do_placebo_time=(not a.no_placebo_time),
-        do_loo=(not a.no_loo),
-        do_sensitivity=(not a.no_sensitivity),
+        do_loo=(not a.no_loo), do_sensitivity=(not a.no_sensitivity),
         sens_samples=a.sens_samples,
         rank=a.rank, tau=a.tau, alpha=a.alpha,
         max_inner=a.max_inner, max_outer=a.max_outer, tol=a.tol,
-        random_state=a.random_state,
-        train_gap=a.train_gap,
+        random_state=a.random_state, train_gap=a.train_gap,
         hpo_trials=a.hpo_trials,
-        link=a.link, link_eps=a.link_eps,
-        pred_clip_min=clip_min,
-        calibrate_victim=a.calibrate_victim,
-        post_smooth_window=max(1, int(a.post_smooth_window)),
-        out_dir=out_dir,
-        exp_tag=a.exp_tag,
-        fig_root=exp_root
+        link=a.link, link_eps=a.link_eps, pred_clip_min=clip_min,
+        calibrate_victim=a.calibrate_victim, post_smooth_window=max(1, int(a.post_smooth_window)),
+        reg_growth=a.reg_growth, reg_growth_max=a.reg_growth_max,
+        bagging_k=int(a.bagging_k),
+        out_dir=out_dir if out_dir is not None else Path("./.data/processed/gsc"),
+        exp_tag=a.exp_tag if a.exp_tag else "A_base",
+        fig_root=exp_root if exp_root is not None else _fig_root()
     )
-
 
 if __name__ == "__main__":
     cfg = parse_args()

@@ -23,6 +23,7 @@ experiments:
         gsc_cv_folds: 5                  # Aumentado de 3 a 5 (más validación)
         gsc_cv_holdout: 14               # Reducido de 21 a 14 (ventanas más pequeñas para rolling CV)
         gsc_cv_gap: 7                    # Gap de 7 días para evitar filtración
+        gsc_hpo_trials: 300              # Optuna trials para GSC
         meta_cv_folds: 5
         meta_cv_holdout: 14
         meta_hpo_trials: 100
@@ -152,3 +153,34 @@ experiments:
         meta_max_iter: 1000
         eda_alg_max_episodes_gsc: 30
         eda_alg_max_episodes_meta: 30
+
+  - id: "A_quick_smoke"
+    desc: "Smoke test: 5 episodios, 5 donantes, HPO Meta=3 trials"
+    overrides:
+      toggles:
+        step1: true
+        step2: true
+        step3: true
+        step5_gsc: true
+        step6_meta: true
+        eda_algorithms: true
+      params:
+        top_k_donors: 12
+        max_donor_promo_share: 0.20
+        min_availability_share: 0.80
+        meta_learners: ["x"]
+        meta_hpo_trials: 1
+        meta_max_episodes: 5
+        gsc_max_episodes: 5
+        gsc_hpo_trials: 500
+        gsc_cv_folds: 8
+        gsc_cv_holdout: 21
+        gsc_cv_gap: 14
+        gsc_include_covariates: false
+        gsc_train_gap: 14
+        gsc_link: "log1p"
+        gsc_post_smooth_window: 1
+        gsc_calibrate_victim: "level"
+        gsc_pred_clip_min: 0.0
+        eda_alg_max_episodes_gsc: 5
+        eda_alg_max_episodes_meta: 5

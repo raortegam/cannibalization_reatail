@@ -53,7 +53,7 @@ Si no hay métricas en disco, se calculan por episodio con la ventana de episode
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -854,6 +854,236 @@ def _plot_causal_metrics_comparison(causal_df: pd.DataFrame, fig_dir: Path, dpi:
 # EDA principal
 # ---------------------------------------------------------------------
 
+def _infer_exp_tag(fig_dir: Path) -> Optional[str]:
+    try:
+        parts = list(Path(fig_dir).parts)
+        for part in reversed(parts):
+            if part and part.lower() != "figures" and part.lower() != "algorithms":
+                return part
+    except Exception:
+        return None
+    return None
+
+
+def _normalize_fig_dir(cfg: EDAConfig) -> Path:
+    try:
+        p = Path(cfg.figures_dir) if cfg.figures_dir is not None else Path("figures")
+        tag = _infer_exp_tag(p)
+        if not tag and cfg.episodes_index is not None:
+            try:
+                tag = Path(cfg.episodes_index).parent.name
+            except Exception:
+                tag = None
+        if not tag and cfg.gsc_out_dir is not None:
+            try:
+                tag = Path(cfg.gsc_out_dir).parent.name
+            except Exception:
+                tag = None
+        if tag:
+            return Path("figures") / tag
+        return p
+    except Exception:
+        return Path("figures")
+
+
+def _load_donors_map_for_exp(exp_tag: str) -> pd.DataFrame:
+    try:
+        bases = [Path("./.data"), Path(".data")]  
+        for base in bases:
+            p = base / "processed_data" / "_shared_base" / "donors_per_victim.csv"
+            try:
+                if p.exists():
+                    return pd.read_csv(p)
+            except Exception:
+                continue
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _load_meta_panel_windows(exp_tag: Optional[str] = None) -> Optional[pd.DataFrame]:
+    bases = [Path("./.data"), Path(".data")]  
+    candidates = []
+    for base in bases:
+        if exp_tag:
+            candidates.append(base / "processed_meta" / exp_tag / "windows.parquet")
+        candidates.append(base / "processed_meta" / "windows.parquet")
+        if exp_tag:
+            candidates.append(base / "processed" / exp_tag / "meta" / "all_units.parquet")
+            candidates.append(base / "processed" / exp_tag / "gsc" / "meta" / "all_units.parquet")
+            candidates.append(base / "processed_data" / exp_tag / "meta" / "all_units.parquet")
+        candidates.append(base / "processed" / "meta" / "all_units.parquet")
+        candidates.append(base / "processed_data" / "meta" / "all_units.parquet")
+    for c in candidates:
+        try:
+            if c.exists():
+                df = pd.read_parquet(c)
+                return df
+        except Exception:
+            continue
+    return None
+
+
+def _read_donors_series(meta_df: Optional[pd.DataFrame],
+                        donors_uids: Set[str],
+                        date_min: pd.Timestamp,
+                        date_max: pd.Timestamp) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    if meta_df is None or meta_df.empty or not donors_uids:
+        return out
+    try:
+        df = meta_df.copy()
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df[(df["date"] >= pd.to_datetime(date_min)) & (df["date"] <= pd.to_datetime(date_max))]
+        if "unit_id" not in df.columns:
+            if {"store_nbr", "item_nbr"}.issubset(df.columns):
+                df["unit_id"] = df["store_nbr"].astype(str) + ":" + df["item_nbr"].astype(str)
+            else:
+                return out
+        df = df[df["unit_id"].isin(list(donors_uids))]
+        if df.empty or "sales" not in df.columns:
+            return out
+        for uid, sub in df.groupby("unit_id", sort=False):
+            out[str(uid)] = sub.sort_values("date")["date"].to_frame().assign(sales=pd.to_numeric(sub["sales"], errors="coerce").values)
+        return out
+    except Exception:
+        return out
+
+
+def _run_gsc_donors_overlay_for_base(cfg: EDAConfig,
+                                     episodes: pd.DataFrame,
+                                     gsc_series: Dict[str, pd.DataFrame]) -> None:
+    try:
+        fig_dir = _ensure_dir(_normalize_fig_dir(cfg))
+        exp_tag = _infer_exp_tag(fig_dir)
+        if not gsc_series:
+            return
+
+        donors_df = _load_donors_map_for_exp(exp_tag)
+        if donors_df is None or donors_df.empty:
+            try:
+                logging.getLogger("EDA_algorithms").info(
+                    "Overlay GSC con donantes omitido: donors_per_victim.csv no encontrado en ./.data o .data bajo processed_data/_shared_base",
+                )
+            except Exception:
+                pass
+            return
+
+        epi = episodes.copy()
+        if "episode_id" not in epi.columns:
+            return
+        for c in ["pre_start", "treat_start", "post_end"]:
+            if c in epi.columns:
+                epi[c] = pd.to_datetime(epi[c], errors="coerce")
+        epi["episode_id"] = epi["episode_id"].astype(str)
+        epi = epi.set_index("episode_id", drop=False)
+
+        meta_df = _load_meta_panel_windows(exp_tag)
+
+        pdf_path = fig_dir / "series_gsc_with_donors.pdf"
+        with PdfPages(pdf_path) as pdf:
+            for ep, vdf in gsc_series.items():
+                ep_id = str(ep)
+                if ep_id not in epi.index:
+                    continue
+                row = epi.loc[ep_id]
+                pre_start = pd.to_datetime(row["pre_start"]) if "pre_start" in row else None
+                treat_start = pd.to_datetime(row["treat_start"]) if "treat_start" in row else None
+                post_end = pd.to_datetime(row["post_end"]) if "post_end" in row else None
+                if pre_start is None or treat_start is None or post_end is None:
+                    continue
+
+                # Donantes del episodio
+                sub = pd.DataFrame()
+                if "episode_id" in donors_df.columns:
+                    try:
+                        sub = donors_df[donors_df["episode_id"].astype(str) == ep_id]
+                    except Exception:
+                        sub = pd.DataFrame()
+                if sub.empty and {"j_store", "j_item"}.issubset(donors_df.columns) and {"j_store", "j_item"}.issubset(epi.columns):
+                    try:
+                        js, ji = int(row["j_store"]), int(row["j_item"])
+                        sub = donors_df[(donors_df["j_store"] == js) & (donors_df["j_item"] == ji)]
+                    except Exception:
+                        sub = pd.DataFrame()
+                if sub.empty or not {"donor_store", "donor_item"}.issubset(sub.columns):
+                    continue
+                donors_uids: Set[str] = set((sub["donor_store"].astype(str) + ":" + sub["donor_item"].astype(str)).tolist())
+                if not donors_uids:
+                    continue
+
+                donors_map = _read_donors_series(meta_df, donors_uids, pre_start, post_end)
+                d = vdf.copy()
+                
+                if len(donors_map) == 0:
+                    w_, h_ = _figsize_from_orientation(cfg.orientation)
+                    fig = plt.figure(figsize=(w_, h_))
+                    gs = fig.add_gridspec(2, 1, height_ratios=[2, 1.4])
+                    ax_top = fig.add_subplot(gs[0, 0])
+                    ax_bot = fig.add_subplot(gs[1, 0])
+                    _plot_episode_series(ax_top, ax_bot, d, pre_start, treat_start, post_end,
+                                         title=f"GSC + Donors — Episodio {ep_id}")
+                    ax_top.text(0.5, 0.5, "No hay datos de donantes disponibles", 
+                               transform=ax_top.transAxes, ha='center', va='center',
+                               fontsize=12, color='red', weight='bold',
+                               bbox=dict(facecolor='white', alpha=0.8, edgecolor='red'))
+                    fig.tight_layout()
+                    png = fig_dir / f"series_gsc_with_donors_{ep_id.replace('/', '_')}.png"
+                    fig.savefig(png, dpi=cfg.dpi)
+                    pdf.savefig(fig, dpi=cfg.dpi)
+                    plt.close(fig)
+                    continue
+
+                # Estándar para víctima (obs, cf)
+                if "date" not in d.columns:
+                    continue
+                if "obs" not in d.columns:
+                    oc = _pick_col(d, _OBS_COLS)
+                    if oc:
+                        d = d.rename(columns={oc: "obs"})
+                if "cf" not in d.columns:
+                    cc = _pick_col(d, _CF_COLS)
+                    if cc:
+                        d = d.rename(columns={cc: "cf"})
+                if "effect" not in d.columns and {"obs", "cf"}.issubset(d.columns):
+                    d["effect"] = pd.to_numeric(d["obs"], errors="coerce") - pd.to_numeric(d["cf"], errors="coerce")
+                if "cum_effect" not in d.columns and "effect" in d.columns:
+                    d["cum_effect"] = (d["effect"].where(d["date"] >= treat_start, 0.0)).cumsum()
+
+                w_, h_ = _figsize_from_orientation(cfg.orientation)
+                fig = plt.figure(figsize=(w_, h_))
+                gs = fig.add_gridspec(2, 1, height_ratios=[2, 1.4])
+                ax_top = fig.add_subplot(gs[0, 0])
+                ax_bot = fig.add_subplot(gs[1, 0])
+                _plot_episode_series(ax_top, ax_bot, d, pre_start, treat_start, post_end,
+                                     title=f"GSC + Donors — Episodio {ep_id}")
+
+                # Overlay de donantes (líneas sutiles)
+                for uid, sdf in donors_map.items():
+                    sd = sdf[(sdf["date"] >= pre_start) & (sdf["date"] <= post_end)].sort_values("date")
+                    if sd.empty:
+                        continue
+                    ax_top.plot(sd["date"], sd["sales"], color="gray", alpha=0.18, linewidth=0.8)
+
+                ax_top.text(0.02, 0.98, f"Donors: {len(donors_map)}", transform=ax_top.transAxes,
+                            va="top", ha="left", fontsize=8,
+                            bbox=dict(facecolor="white", alpha=0.7, edgecolor="0.5"))
+
+                fig.tight_layout()
+                png = fig_dir / f"series_gsc_with_donors_{ep_id.replace('/', '_')}.png"
+                fig.savefig(png, dpi=cfg.dpi)
+                pdf.savefig(fig, dpi=cfg.dpi)
+                plt.close(fig)
+        try:
+            logging.getLogger("EDA_algorithms").info(
+                "PDF GSC con donantes guardado en: %s", str(pdf_path)
+            )
+        except Exception:
+            pass
+    except Exception:
+        return
+
 def _load_causal_metrics(base_dir: Path, model_type: str) -> pd.DataFrame:
     """Carga métricas causales desde carpeta causal_metrics."""
     if not base_dir:
@@ -888,8 +1118,11 @@ def run(cfg: EDAConfig) -> None:
     logger.setLevel(logging.INFO)
 
     # Carpetas de salida
-    fig_dir = _ensure_dir(Path(cfg.figures_dir))
+    fig_dir = _ensure_dir(_normalize_fig_dir(cfg))
     tbl_dir = _ensure_dir(fig_dir / "tables")
+    logger.info("EDA_algorithms: episodes_index=%s", str(cfg.episodes_index))
+    logger.info("EDA_algorithms: gsc_out_dir=%s | meta_out_root=%s", str(cfg.gsc_out_dir), str(cfg.meta_out_root))
+    logger.info("EDA_algorithms: figures_dir=%s", str(fig_dir))
 
     # 1) Cargar episodios (referencia)
     episodes = _safe_read_parquet(Path(cfg.episodes_index))
@@ -904,6 +1137,12 @@ def run(cfg: EDAConfig) -> None:
 
     # 2) Cargar métricas de GSC + Meta (para figuras resumen)
     gsc_df = _load_gsc_metrics(cfg.gsc_out_dir)
+    if cfg.gsc_out_dir:
+        gsc_mets_path = Path(cfg.gsc_out_dir) / "gsc_metrics.parquet"
+        if gsc_df.empty:
+            logger.info("Métricas GSC no disponibles en: %s", str(gsc_mets_path))
+        else:
+            logger.info("Métricas GSC cargadas desde: %s (%d filas)", str(gsc_mets_path), len(gsc_df))
     meta_dict = _load_meta_metrics(cfg.meta_out_root, cfg.meta_learners)
 
     # 3) Cobertura por episodio
@@ -1074,6 +1313,11 @@ def run(cfg: EDAConfig) -> None:
             for ep, d in dmap.items():
                 _render_one(f"Meta-{lr.upper()}", ep, d, pdf_writer=None)
 
+    try:
+        _run_gsc_donors_overlay_for_base(cfg, episodes, gsc_series)
+    except Exception:
+        pass
+
     # 8) Top episodios por |ATT_sum| (si hubo métricas)
     if not all_mets.empty and "att_sum" in all_mets.columns:
         rows: List[pd.DataFrame] = []
@@ -1148,11 +1392,3 @@ def run(cfg: EDAConfig) -> None:
     # Mensajes finales
     logger.info("EDA_algorithms completado.")
     logger.info("Cobertura guardada en: %s", str(cover_path))
-    if pdf_sum_path:
-        logger.info("Resumen PDF: %s", str(pdf_sum_path))
-    logger.info("PDFs de series generados:")
-    if gsc_series and cfg.export_pdf:
-        logger.info("  - series_gsc.pdf")
-    for lr in meta_series.keys():
-        if meta_series[lr] and cfg.export_pdf:
-            logger.info("  - series_meta_%s.pdf", lr)

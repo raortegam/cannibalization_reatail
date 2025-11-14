@@ -39,7 +39,7 @@ def main():
     
     exp_config = {
         "params": {
-            "top_k_donors": 12,
+            "top_k_donors": 9999,
             "lags_days": [7, 14, 28, 56],
             "fourier_k": 3,
             "use_stl": True,
@@ -48,7 +48,7 @@ def main():
     
     config = {
         "episodes_index": ".data/processed_data/_shared_base/episodes_index.parquet",
-        "donors_csv": ".data/processed_data/_shared_base/donors_per_victim.csv",
+        "donors_csv": ".data/processed_data/A_base/donors_per_victim.csv",
         "raw_dir": ".data/raw_data",  # Directorio, no archivo
         "out_gsc": ".data/processed/A_base/gsc",
         "out_meta": ".data/processed_meta/A_base",
