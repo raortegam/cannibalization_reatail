@@ -387,40 +387,16 @@ def _plot_episode_series(ax_top: plt.Axes,
     # Línea vertical en inicio de tratamiento
     ax_top.axvline(pd.to_datetime(treat_start), linewidth=1.0)
 
-    # ---- Panel inferior: Efecto y acumulado
+    # ---- Panel inferior: Solo efecto acumulado
     if "effect" in d.columns:
-        ax_bot.plot(d["date"], d["effect"], label="Efecto (Y - Y0)", linewidth=1.2)
-        ax_bot.set_ylabel("Efecto")
-        # Acumulado en eje secundario - solo post-tratamiento
-        if "cum_effect" in d.columns:
-            # Recalcular acumulado: 0 antes del tratamiento, acumular solo después
-            d_plot = d.copy()
-            d_plot["cum_effect_plot"] = d_plot["effect"].where(d_plot["date"] >= treat_start, 0.0).cumsum()
-            ax2 = ax_bot.twinx()
-            ax2.plot(d_plot["date"], d_plot["cum_effect_plot"], linestyle="--", label="Efecto acumulado", linewidth=1.0)
-            ax2.set_ylabel("Acumulado")
-            
-            # Alinear el cero de ambos ejes
-            y1_min, y1_max = ax_bot.get_ylim()
-            y2_min, y2_max = ax2.get_ylim()
-            
-            # Para alinear el cero, necesitamos que la proporción sea la misma:
-            # |y1_min| / y1_max = |y2_min| / y2_max
-            # Ajustamos el eje 2 para que coincida con el eje 1
-            
-            if y1_min < 0 and y1_max > 0:
-                # El eje 1 cruza el cero - usamos su proporción
-                ratio = abs(y1_min) / y1_max
-                
-                if y2_max > 0:
-                    # Ajustar y2_min para que tenga la misma proporción
-                    new_y2_min = -y2_max * ratio
-                    ax2.set_ylim(new_y2_min, y2_max)
-                elif y2_min < 0:
-                    # Ajustar y2_max para que tenga la misma proporción
-                    new_y2_max = abs(y2_min) / ratio
-                    ax2.set_ylim(y2_min, new_y2_max)
+        # Calcular acumulado: 0 antes del tratamiento, acumular solo después
+        d_plot = d.copy()
+        d_plot["cum_effect_plot"] = d_plot["effect"].where(d_plot["date"] >= treat_start, 0.0).cumsum()
         
+        # Graficar solo el efecto acumulado con línea punteada
+        ax_bot.plot(d_plot["date"], d_plot["cum_effect_plot"], linestyle="--", label="Acumulado", linewidth=1.5, color='C0')
+        ax_bot.set_ylabel("Acumulado")
+        ax_bot.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7)
         ax_bot.axvline(pd.to_datetime(treat_start), linewidth=1.0)
         ax_bot.legend(loc="upper left")
     else:

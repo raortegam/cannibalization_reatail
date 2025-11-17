@@ -161,17 +161,17 @@ experiments:
         step1: true
         step2: true
         step3: true
-        step5_gsc: true
+        step5_gsc: false
         step6_meta: true
         eda_algorithms: true
       params:
         top_k_donors: 12
         max_donor_promo_share: 0.20
         min_availability_share: 0.80
-        meta_learners: ["x"]
-        meta_hpo_trials: 1
-        meta_max_episodes: 5
-        gsc_max_episodes: 5
+        meta_learners: ["x","t","s"]
+        meta_hpo_trials: 200
+        meta_max_episodes: 50
+        gsc_max_episodes: 50
         gsc_hpo_trials: 500
         gsc_cv_folds: 8
         gsc_cv_holdout: 21
@@ -182,5 +182,90 @@ experiments:
         gsc_post_smooth_window: 1
         gsc_calibrate_victim: "level"
         gsc_pred_clip_min: 0.0
-        eda_alg_max_episodes_gsc: 5
-        eda_alg_max_episodes_meta: 5
+        eda_alg_max_episodes_gsc: 50
+        eda_alg_max_episodes_meta: 50
+
+  - id: "FINAL_PAPERv2"
+    desc: "Experimento definitivo para paper final: 50 víctimas, X/S/T learners, 15-20 donantes, 500 trials GSC, 200 trials Meta"
+    overrides:
+      toggles:
+        step1: true                     # Reutilizar datos procesados compartidos
+        step2: true                    # Reutilizar competitive_exposure compartido
+        step3: true                    # Reutilizar pairs y donors compartidos
+        step4: true                     # Preparar features
+        step5_gsc: true                 # Ejecutar GSC con HPO
+        step6_meta: true                # Ejecutar Meta-learners con HPO
+        eda_algorithms: true            # Generar gráficas finales
+        use_cached_step1: true
+        use_cached_step2: true
+        use_cached_step3: true
+      params:
+        # ===== SELECCIÓN DE EPISODIOS =====
+        n_cannibals: 10                 # 10 caníbales
+        n_victims_per_cannibal: 5       # 5 víctimas por caníbal = 50 víctimas totales
+        
+        # ===== DONANTES =====
+        top_k_donors: 12                # 15-20 donantes por víctima (18 es punto medio)
+               # Donantes del mismo producto
+        max_donor_promo_share: 0.20     # Máximo 2% de días en promoción
+        min_availability_share: 0.80    # Mínimo 90% de disponibilidad
+        
+        # ===== FEATURES =====
+        lags_days: [7, 14, 28, 56]      # Lags semanales, quincenales, mensuales, bimestrales
+        fourier_k: 3                    # Componentes de Fourier para estacionalidad
+        use_stl: true                   # Descomposición STL (trend + seasonal)
+        
+        # ===== GSC: CONTROL SINTÉTICO GENERALIZADO =====
+                          # Rank bajo para evitar overfitting
+                         # Regularización nuclear (100x más que baseline)
+                     # Regularización L2
+        gsc_hpo_trials: 500             # 500 trials de Optuna para HPO
+        gsc_cv_folds: 8                # 5 folds de validación cruzada rolling
+        gsc_cv_holdout: 21             # Ventanas de 14 días
+        gsc_cv_gap: 14                   # Gap de 7 días entre train/test
+        gsc_train_gap: 14              # Embargo de 7 días antes del tratamiento
+        gsc_include_covariates: false    # Incluir covariables en el modelo
+        gsc_link: "log1p"               # Transformación log1p para estabilizar varianza
+        gsc_calibrate_victim: "level"   # Calibrar nivel del contrafactual
+        gsc_post_smooth_window: 1       # Sin suavizado post-predicción
+        gsc_pred_clip_min: 0.0          # Clip predicciones negativas a 0
+            # Tests placebo espaciales
+              # Tests placebo temporales
+                   # Sin leave-one-o           # Sin análisis de sensibilidad adicional
+        gsc_max_episodes: null          # Procesar TODOS los episodios (50)
+        
+        # ===== META-LEARNERS: X, S, T =====
+        meta_learners: ["s"]  # Los 3 meta-learners principales
+        meta_model: "hgbt"              # Histogram Gradient Boosting Trees
+        meta_prop_model: "logit"        # Logistic regression para propensity score
+        meta_hpo_trials: 1           # 200 trials de Optuna por learner
+        meta_max_iter: 1000             # Máximo 1000 iteraciones de boosting
+        meta_max_depth: 6               # Profundidad máxima de árboles
+        meta_learning_rate: 0.05        # Learning rate conservador
+        meta_min_samples_leaf: 20       # Mínimo 20 muestras por hoja
+        meta_l2: 0.0                    # Sin regularización L2 adicional (HGBT ya tiene)
+        meta_cv_folds: 5                # 5 folds de validación cruzada
+        meta_cv_holdout: 14             # Ventanas de 14 días
+        meta_min_train_samples: 50      # Mínimo 50 muestras para entrenar
+        meta_random_state: 42           # Seed para reproducibilidad
+        meta_max_episodes: null         # Procesar TODOS los episodios (50)
+        meta_do_placebo_space: true     # Tests placebo espaciales
+        meta_do_placebo_time: true      # Tests placebo temporales
+        meta_do_loo: false              # Sin leave-one-out
+        meta_max_loo: 5
+        meta_sens_samples: 0            # Sin análisis de sensibilidad adicional
+        
+        # ===== TRATAMIENTO =====
+        treat_col_s: "H_disc"           # Tratamiento discretizado (0/1)
+        s_ref: 0.0                      # Valor de referencia para S-learner
+        treat_col_b: "H_prop"           # Tratamiento continuo (proporción)
+        bin_threshold: 0.0              # Umbral para binarización
+        h_bin_threshold: 0.02           # Umbral para considerar alta exposición
+        
+        # ===== EDA FINAL =====
+        eda_alg_orientation: "landscape"    # Orientación horizontal para gráficas
+        eda_alg_dpi: 300                    # Alta resolución para publicación
+        eda_alg_learners: ["t", "s", "x"]   # Comparar los 3 learners
+        eda_alg_export_pdf: true            # Exportar PDFs además de PNGs
+        eda_alg_max_episodes_gsc: 50        # Plotear las 50 víctimas para GSC
+        eda_alg_max_episodes_meta: 50       # Plotear las 50 víctimas para cada Meta-learner
