@@ -154,36 +154,29 @@ experiments:
         eda_alg_max_episodes_gsc: 30
         eda_alg_max_episodes_meta: 30
 
-  - id: "A_quick_smoke"
+  - id: "A_quick_smoke2"
     desc: "Smoke test: 5 episodios, 5 donantes, HPO Meta=3 trials"
     overrides:
       toggles:
         step1: true
         step2: true
         step3: true
+        step4: true
         step5_gsc: false
         step6_meta: true
         eda_algorithms: true
       params:
-        top_k_donors: 12
-        max_donor_promo_share: 0.20
-        min_availability_share: 0.80
-        meta_learners: ["x","t","s"]
-        meta_hpo_trials: 200
-        meta_max_episodes: 50
-        gsc_max_episodes: 50
-        gsc_hpo_trials: 500
-        gsc_cv_folds: 8
-        gsc_cv_holdout: 21
-        gsc_cv_gap: 14
-        gsc_include_covariates: false
-        gsc_train_gap: 14
-        gsc_link: "log1p"
-        gsc_post_smooth_window: 1
-        gsc_calibrate_victim: "level"
-        gsc_pred_clip_min: 0.0
-        eda_alg_max_episodes_gsc: 50
-        eda_alg_max_episodes_meta: 50
+        meta_model: lgbm
+        meta_hpo_trials: 50
+        meta_cv_folds: 5
+        meta_cv_holdout: 14
+        lags_days: [1,2,3,7,14,28,56]
+        fourier_k: 8
+        use_sc_hat_feature: true
+        use_available_A_feature: false
+        use_zero_streak_feature: false
+        meta_learners: [x, t, s]
+        meta_min_train_samples: 100
 
   - id: "FINAL_PAPERv2"
     desc: "Experimento definitivo para paper final: 50 víctimas, X/S/T learners, 15-20 donantes, 500 trials GSC, 200 trials Meta"
@@ -269,3 +262,260 @@ experiments:
         eda_alg_export_pdf: true            # Exportar PDFs además de PNGs
         eda_alg_max_episodes_gsc: 50        # Plotear las 50 víctimas para GSC
         eda_alg_max_episodes_meta: 50       # Plotear las 50 víctimas para cada Meta-learner
+
+  - id: "M1_meta_x_baseline"
+    desc: "Meta-X baseline (LGBM, CV=5x14, lags/fourier ricos, sin sc_hat)"
+    overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
+        step4: true
+        step5_gsc: false
+        step6_meta: true
+        eda_algorithms: true
+      params:
+        meta_model: lgbm
+        meta_learners: ["x"]
+        meta_hpo_trials: 50
+        meta_cv_folds: 5
+        meta_cv_holdout: 14
+        meta_min_train_samples: 100
+        meta_max_iter: 1000
+        lags_days: [1,2,3,7,14,28,56]
+        fourier_k: 8
+        use_sc_hat_feature: false
+        use_available_A_feature: false
+        use_zero_streak_feature: false
+        treat_col_s: "H_disc"
+        treat_col_b: "H_prop"
+        bin_threshold: 0.0
+
+  - id: "M2_meta_t_baseline"
+    desc: "Meta-T baseline (LGBM, misma config que M1)"
+    overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
+        step4: true
+        step5_gsc: false
+        step6_meta: true
+        eda_algorithms: true
+      params:
+        meta_model: lgbm
+        meta_learners: ["t"]
+        meta_hpo_trials: 50
+        meta_cv_folds: 5
+        meta_cv_holdout: 14
+        meta_min_train_samples: 100
+        meta_max_iter: 1000
+        lags_days: [1,2,3,7,14,28,56]
+        fourier_k: 8
+        use_sc_hat_feature: false
+        use_available_A_feature: false
+        use_zero_streak_feature: false
+        treat_col_s: "H_disc"
+        treat_col_b: "H_prop"
+        bin_threshold: 0.0
+
+  - id: "M3_meta_s_baseline"
+    desc: "Meta-S baseline (LGBM, misma config que M1)"
+    overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
+        step4: true
+        step5_gsc: false
+        step6_meta: true
+        eda_algorithms: true
+      params:
+        meta_model: lgbm
+        meta_learners: ["s"]
+        meta_hpo_trials: 50
+        meta_cv_folds: 5
+        meta_cv_holdout: 14
+        meta_min_train_samples: 100
+        meta_max_iter: 1000
+        lags_days: [1,2,3,7,14,28,56]
+        fourier_k: 8
+        use_sc_hat_feature: false
+        use_available_A_feature: false
+        use_zero_streak_feature: false
+        treat_col_s: "H_disc"
+        treat_col_b: "H_prop"
+        bin_threshold: 0.0
+        s_ref: 0.0
+
+  - id: "M4_meta_x_sc_hat_on"
+    desc: "Meta-X con sc_hat habilitado"
+    overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
+        step4: true
+        step5_gsc: false
+        step6_meta: true
+        eda_algorithms: true
+      params:
+        meta_model: lgbm
+        meta_learners: ["x"]
+        meta_hpo_trials: 50
+        meta_cv_folds: 5
+        meta_cv_holdout: 14
+        meta_min_train_samples: 100
+        meta_max_iter: 1000
+        lags_days: [1,2,3,7,14,28,56]
+        fourier_k: 8
+        use_sc_hat_feature: true
+        use_available_A_feature: false
+        use_zero_streak_feature: false
+        treat_col_s: "H_disc"
+        treat_col_b: "H_prop"
+        bin_threshold: 0.0
+
+  - id: "M5_meta_x_hgbt"
+    desc: "Meta-X con HGBT"
+    overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
+        step4: true
+        step5_gsc: false
+        step6_meta: true
+        eda_algorithms: true
+      params:
+        meta_model: "hgbt"
+        meta_learners: ["x"]
+        meta_hpo_trials: 50
+        meta_cv_folds: 5
+        meta_cv_holdout: 14
+        meta_min_train_samples: 100
+        meta_max_iter: 1000
+        lags_days: [1,2,3,7,14,28,56]
+        fourier_k: 8
+        use_sc_hat_feature: false
+        use_available_A_feature: false
+        use_zero_streak_feature: false
+        treat_col_s: "H_disc"
+        treat_col_b: "H_prop"
+        bin_threshold: 0.0
+
+
+  - id: "M6_meta_x_hgbt"
+    desc: "Meta-X con HGBT"
+    overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
+        step4: true
+        step5_gsc: false
+        step6_meta: true
+        eda_algorithms: true
+      params:
+        meta_model: "hgbt"
+        meta_learners: ["x"]
+        meta_hpo_trials: 50
+        meta_cv_folds: 5
+        meta_cv_holdout: 14
+        meta_min_train_samples: 100
+        meta_max_iter: 1000
+        lags_days: [1,2,3,7,14,28,56]
+        fourier_k: 8
+        use_sc_hat_feature: false
+        use_available_A_feature: false
+        use_zero_streak_feature: false
+        treat_col_s: "H_disc"
+        treat_col_b: "H_prop"
+        bin_threshold: 0.0
+        # meta_do_placebo_space: true
+        # meta_do_placebo_time: true
+
+
+  - id: "M6_meta_x_cv7"
+    desc: "Meta-X CV=7x14"
+    overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
+        step4: true
+        step5_gsc: false
+        step6_meta: true
+        eda_algorithms: true
+      params:
+        meta_model: lgbm
+        meta_learners: ["x"]
+        meta_hpo_trials: 50
+        meta_cv_folds: 7
+        meta_cv_holdout: 14
+        meta_min_train_samples: 100
+        meta_max_iter: 1000
+        lags_days: [1,2,3,7,14,28,56]
+        fourier_k: 8
+        use_sc_hat_feature: false
+        use_available_A_feature: false
+        use_zero_streak_feature: false
+        treat_col_s: "H_disc"
+        treat_col_b: "H_prop"
+        bin_threshold: 0.0
+
+  - id: "M7_meta_x_lags_rich"
+    desc: "Meta-X con lags/fourier enriquecidos"
+    overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
+        step4: true
+        step5_gsc: false
+        step6_meta: true
+        eda_algorithms: true
+      params:
+        meta_model: lgbm
+        meta_learners: ["x"]
+        meta_hpo_trials: 50
+        meta_cv_folds: 5
+        meta_cv_holdout: 14
+        meta_min_train_samples: 100
+        meta_max_iter: 1000
+        lags_days: [1,2,3,4,7,14,21,28,56,84]
+        fourier_k: 10
+        use_sc_hat_feature: false
+        use_available_A_feature: false
+        use_zero_streak_feature: false
+        treat_col_s: "H_disc"
+        treat_col_b: "H_prop"
+        bin_threshold: 0.0
+
+  - id: "M8_meta_x_min_train_50"
+    desc: "Meta-X con min_train=50"
+    overrides:
+      toggles:
+        step1: false
+        step2: false
+        step3: false
+        step4: true
+        step5_gsc: false
+        step6_meta: true
+        eda_algorithms: true
+      params:
+        meta_model: lgbm
+        meta_learners: ["x"]
+        meta_hpo_trials: 50
+        meta_cv_folds: 5
+        meta_cv_holdout: 14
+        meta_min_train_samples: 50
+        meta_max_iter: 1000
+        lags_days: [1,2,3,7,14,28,56]
+        fourier_k: 8
+        use_sc_hat_feature: false
+        use_available_A_feature: false
+        use_zero_streak_feature: false
+        treat_col_s: "H_disc"
+        treat_col_b: "H_prop"
+        bin_threshold: 0.0

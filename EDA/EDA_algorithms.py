@@ -200,7 +200,7 @@ def _load_meta_metrics(meta_out_root: Optional[Path],
             ren["effect_mean"] = "att_mean"
         if ren:
             df = df.rename(columns=ren)
-        keep = [c for c in ["episode_id", "rmspe_pre", "att_sum", "att_mean"] if c in df.columns]
+        keep = [c for c in ["episode_id", "rmspe_pre", "att_sum", "att_mean", "p_value_placebo_space"] if c in df.columns]
         if not keep:
             continue
         df = df[keep].copy()
@@ -349,6 +349,115 @@ def _compute_metrics_for_window(df: pd.DataFrame,
     att_mean = float(np.nanmean(post["effect"])) if "effect" in post.columns and len(post) > 0 else np.nan
 
     return {"rmspe_pre": rmspe_pre, "att_sum": att_sum, "att_mean": att_mean}
+
+
+def _compute_sensitivity_windows(df: pd.DataFrame,
+                                 treat_start: pd.Timestamp,
+                                 post_end: pd.Timestamp) -> Dict[str, float]:
+    d = df.copy()
+    d = d[(d["date"] >= treat_start) & (d["date"] <= post_end)].sort_values("date")
+    if "effect" not in d.columns and {"obs", "cf"}.issubset(d.columns):
+        d["effect"] = pd.to_numeric(d["obs"], errors="coerce") - pd.to_numeric(d["cf"], errors="coerce")
+    if "effect" not in d.columns:
+        return {"att_30": np.nan, "att_60": np.nan, "att_90": np.nan, "sens_std": np.nan, "sens_rel_std": np.nan, "sens_range": np.nan, "sens_rel_range": np.nan}
+    ts = pd.to_datetime(treat_start)
+    def _sum_k(k: int) -> float:
+        end_k = ts + pd.Timedelta(days=int(k) - 1)
+        sub = d[(d["date"] >= ts) & (d["date"] <= end_k)]
+        return float(np.nansum(pd.to_numeric(sub["effect"], errors="coerce"))) if not sub.empty else np.nan
+    a30 = _sum_k(30)
+    a60 = _sum_k(60)
+    a90 = _sum_k(90)
+    vec = np.array([a30, a60, a90], dtype=float)
+    m = np.isfinite(vec)
+    if not np.any(m):
+        return {"att_30": a30, "att_60": a60, "att_90": a90, "sens_std": np.nan, "sens_rel_std": np.nan, "sens_range": np.nan, "sens_rel_range": np.nan}
+    v = vec[m]
+    std = float(np.nanstd(v))
+    ref = float(np.nanmean(np.abs(v))) if np.isfinite(np.nanmean(np.abs(v))) else 0.0
+    rel_std = float(std / (ref + 1e-8))
+    rng = float(np.nanmax(v) - np.nanmin(v))
+    rel_rng = float(rng / (np.nanmax(np.abs(v)) + 1e-8))
+    return {"att_30": a30, "att_60": a60, "att_90": a90, "sens_std": std, "sens_rel_std": rel_std, "sens_range": rng, "sens_rel_range": rel_rng}
+
+
+def _compute_effect_heterogeneity(df: pd.DataFrame,
+                                  treat_start: pd.Timestamp,
+                                  post_end: pd.Timestamp) -> Dict[str, float]:
+    d = df.copy()
+    d = d[(d["date"] >= treat_start) & (d["date"] <= post_end)].sort_values("date")
+    if "effect" not in d.columns and {"obs", "cf"}.issubset(d.columns):
+        d["effect"] = pd.to_numeric(d["obs"], errors="coerce") - pd.to_numeric(d["cf"], errors="coerce")
+    if "effect" not in d.columns or d.empty:
+        return {"het_tau_std": np.nan, "het_tau_cv": np.nan}
+    e = pd.to_numeric(d["effect"], errors="coerce").to_numpy(dtype=float)
+    std = float(np.nanstd(e))
+    mu = float(np.nanmean(e))
+    cv = float(std / (abs(mu) + 1e-8))
+    return {"het_tau_std": std, "het_tau_cv": cv}
+
+
+def _compute_balance_for_episode(ep_row: pd.Series,
+                                 donors_df: pd.DataFrame,
+                                 meta_df: Optional[pd.DataFrame]) -> Dict[str, float]:
+    if meta_df is None or meta_df.empty:
+        return {"bal_mean_abs_std_diff": np.nan, "bal_rate": np.nan}
+    try:
+        pre_start = pd.to_datetime(ep_row["pre_start"]) if "pre_start" in ep_row else None
+        treat_start = pd.to_datetime(ep_row["treat_start"]) if "treat_start" in ep_row else None
+        if pre_start is None or treat_start is None:
+            return {"bal_mean_abs_std_diff": np.nan, "bal_rate": np.nan}
+        if "unit_id" not in meta_df.columns and {"store_nbr", "item_nbr"}.issubset(meta_df.columns):
+            meta_df = meta_df.copy()
+            meta_df["unit_id"] = meta_df["store_nbr"].astype(str) + ":" + meta_df["item_nbr"].astype(str)
+        if "date" in meta_df.columns:
+            meta_df = meta_df.copy()
+            meta_df["date"] = pd.to_datetime(meta_df["date"], errors="coerce")
+        js = int(ep_row["j_store"]) if "j_store" in ep_row else None
+        ji = int(ep_row["j_item"]) if "j_item" in ep_row else None
+        victim_uid = f"{js}:{ji}" if js is not None and ji is not None else None
+        if victim_uid is None or "unit_id" not in meta_df.columns or "date" not in meta_df.columns:
+            return {"bal_mean_abs_std_diff": np.nan, "bal_rate": np.nan}
+        donors = pd.DataFrame()
+        if donors_df is not None and not donors_df.empty:
+            ep_id = str(ep_row.get("episode_id", ""))
+            try:
+                donors = donors_df[donors_df.get("episode_id", "").astype(str) == ep_id]
+            except Exception:
+                donors = pd.DataFrame()
+            if donors.empty and {"j_store", "j_item"}.issubset(donors_df.columns) and js is not None and ji is not None:
+                donors = donors_df[(donors_df["j_store"] == js) & (donors_df["j_item"] == ji)]
+        if donors.empty or not {"donor_store", "donor_item"}.issubset(donors.columns):
+            return {"bal_mean_abs_std_diff": np.nan, "bal_rate": np.nan}
+        donor_uids = (donors["donor_store"].astype(str) + ":" + donors["donor_item"].astype(str)).unique().tolist()
+        vpre = meta_df[(meta_df["unit_id"] == victim_uid) & (meta_df["date"] < treat_start) & (meta_df["date"] >= pre_start)].copy()
+        dpre = meta_df[(meta_df["unit_id"].isin(donor_uids)) & (meta_df["date"] < treat_start) & (meta_df["date"] >= pre_start)].copy()
+        if vpre.empty or dpre.empty:
+            return {"bal_mean_abs_std_diff": np.nan, "bal_rate": np.nan}
+        num_cols = dpre.select_dtypes(include=[np.number]).columns.tolist()
+        keep_cols = []
+        for c in num_cols:
+            if c in {"sales", "D", "treated_unit", "treated_time", "is_pre", "train_mask", "episode_id"}:
+                continue
+            if c in {"ADI", "CV2", "available_A", "zero_streak", "sc_hat"}:
+                continue
+            if c.startswith("promo_share") or c.startswith("class_index_excl"):
+                continue
+            keep_cols.append(c)
+        if not keep_cols:
+            return {"bal_mean_abs_std_diff": np.nan, "bal_rate": np.nan}
+        vm = vpre[keep_cols].mean(numeric_only=True)
+        dm = dpre[keep_cols].mean(numeric_only=True)
+        vv = vpre[keep_cols].var(numeric_only=True, ddof=1).fillna(0.0)
+        dv = dpre[keep_cols].var(numeric_only=True, ddof=1).fillna(0.0)
+        pooled = np.sqrt(((vv + dv) / 2.0).replace(0.0, np.nan))
+        smd = (vm - dm) / pooled
+        smd = smd.replace([np.inf, -np.inf], np.nan).abs()
+        mean_abs = float(np.nanmean(smd.values)) if smd.size > 0 else np.nan
+        rate = float(np.nanmean((smd < 0.25).to_numpy(dtype=float))) if smd.size > 0 else np.nan
+        return {"bal_mean_abs_std_diff": mean_abs, "bal_rate": rate}
+    except Exception:
+        return {"bal_mean_abs_std_diff": np.nan, "bal_rate": np.nan}
 
 
 def _plot_episode_series(ax_top: plt.Axes,
@@ -1042,8 +1151,8 @@ def _run_gsc_donors_overlay_for_base(cfg: EDAConfig,
                         continue
                     ax_top.plot(sd["date"], sd["sales"], color="gray", alpha=0.18, linewidth=0.8)
 
-                ax_top.text(0.02, 0.98, f"Donors: {len(donors_map)}", transform=ax_top.transAxes,
-                            va="top", ha="left", fontsize=8,
+                ax_top.text(0.98, 0.98, f"Donors: {len(donors_map)}", transform=ax_top.transAxes,
+                            va="top", ha="right", fontsize=8,
                             bbox=dict(facecolor="white", alpha=0.7, edgecolor="0.5"))
 
                 fig.tight_layout()
@@ -1207,6 +1316,57 @@ def run(cfg: EDAConfig) -> None:
     )
     epi_map["episode_id"] = epi_map["episode_id"].astype(str)
     epi_map = epi_map.set_index("episode_id")
+
+    rows: List[Dict[str, float]] = []
+    exp_tag = _infer_exp_tag(fig_dir)
+    donors_df = _load_donors_map_for_exp(exp_tag) if exp_tag else pd.DataFrame()
+    meta_panel = _load_meta_panel_windows(exp_tag)
+    if meta_panel is not None and not meta_panel.empty and "date" in meta_panel.columns:
+        meta_panel = meta_panel.copy()
+        meta_panel["date"] = pd.to_datetime(meta_panel["date"], errors="coerce")
+    if "unit_id" not in (meta_panel.columns if meta_panel is not None else []):
+        if meta_panel is not None and {"store_nbr", "item_nbr"}.issubset(meta_panel.columns):
+            meta_panel = meta_panel.copy()
+            meta_panel["unit_id"] = meta_panel["store_nbr"].astype(str) + ":" + meta_panel["item_nbr"].astype(str)
+
+    if gsc_series:
+        for ep, d in gsc_series.items():
+            ep_id = str(ep)
+            if ep_id not in epi_map.index:
+                continue
+            row = epi_map.loc[ep_id]
+            mets = _compute_metrics_for_window(d, row["pre_start"], row["treat_start"], row["post_end"])
+            sens = _compute_sensitivity_windows(d, row["treat_start"], row["post_end"])
+            het = _compute_effect_heterogeneity(d, row["treat_start"], row["post_end"])
+            bal = _compute_balance_for_episode(episodes[episodes["episode_id"].astype(str) == ep_id].iloc[0], donors_df, meta_panel)
+            out = {"source": "gsc", "episode_id": ep_id}
+            out.update(mets); out.update(sens); out.update(het); out.update(bal)
+            rows.append(out)
+
+    for lr, dmap in meta_series.items():
+        mdf = meta_dict.get(lr, pd.DataFrame())
+        pmap = {}
+        if not mdf.empty and "episode_id" in mdf.columns and "p_value_placebo_space" in mdf.columns:
+            pmap = dict(zip(mdf["episode_id"].astype(str), pd.to_numeric(mdf["p_value_placebo_space"], errors="coerce")))
+        for ep, d in dmap.items():
+            ep_id = str(ep)
+            if ep_id not in epi_map.index:
+                continue
+            row = epi_map.loc[ep_id]
+            mets = _compute_metrics_for_window(d, row["pre_start"], row["treat_start"], row["post_end"])
+            sens = _compute_sensitivity_windows(d, row["treat_start"], row["post_end"])
+            het = _compute_effect_heterogeneity(d, row["treat_start"], row["post_end"])
+            pval = float(pmap.get(ep_id, np.nan)) if pmap else np.nan
+            out = {"source": f"meta-{lr}", "episode_id": ep_id, "plac_p_value_space": pval}
+            out.update(mets); out.update(sens); out.update(het)
+            rows.append(out)
+
+    if rows:
+        diag = pd.DataFrame(rows)
+        diag_path = tbl_dir / "episode_causal_diagnostics.parquet"
+        diag.to_parquet(diag_path, index=False)
+        diag_csv = tbl_dir / "episode_causal_diagnostics.csv"
+        diag.to_csv(diag_csv, index=False)
 
     def _render_one(src: str, ep: str, d: pd.DataFrame, pdf_writer=None) -> None:
         if ep not in epi_map.index:

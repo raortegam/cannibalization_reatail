@@ -139,7 +139,7 @@ EXCLUDE_BASE_COLS = {
 
 # --- Hiperparámetros internos ---
 _CV_GAP_DAYS = 7
-_LAMBDA_RECENCY = 0.004  # peso temporal: exp(-λ * days_to_vstart)
+_LAMBDA_RECENCY = 0   # peso temporal: exp(-λ * days_to_vstart)
 _MIN_TRAIN_FOLD = 30     # mínimo “blando” por grupo
 
 def select_feature_cols(df: pd.DataFrame, extra_exclude: Sequence[str] | None = None) -> List[str]:
@@ -165,19 +165,25 @@ def select_feature_cols(df: pd.DataFrame, extra_exclude: Sequence[str] | None = 
         "HNat", "HReg", "HLoc", "is_bridge", "is_additional", "is_work_day",
         # disponibilidad / intermitencia
         "available_A", "available_A_l1", "ADI", "CV2", "zero_streak",
+        # tendencias (solo lags, anti-fuga)
+        "trend_T_l1", "trend_T_l7", "trend_T_l28",
+        "Q_store_trend_l1", "Q_store_trend_l7", "Q_store_trend_l28",
         # donor blend
         "sc_hat",
         # promo/class (lags)
         "promo_share_sc_l7", "promo_share_sc_l14",
         "promo_share_sc_excl_l7", "promo_share_sc_excl_l14",
         "class_index_excl_l7", "class_index_excl_l14",
+        # rolling causales
+        "roll_mean_7", "roll_mean_28", "roll_std_7", "roll_std_28",
         # metadatos discretos
         "month",
     }
 
     feats = [
         c for c in feats
-        if (c.startswith(("fourier_", "lag_", "dow_", "type_", "cluster_", "state_"))
+        if (c.startswith(("fourier_", "lag_", "dow_", "type_", "cluster_", "state_",
+                          "roll_mean_", "roll_std_", "trend_T_l", "Q_store_trend_l"))
             or c in keep)
     ]
 
@@ -301,7 +307,7 @@ def make_classifier(name: str = "logit", random_state: int = 42):
         except Exception:
             pass
     from sklearn.linear_model import LogisticRegression
-    return LogisticRegression(max_iter=200, solver="liblinear", random_state=random_state)
+    return LogisticRegression(max_iter=500, solver="liblinear", random_state=random_state)
 
 # Modelo constante
 class _ConstantRegressor(BaseEstimator, RegressorMixin):
@@ -409,6 +415,26 @@ def _compute_sample_weights(df: pd.DataFrame, train_mask: np.ndarray, v_start: p
     m = float(np.mean(w)) if np.isfinite(np.mean(w)) and np.mean(w) > 0 else 1.0
     return w / m
 
+def _clip_by_stats(y_hat: np.ndarray, X_aug: np.ndarray, k: float = 3.5, nonneg: bool = True) -> np.ndarray:
+    """Clipa predicciones usando stats por unidad agregadas al final de X_aug.
+    Stats = [mu, sd, slope, m7, m28]. Para S-learner hay una columna extra de tratamiento al final.
+    """
+    y = np.asarray(y_hat, float)
+    X = np.asarray(X_aug, float)
+    # Identificar columnas de mu y sd al final
+    if X.shape[1] >= 6:
+        mu = X[:, -6]
+        sd = X[:, -5]
+    else:
+        mu = X[:, -5]
+        sd = X[:, -4]
+    sd_safe = np.maximum(sd, 1.0)
+    lo = mu - k * sd_safe
+    hi = mu + k * sd_safe
+    if nonneg:
+        lo = np.maximum(lo, 0.0)
+    return np.clip(y, lo, hi)
+
 def _build_augmented_matrices(df: pd.DataFrame,
                               feats: List[str],
                               train_mask: np.ndarray,
@@ -483,7 +509,12 @@ def _time_cv_score(meta_df: pd.DataFrame,
             logging.debug(f"HPO fold falló: {e}")
             scores.append(1e3)
 
-    return float(np.mean(scores)) if scores else np.inf
+    if not scores:
+        return np.inf
+    med = float(np.median(scores))
+    sd = float(np.std(scores))
+    # Penaliza varianza entre folds para reducir soluciones inestables
+    return float(med + 0.10 * sd)
 
 def tune_hyperparams(meta_df: pd.DataFrame, feats: List[str], cfg_model: str,
                      random_state: int, cv_folds: int, cv_holdout_days: int,
@@ -499,24 +530,24 @@ def tune_hyperparams(meta_df: pd.DataFrame, feats: List[str], cfg_model: str,
     warm_params = dict(base_defaults.get("hpo_warm_params", {}) or {})
 
     def objective(trial):
-        if model_name == "lgbm":
+        if model_name == "lgbm": 
             params = {
-                "num_leaves": trial.suggest_int("num_leaves", 31, 511),
-                "max_depth": trial.suggest_int("max_depth", 5, 15),
-                "learning_rate": trial.suggest_float("learning_rate", 5e-4, 0.3, log=True),
-                "min_child_samples": trial.suggest_int("min_child_samples", 3, 100),
-                "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
-                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-                "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 20.0),
-                "max_iter": trial.suggest_int("max_iter", 400, 1500, step=100),
+                "num_leaves": trial.suggest_int("num_leaves", 15, 127),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-2, 0.2, log=True),
+                "min_child_samples": trial.suggest_int("min_child_samples", 5, 200),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 0.95),
+                "subsample": trial.suggest_float("subsample", 0.5, 0.95),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 50.0, log=True),
+                "max_iter": trial.suggest_int("max_iter", 400, 1200, step=100),
             }
         elif model_name == "hgbt":
             params = {
-                "max_depth": trial.suggest_int("max_depth", 5, 15),
-                "learning_rate": trial.suggest_float("learning_rate", 5e-4, 0.3, log=True),
-                "max_iter": trial.suggest_int("max_iter", 400, 3000, step=100),
-                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 3, 100),
-                "l2": trial.suggest_float("l2", 1e-7, 20.0, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-2, 0.2, log=True),
+                "max_iter": trial.suggest_int("max_iter", 400, 1500, step=100),
+                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 200),
+                "l2": trial.suggest_float("l2", 1e-5, 50.0, log=True),
             }
         else:
             return np.inf
@@ -563,17 +594,17 @@ class TrainCfg:
     min_train_samples: int = 50
 
     # hiperparámetros genéricos / HGBT
-    max_depth: int = 8
+    max_depth: int = 6
     learning_rate: float = 0.05
-    max_iter: int = 600
-    min_samples_leaf: int = 10
-    l2: float = 0.0
+    max_iter: int = 500
+    min_samples_leaf: int = 20
+    l2: float = 1.0
 
     # LightGBM
-    num_leaves: int = 127
-    min_child_samples: int = 10
-    feature_fraction: float = 0.8
-    subsample: float = 0.8
+    num_leaves: int = 63
+    min_child_samples: int = 20
+    feature_fraction: float = 0.7
+    subsample: float = 0.7
 
     # sensibilidad
     sens_samples: int = 0
@@ -583,6 +614,15 @@ class TrainCfg:
     s_ref: float = 0.0
     treat_col_b: str = "D"
     bin_threshold: float = 0.0
+    use_sc_hat_feature: bool = False
+    use_available_A_feature: bool = False
+    use_zero_streak_feature: bool = False
+    use_sc_hat_feature: bool = False
+    use_available_A_feature: bool = False
+    use_zero_streak_feature: bool = False
+    use_sc_hat_feature: bool = False
+    use_available_A_feature: bool = False
+    use_zero_streak_feature: bool = False
 
 def _build_X(df: pd.DataFrame, feats: List[str]) -> np.ndarray:
     X = df[feats].values.astype(float)
@@ -662,8 +702,8 @@ def crossfit_predictions(df: pd.DataFrame, feats: List[str], cfg: TrainCfg) -> D
             else:
                 m1 = _ConstantRegressor(np.nanmean(y_tr[mask1]) if mask1.sum() else np.nanmean(y_tr)).fit(X_tr_aug, y_tr)
 
-            mu0_cf[valid_mask] = m0.predict(X_va_aug)
-            mu1_cf[valid_mask] = m1.predict(X_va_aug)
+            mu0_cf[valid_mask] = _clip_by_stats(m0.predict(X_va_aug), X_va_aug)
+            mu1_cf[valid_mask] = _clip_by_stats(m1.predict(X_va_aug), X_va_aug)
             tau_cf[valid_mask] = mu1_cf[valid_mask] - mu0_cf[valid_mask]
 
         # --- S-learner ---
@@ -683,8 +723,8 @@ def crossfit_predictions(df: pd.DataFrame, feats: List[str], cfg: TrainCfg) -> D
             X_va_ref = np.column_stack([X_va_aug, np.full((X_va_aug.shape[0], 1), cfg.s_ref)])
             X_va_obs = np.column_stack([X_va_aug, d_va.reshape(-1, 1)])
 
-            mu0_cf[valid_mask] = model.predict(X_va_ref)
-            mu1_cf[valid_mask] = model.predict(X_va_obs)
+            mu0_cf[valid_mask] = _clip_by_stats(model.predict(X_va_ref), X_va_ref)
+            mu1_cf[valid_mask] = _clip_by_stats(model.predict(X_va_obs), X_va_obs)
             tau_cf[valid_mask] = mu1_cf[valid_mask] - mu0_cf[valid_mask]
 
         # --- X-learner ---
@@ -720,8 +760,8 @@ def crossfit_predictions(df: pd.DataFrame, feats: List[str], cfg: TrainCfg) -> D
 
             # Degradar a T si falta variación en TRAIN
             if (mask0.sum() == 0) or (mask1.sum() == 0):
-                mu0_cf[valid_mask] = m0.predict(X_va_aug)
-                mu1_cf[valid_mask] = m1.predict(X_va_aug)
+                mu0_cf[valid_mask] = _clip_by_stats(m0.predict(X_va_aug), X_va_aug)
+                mu1_cf[valid_mask] = _clip_by_stats(m1.predict(X_va_aug), X_va_aug)
                 tau_cf[valid_mask] = mu1_cf[valid_mask] - mu0_cf[valid_mask]
                 continue
 
@@ -807,8 +847,8 @@ def crossfit_predictions(df: pd.DataFrame, feats: List[str], cfg: TrainCfg) -> D
         else:
             m1_full = _ConstantRegressor(np.nanmean(y_full[mask1_all]) if mask1_all.sum() else np.nanmean(y_full)).fit(X_all_aug, y_full)
 
-        mu0_full = m0_full.predict(X_all_aug)
-        mu1_full = m1_full.predict(X_all_aug)
+        mu0_full = _clip_by_stats(m0_full.predict(X_all_aug), X_all_aug)
+        mu1_full = _clip_by_stats(m1_full.predict(X_all_aug), X_all_aug)
         tau_full = mu1_full - mu0_full
 
     elif cfg.learner.lower() == "s":
@@ -824,8 +864,8 @@ def crossfit_predictions(df: pd.DataFrame, feats: List[str], cfg: TrainCfg) -> D
         _fit_with_weights(model_full, XD, y_full, sw_full)
         X_ref = np.column_stack([X_all_aug, np.full((X_all_aug.shape[0], 1), 0.0)])
         X_obs = np.column_stack([X_all_aug, D_all.reshape(-1, 1)])
-        mu0_full = model_full.predict(X_ref)
-        mu1_full = model_full.predict(X_obs)
+        mu0_full = _clip_by_stats(model_full.predict(X_ref), X_ref)
+        mu1_full = _clip_by_stats(model_full.predict(X_obs), X_obs)
         tau_full = mu1_full - mu0_full
 
     else:
@@ -854,7 +894,7 @@ def crossfit_predictions(df: pd.DataFrame, feats: List[str], cfg: TrainCfg) -> D
         else:
             m1_full = _ConstantRegressor(np.nanmean(y_full[mask1_all]) if mask1_all.sum() else np.nanmean(y_full)).fit(X_all_aug, y_full)
 
-        mu0_full = m0_full.predict(X_all_aug);  mu1_full = m1_full.predict(X_all_aug)
+        mu0_full = _clip_by_stats(m0_full.predict(X_all_aug), X_all_aug);  mu1_full = _clip_by_stats(m1_full.predict(X_all_aug), X_all_aug)
 
         d1_all = y_full[mask1_all] - mu0_full[mask1_all]
         d0_all = mu1_full[mask0_all] - y_full[mask0_all]
@@ -1001,6 +1041,9 @@ class RunCfg:
     s_ref: float = 0.0
     treat_col_b: str = "D"
     bin_threshold: float = 0.0
+    use_sc_hat_feature: bool = False
+    use_available_A_feature: bool = False
+    use_zero_streak_feature: bool = False
 
 def _default_out_dir(cfg: RunCfg) -> Path:
     """
@@ -1181,7 +1224,15 @@ def run_episode(meta_df: pd.DataFrame,
     pval_space = np.nan
     if cfg.do_placebo_space:
         ep_rows = dfp.loc[dfp["date"].between(ep_row["pre_start"], post_end, inclusive="both")].copy()
-        ps = placebo_space_meta(ep_rows, donors_df, (j_store, j_item), treat_start, post_end)
+        dons = donors_df.loc[(donors_df["j_store"] == j_store) & (donors_df["j_item"] == j_item)] if donors_df is not None else pd.DataFrame()
+        if dons.empty:
+            ps_rows = pd.DataFrame(columns=["unit_id", "date", "tau_hat"])
+        else:
+            donor_uids = set(dons["donor_store"].astype(str) + ":" + dons["donor_item"].astype(str))
+            m = meta_df["unit_id"].astype(str).isin(donor_uids) & meta_df["date"].between(treat_start, post_end, inclusive="both")
+            ps_rows = meta_df.loc[m, ["unit_id", "date"]].copy()
+            ps_rows["tau_hat"] = pred_cache["tau_cf"][m.to_numpy()]
+        ps = placebo_space_meta(ps_rows, donors_df, (j_store, j_item), treat_start, post_end)
         ps["episode_id"] = ep_id
         ps_path = plac_dir / f"{ep_id}_space.parquet"
         ps.to_parquet(ps_path, index=False)
@@ -1296,7 +1347,14 @@ def run_batch(cfg: RunCfg) -> None:
             donors = _load_donors(alt_dn)
 
     # Selección de features (excluye columnas de tratamiento para evitar leakage)
-    feats = select_feature_cols(meta_df, extra_exclude=[cfg.treat_col_s, cfg.treat_col_b])
+    _extra_ex = [cfg.treat_col_s, cfg.treat_col_b]
+    if not cfg.use_sc_hat_feature:
+        _extra_ex.append("sc_hat")
+    if not cfg.use_available_A_feature:
+        _extra_ex.append("available_A")
+    if not cfg.use_zero_streak_feature:
+        _extra_ex.append("zero_streak")
+    feats = select_feature_cols(meta_df, extra_exclude=_extra_ex)
     logging.info(f"Features seleccionadas ({len(feats)}): {feats[:8]}{' ...' if len(feats) > 8 else ''}")
 
     # Orden base
@@ -1435,6 +1493,9 @@ def parse_args() -> RunCfg:
     p.add_argument("--s_ref", type=float, default=0.0)
     p.add_argument("--treat_col_b", type=str, default="D")
     p.add_argument("--bin_threshold", type=float, default=0.0)
+    p.add_argument("--use_sc_hat_feature", action="store_true")
+    p.add_argument("--use_available_A_feature", action="store_true")
+    p.add_argument("--use_zero_streak_feature", action="store_true")
 
     a = p.parse_args()
     return RunCfg(
@@ -1471,6 +1532,9 @@ def parse_args() -> RunCfg:
         s_ref=a.s_ref,
         treat_col_b=a.treat_col_b,
         bin_threshold=a.bin_threshold,
+        use_sc_hat_feature=bool(a.use_sc_hat_feature),
+        use_available_A_feature=bool(a.use_available_A_feature),
+        use_zero_streak_feature=bool(a.use_zero_streak_feature),
     )
 
 if __name__ == "__main__":

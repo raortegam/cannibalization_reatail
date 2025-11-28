@@ -422,6 +422,9 @@ class ParamsConfig:
     s_ref: float = 0.0
     treat_col_b: str = "H_prop"
     bin_threshold: float = 0.0
+    use_sc_hat_feature: bool = False
+    use_available_A_feature: bool = False
+    use_zero_streak_feature: bool = False
 
     # EDA final de algoritmos
     eda_alg_orientation: str = "landscape"
@@ -1127,6 +1130,9 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                 max_episodes=cfg.params.max_episodes,
                 log_level=cfg.params.prep_log_level,
                 fail_fast=cfg.params.fail_fast,
+                use_sc_hat_feature=cfg.params.use_sc_hat_feature,
+                use_available_A_feature=cfg.params.use_available_A_feature,
+                use_zero_streak_feature=cfg.params.use_zero_streak_feature,
             )
 
             _safe_call(
@@ -1369,6 +1375,9 @@ def run_pipeline(config_path: Path) -> Dict[str, Any]:
                         s_ref=cfg.params.s_ref,
                         treat_col_b=cfg.params.treat_col_b,
                         bin_threshold=cfg.params.bin_threshold,
+                        use_sc_hat_feature=cfg.params.use_sc_hat_feature,
+                        use_available_A_feature=cfg.params.use_available_A_feature,
+                        use_zero_streak_feature=cfg.params.use_zero_streak_feature,
                     )
                     _safe_call(meta_run_batch, logger, cfg.fail_fast, f"6.{lr.upper()} Meta run_batch", cfg=mcfg)
                     outputs[lr] = {

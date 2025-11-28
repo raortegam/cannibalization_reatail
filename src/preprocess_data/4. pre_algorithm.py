@@ -171,6 +171,9 @@ class PrepConfig:
     add_donor_blend_sc: bool = True
     donor_blend_alpha: float = 1.0
     donor_blend_min_pre_T: int = 10
+    use_sc_hat_feature: bool = False
+    use_available_A_feature: bool = False
+    use_zero_streak_feature: bool = False
 
     # Compatibilidad: además de escribir a out_meta_dir/windows.parquet,
     # se puede duplicar la salida en out_dir/meta/all_units.parquet
@@ -541,6 +544,11 @@ def add_temporal_features(panel: pd.DataFrame,
     grouped = df.groupby(["store_nbr", "item_nbr"], group_keys=False)
     for L in lags_days:
         df[f"lag_{L}d"] = grouped["sales"].shift(L)
+    # Rolling causales (solo pasado): usar shift(1) antes del rolling
+    for W in [7, 28]:
+        s_shift = grouped["sales"].shift(1)
+        df[f"roll_mean_{W}"] = s_shift.rolling(window=W, min_periods=2).mean()
+        df[f"roll_std_{W}"] = s_shift.rolling(window=W, min_periods=2).std()
     return df
 
 
@@ -573,6 +581,8 @@ def add_availability_and_store_trend(panel: pd.DataFrame, use_stl: bool) -> pd.D
     df["available_A"] = pd.concat(avails).sort_index()
     # Usar SOLO tendencia rezagada como feature
     df["trend_T_l1"] = df.groupby(["store_nbr", "item_nbr"], observed=False)["trend_T"].shift(1)
+    df["trend_T_l7"] = df.groupby(["store_nbr", "item_nbr"], observed=False)["trend_T"].shift(7)
+    df["trend_T_l28"] = df.groupby(["store_nbr", "item_nbr"], observed=False)["trend_T"].shift(28)
 
     store_sum = df.groupby(["store_nbr", "date"], as_index=False)["sales"].sum().sort_values(["store_nbr", "date"])
     store_trend_parts = []
@@ -585,6 +595,8 @@ def add_availability_and_store_trend(panel: pd.DataFrame, use_stl: bool) -> pd.D
 
     df = _safe_merge(df, store_trend, on=["store_nbr", "date"], how="left", validate="many_to_one", name="panel×store_trend")
     df["Q_store_trend_l1"] = df.groupby("store_nbr", observed=False)["Q_store_trend"].shift(1)
+    df["Q_store_trend_l7"] = df.groupby("store_nbr", observed=False)["Q_store_trend"].shift(7)
+    df["Q_store_trend_l28"] = df.groupby("store_nbr", observed=False)["Q_store_trend"].shift(28)
     return df
 
 
@@ -807,7 +819,7 @@ def attach_controls(panel: pd.DataFrame,
         # ffill/bfill por tienda (sin deprecations)
         df["Fsw_log1p"] = (
             df.groupby("store_nbr", observed=False)["Fsw_log1p"]
-            .ffill().bfill().fillna(0.0)
+            .ffill().fillna(0.0)
             .astype(float)
         )
 
@@ -819,7 +831,7 @@ def attach_controls(panel: pd.DataFrame,
             validate="many_to_one", name="panel×weekly_oil_proxy"
         )
         df = df.sort_values(["date"])
-        df["Ow"] = df["Ow"].ffill().bfill().fillna(0.0).astype(float)
+        df["Ow"] = df["Ow"].ffill().fillna(0.0).astype(float)
 
     # --- Proxy regional (cuota tienda dentro del estado esa semana) ---
     if cfg.use_regional_proxy and regional_proxy is not None:
@@ -841,7 +853,7 @@ def attach_controls(panel: pd.DataFrame,
         df = df.sort_values(["store_nbr", "date"])
         df["F_state_excl_store_log1p"] = (
             df.groupby("store_nbr", observed=False)["F_state_excl_store_log1p"]
-            .ffill().bfill().fillna(0.0)
+            .ffill().fillna(0.0)
             .astype(float)
         )
         # (opcional) podemos conservar 'regional_proxy' para auditoría o eliminarla:
@@ -1330,13 +1342,31 @@ def prepare_datasets(cfg: PrepConfig) -> None:
 
         # Ruta nueva (entrenamiento Meta)
         meta_train_path = cfg.out_meta_dir / "windows.parquet"
+        # Eliminar de meta_all las columnas propensas a fuga (contemporáneas o agregadas con futuro)
+        _leak_drop = ["ADI","CV2","promo_share_sc","promo_share_sc_excl","class_index_excl"]
+        if "available_A" in meta_all.columns and "available_A_l1" not in meta_all.columns:
+            meta_all = meta_all.sort_values(["unit_id","date"]).copy()
+            meta_all["available_A_l1"] = (
+                meta_all.groupby("unit_id", observed=False)["available_A"].shift(1).astype("float32")
+            )
+        if not cfg.use_available_A_feature:
+            _leak_drop.append("available_A")
+        if not cfg.use_zero_streak_feature:
+            _leak_drop.append("zero_streak")
+        if not cfg.use_sc_hat_feature:
+            _leak_drop.append("sc_hat")
+        _present = [c for c in _leak_drop if c in meta_all.columns]
+        if _present:
+            meta_all = meta_all.drop(columns=_present)
+            logging.info(f"Se excluyeron de windows.parquet (anti-fuga): {_present}")
         meta_all.to_parquet(meta_train_path, index=False)
         logging.info(f"Meta-training stack guardado: {meta_train_path} ({meta_all.shape[0]:,} filas)")
 
         # --- NUEVO: separación explícita X/Y y blacklist anti-fuga ---
         id_cols = ["episode_id","unit_id","date","store_nbr","item_nbr",
                    "treated_unit","treated_time","D","is_pre","train_mask","train_mask_time","cluster_id"]
-        leak_cols = {"sales","y_raw","y_log1p","trend_T","Q_store_trend","sc_hat"}
+        leak_cols = {"sales","y_raw","y_log1p","trend_T","Q_store_trend","sc_hat",
+                     "ADI","CV2","promo_share_sc","promo_share_sc_excl","class_index_excl"}
         X_cols = [c for c in meta_all.columns if c not in leak_cols and c not in id_cols]
         X_safe = meta_all[id_cols + X_cols]
         Y_cols = meta_all[id_cols + ["sales","y_raw","y_log1p"]]
@@ -1423,6 +1453,9 @@ def parse_args() -> PrepConfig:
     p.add_argument("--donor_blend_alpha", type=float, default=PrepConfig.donor_blend_alpha, help="Alpha de Ridge para donor-blend")
     p.add_argument("--donor_blend_min_pre_T", type=int, default=PrepConfig.donor_blend_min_pre_T, help="Mínimo PRE T para donor-blend")
     p.add_argument("--no_legacy_meta_copy", action="store_true", help="No duplicar salida de Meta en out/meta/all_units.parquet")
+    p.add_argument("--use_sc_hat_feature", action="store_true")
+    p.add_argument("--use_available_A_feature", action="store_true")
+    p.add_argument("--use_zero_streak_feature", action="store_true")
 
     # Chequeo de coherencia Observado
     p.add_argument("--no_obs_check", action="store_true", help="Desactiva check de coherencia Observado Meta vs GSC")
@@ -1471,6 +1504,9 @@ def parse_args() -> PrepConfig:
         add_donor_blend_sc=(not args.no_donor_blend_sc),
         donor_blend_alpha=args.donor_blend_alpha,
         donor_blend_min_pre_T=args.donor_blend_min_pre_T,
+        use_sc_hat_feature=bool(args.use_sc_hat_feature),
+        use_available_A_feature=bool(args.use_available_A_feature),
+        use_zero_streak_feature=bool(args.use_zero_streak_feature),
         write_legacy_meta_copy=(not args.no_legacy_meta_copy),
 
         check_observed_consistency=(not args.no_obs_check),
