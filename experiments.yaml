@@ -418,7 +418,7 @@ experiments:
         eda_algorithms: true
       params:
         meta_model: "hgbt"
-        meta_learners: ["x"]
+        meta_learners: ["x", "t", "s"]
         meta_hpo_trials: 50
         meta_cv_folds: 5
         meta_cv_holdout: 14
@@ -432,8 +432,8 @@ experiments:
         treat_col_s: "H_disc"
         treat_col_b: "H_prop"
         bin_threshold: 0.0
-        # meta_do_placebo_space: true
-        # meta_do_placebo_time: true
+        meta_do_placebo_space: true
+        meta_do_placebo_time: true
 
 
   - id: "M6_meta_x_cv7"
